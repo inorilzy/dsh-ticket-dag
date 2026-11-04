@@ -81,6 +81,27 @@ test('plan aliases, defaults and declared artifact dependencies', () => {
   )
 })
 
+test('a ticket agent preset is frozen into the manifest; tickets without one are unchanged', () => {
+  const agents = {
+    'test-writer': { instructions: 'Only add tests.', provider: 'acme', model: 'fast-1', reasoningEffort: '' },
+  }
+  const plan = (tickets) => ({ spec_id: 'test', base_ref: 'refs/heads/main', tickets })
+  assert.equal(
+    JSON.stringify(normalizeManifest(plan([ticket('A')]), checks, agents)),
+    JSON.stringify(manifest([ticket('A')])),
+  )
+  const m = normalizeManifest(plan([{ ...ticket('A'), agent: 'test-writer' }, ticket('B')]), checks, agents)
+  assert.equal(m.tickets[0].agent, 'test-writer')
+  assert.deepEqual(m.tickets[0].agentSpec, { instructions: 'Only add tests.', provider: 'acme', model: 'fast-1' })
+  assert.equal(Object.hasOwn(m.tickets[1], 'agent'), false)
+  assert.deepEqual(normalizeManifest(m, checks, agents), m)
+  assert.throws(
+    () => normalizeManifest(plan([{ ...ticket('A'), agent: 'ghost' }]), checks, agents),
+    /unknown agent preset: ghost/,
+  )
+  assert.throws(() => normalizeManifest(plan([{ ...ticket('A'), agent: '../x' }]), checks, agents), /safe ID/)
+})
+
 test('cross-connection leases, max workers and fan-in use durable integrated records', (t) => {
   const file = tempDb(t)
   const db = new RunStore(file),

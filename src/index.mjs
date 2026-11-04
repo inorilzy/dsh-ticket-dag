@@ -2,8 +2,9 @@ import { isAbsolute } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { builtinAgents } from './agents.mjs'
 import { Coordinator } from './coordinator.mjs'
-import { RunCatalog, mountDashboard } from './dashboard.mjs'
+import { RunCatalog, mountDashboard, mountModels } from './dashboard.mjs'
 
 export const name = 'dsh-ticket-dag'
 export const inject = [
@@ -20,6 +21,18 @@ export const Config = z.object({
   checks: z
     .dict(z.array(z.array(z.string()).min(1)).min(1))
     .default({})
+    .volatile(),
+  agents: z
+    .dict(
+      z.object({
+        description: z.string().default(''),
+        instructions: z.string().default(''),
+        provider: z.string().default(''),
+        model: z.string().default(''),
+        reasoningEffort: z.string().default(''),
+      }),
+    )
+    .default(builtinAgents)
     .volatile(),
   maxWorkers: z.natural().min(1).max(32).default(16).volatile(),
   checkTimeoutMs: z.natural().min(1).max(2_147_483_647).default(120000).volatile(),
@@ -79,6 +92,7 @@ function setting(field, fallback) {
 export function apply(ctx, config = {}) {
   const settings = () => ({
     checks: setting(config.checks, {}),
+    agents: setting(config.agents, builtinAgents),
     maxWorkers: setting(config.maxWorkers, 16),
     checkTimeoutMs: setting(config.checkTimeoutMs, 120000),
   })
@@ -99,7 +113,7 @@ export function apply(ctx, config = {}) {
     return agent
   }
 
-  async function launch({ parentId, childId, cwd, prompt, signal, runId, ticketId, attempt }) {
+  async function launch({ parentId, childId, cwd, prompt, agentOptions, signal, runId, ticketId, attempt }) {
     if (!isAbsolute(cwd)) throw new Error('Worker worktree path must be absolute')
     const parent = await captain(parentId)
     signal.throwIfAborted()
@@ -107,7 +121,7 @@ export function apply(ctx, config = {}) {
       provider: 'spawn',
       label: childLabel + runId + '/' + ticketId + '#' + attempt,
       childId,
-      request: { parent, cwd, prompt: [{ type: 'text', text: prompt }] },
+      request: { parent, cwd, prompt: [{ type: 'text', text: prompt }], ...(agentOptions && { agentOptions }) },
       signal,
       delivery: 'caller',
     })
@@ -179,7 +193,10 @@ export function apply(ctx, config = {}) {
     }
   }
   const coordinator = new Coordinator({ launch, notify, canRetry, rememberRun, ...settings() })
-  ctx.inject?.(['connection'], (scope) => mountDashboard(scope, catalog, coordinator))
+  ctx.inject?.(['connection'], (scope) => {
+    mountDashboard(scope, catalog, coordinator)
+    mountModels(scope, () => ctx.get('llm'))
+  })
   ctx.on('loader/volatile-update', () => coordinator.updateSettings(settings()))
   ctx.inject?.(['settings'], (scope) => {
     scope.effect(() => scope.settings.configure({ auto: false }, ctx.fiber))
@@ -282,7 +299,7 @@ export function apply(ctx, config = {}) {
 
   register(
     'run',
-    'Start the approved spec manifest and return its runId. Reusing a runId with the same manifest is idempotent. Only trusted host check IDs are supported.',
+    'Start the approved spec manifest and return its runId. Reusing a runId with the same manifest is idempotent. Only trusted host check IDs are supported. A ticket may set agent to a configured agent preset ID (for example implementer, test-writer or docs) to give its worker that role and model; omit it for the default worker.',
     {
       manifest: { type: 'json', required: true, description: 'Ticket DAG manifest object or JSON string.' },
       runId: {

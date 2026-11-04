@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
 import { pathToFileURL } from 'node:url'
-import { RunCatalog, mountDashboard } from '../src/dashboard.mjs'
+import { RunCatalog, mountDashboard, mountModels } from '../src/dashboard.mjs'
 import { RunStore, normalizeManifest } from '../src/store.mjs'
 
 function addRun(root, name, catalog, at) {
@@ -114,6 +114,96 @@ test('dashboard URL accepts only one opaque key and only supplies a GET route', 
   assert.match(list.headers.get('cache-control'), /no-store/)
   assert.deepEqual(await list.json(), { runs: [], selected: null })
   assert.equal((await get('?key=' + 'a'.repeat(64))).status, 404)
+})
+
+test('model catalog route lists every provider, its models and efforts, and reports a failing provider', async () => {
+  let route
+  const llm = {
+    listProviders: () => [
+      { id: 'acme', name: 'Acme' },
+      { id: 'down', name: 'Down' },
+    ],
+    async listModels(provider) {
+      if (provider === 'down') throw Error('offline')
+      return [
+        { provider, id: 'fast-1', name: 'Fast 1' },
+        { provider, id: 'deep-2', name: 'Deep 2' },
+      ]
+    },
+    async resolveModelInfo(provider, model) {
+      return model === 'deep-2'
+        ? { provider, id: model, name: 'Deep 2', reasoning: { efforts: [{ id: 'high', name: 'High' }], defaultEffort: 'high' } }
+        : { provider, id: model, name: 'Fast 1' }
+    },
+  }
+  mountModels({ connection: { fetch: { register: (r) => (route = r) } } }, () => llm)
+  assert.equal(route.path, '/api/ticket-dag.models')
+  assert.deepEqual(route.methods, ['GET'])
+  const response = await route.fetch(new Request('http://localhost' + route.path))
+  assert.match(response.headers.get('cache-control'), /no-store/)
+  assert.deepEqual(await response.json(), {
+    providers: [
+      {
+        id: 'acme',
+        name: 'Acme',
+        models: [
+          { id: 'fast-1', name: 'Fast 1', efforts: [], defaultEffort: null },
+          { id: 'deep-2', name: 'Deep 2', efforts: [{ id: 'high', name: 'High' }], defaultEffort: 'high' },
+        ],
+      },
+    ],
+    failures: ['down'],
+  })
+  mountModels({ connection: { fetch: { register: (r) => (route = r) } } }, () => undefined)
+  assert.deepEqual(await (await route.fetch(new Request('http://localhost' + route.path))).json(), {
+    providers: [],
+    failures: [],
+  })
+})
+
+test('cold history exposes each ticket agent preset and model route', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'dag-agents-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const repo = join(root, 'repo')
+  mkdirSync(repo)
+  const file = join(repo, 'state.sqlite')
+  const db = new RunStore(file)
+  const manifest = normalizeManifest(
+    {
+      spec_id: 'demo',
+      tickets: [
+        { id: 'A', title: 'A', verify: ['test'], agent: 'docs' },
+        { id: 'B', title: 'B', verify: ['test'] },
+      ],
+    },
+    { test: [['node', '--version']] },
+    { docs: { instructions: 'Docs.', provider: 'acme', model: 'fast-1' } },
+  )
+  const meta = {
+    runId: 'agents',
+    parentId: 'captain',
+    repo: { root: repo, commonDir: join(repo, '.git') },
+    ref: 'refs/heads/integration/agents',
+    baseSha: 'start',
+    manifest,
+    policyHash: 'test',
+  }
+  db.init(meta)
+  const catalog = new RunCatalog(join(root, 'profile'))
+  catalog.remember(file, meta, 1)
+  try {
+    const cold = { maxWorkers: 16, runs: new Map() }
+    const rows = catalog.read(cold, null).selected.tickets
+    assert.deepEqual(
+      rows.map((r) => [r.id, r.agent, r.model]),
+      [
+        ['A', 'docs', 'acme/fast-1'],
+        ['B', null, null],
+      ],
+    )
+  } finally {
+    db.close()
+  }
 })
 
 test(

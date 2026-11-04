@@ -124,6 +124,8 @@ export class RunCatalog {
             id: t.id,
             title: t.title,
             status: t.status,
+            agent: t.agent ?? null,
+            model: t.model ?? null,
             dependsOn: t.dependsOn,
             attempt: t.attempt,
             path: t.path,
@@ -175,15 +177,64 @@ function readLedger(file, entry, detail, globalLimit) {
         .prepare(
           `SELECT id,json_extract(definition,'$.title') AS title,
         json_extract(definition,'$.dependsOn') AS deps,status,attempt,baseSha,sourceSha,landedSha,
-        path,branch,childId,message,autoRetries,retryAt FROM tickets ORDER BY position`,
+        path,branch,childId,message,autoRetries,retryAt,json_extract(definition,'$.agent') AS agent,
+        json_extract(definition,'$.agentSpec.provider') AS provider,
+        json_extract(definition,'$.agentSpec.model') AS modelId FROM tickets ORDER BY position`,
         )
         .all()
-        .map(({ deps, ...row }) => ({ ...row, dependsOn: JSON.parse(deps), livePhase: null }))
+        .map(({ deps, provider, modelId, ...row }) => ({
+          ...row,
+          dependsOn: JSON.parse(deps),
+          model: modelId ? [provider, modelId].filter(Boolean).join('/') : null,
+          livePhase: null,
+        }))
     }
     return result
   } finally {
     db.close()
   }
+}
+
+// Provider/model/effort choices for the settings form. Read-only: it never
+// changes any session's model. A provider whose catalog fails is named in
+// failures and its models are omitted.
+async function modelCatalog(llm) {
+  const providers = []
+  const failures = []
+  for (const provider of llm?.listProviders?.() ?? []) {
+    try {
+      const models = []
+      for (const model of await llm.listModels(provider.id)) {
+        let reasoning
+        try {
+          reasoning = (await llm.resolveModelInfo?.(provider.id, model.id))?.reasoning
+        } catch {
+          // Effort metadata is optional; the model stays selectable without it.
+        }
+        models.push({
+          id: model.id,
+          name: model.name || model.id,
+          efforts: (reasoning?.efforts ?? []).map(({ id, name }) => ({ id, name: name || id })),
+          defaultEffort: reasoning?.defaultEffort ?? null,
+        })
+      }
+      if (models.length) providers.push({ id: provider.id, name: provider.name || provider.id, models })
+    } catch {
+      failures.push(provider.id)
+    }
+  }
+  return { providers, failures }
+}
+
+export function mountModels(ctx, getLlm) {
+  ctx.connection.fetch.register({
+    path: '/api/ticket-dag.models',
+    methods: ['GET'],
+    requestBody: 'buffered',
+    async fetch() {
+      return Response.json(await modelCatalog(getLlm()), { headers: noStore })
+    },
+  })
 }
 
 // The managed Connection exact-route dispatcher rejects non-owner Peers before

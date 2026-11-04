@@ -365,6 +365,59 @@ test(
 )
 
 test(
+  'a ticket agent preset reaches the worker launch, its prompt and status; later edits do not change the run',
+  { timeout: 120000 },
+  async (t) => {
+    const cwd = await repo(t)
+    const jobs = []
+    const hold = gate()
+    const co = new Coordinator({
+      checks: noopChecks,
+      agents: { docs: { instructions: 'Edit documentation only.', provider: 'acme', model: 'fast-1' } },
+      launch: async (job) => {
+        jobs.push(job)
+        return {
+          dispose: async () => {},
+          result: (async () => {
+            if (job.ticketId === 'B') await hold.wait
+            await commit(job)
+            return { ok: true }
+          })(),
+        }
+      },
+    })
+    const q = { cwd, parentId: 'captain', runId: 'agents' }
+    try {
+      await co.start({
+        ...q,
+        manifest: { spec_id: 'agents', tickets: [{ ...ticket('A'), agent: 'docs' }, { ...ticket('B', ['A']), agent: 'docs' }, ticket('C')] },
+      })
+      await until(() => jobs.some((j) => j.ticketId === 'B'), 'B starts after A', 60000)
+      co.updateSettings({ checks: noopChecks, maxWorkers: 16, checkTimeoutMs: 20000, agents: { docs: { model: 'other' } } })
+      hold.release()
+      await until(async () => (await co.status(q)).complete, 'all integrate', 60000)
+      const byId = Object.fromEntries(jobs.map((j) => [j.ticketId, j]))
+      assert.deepEqual(byId.A.agentOptions, { provider: 'acme', model: 'fast-1' })
+      assert.deepEqual(byId.B.agentOptions, { provider: 'acme', model: 'fast-1' })
+      assert.match(byId.A.prompt, /Role \(docs\): Edit documentation only\./)
+      assert.equal(byId.C.agentOptions, undefined)
+      assert.doesNotMatch(byId.C.prompt, /Role/)
+      assert.deepEqual(
+        (await co.status(q)).tickets.map((r) => [r.id, r.agent, r.model]),
+        [
+          ['A', 'docs', 'acme/fast-1'],
+          ['B', 'docs', 'acme/fast-1'],
+          ['C', null, null],
+        ],
+      )
+    } finally {
+      hold.release()
+      await co.close()
+    }
+  },
+)
+
+test(
   'status identifies a running worker and the exact cumulative check being executed',
   { timeout: 20000 },
   async (t) => {

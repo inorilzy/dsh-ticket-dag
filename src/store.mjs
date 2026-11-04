@@ -94,10 +94,27 @@ function commandExists(registry, name) {
   }
 }
 
+// The resolved preset is stored with the ticket, so later profile edits cannot
+// change a run's instructions or model route. Empty fields are omitted.
+function agentSpec(registry, name) {
+  if (!Object.hasOwn(registry, name)) throw new TypeError('unknown agent preset: ' + name)
+  const preset = record(registry[name], 'agent preset ' + name)
+  const spec = {}
+  for (const field of ['instructions', 'provider', 'model', 'reasoningEffort']) {
+    const value = preset[field] ?? ''
+    if (typeof value !== 'string') throw new TypeError('agent preset ' + name + '.' + field + ' must be a string')
+    if (value.trim()) spec[field] = value.trim()
+  }
+  if ((spec.provider || spec.reasoningEffort) && !spec.model)
+    throw new TypeError('agent preset ' + name + ' sets a provider or reasoning effort without a model')
+  return spec
+}
+
 /** Accept the spec author's snake_case or the stored camelCase representation. */
-export function normalizeManifest(input, checkRegistry = {}) {
+export function normalizeManifest(input, checkRegistry = {}, agentRegistry = {}) {
   record(input, 'manifest')
   record(checkRegistry, 'checkRegistry')
+  record(agentRegistry, 'agentRegistry')
   const specId = safeId(input.specId ?? input.spec_id, 'specId')
   const baseRef = gitRef(input.baseRef ?? input.base_ref ?? 'main')
   const maxWorkers = input.maxWorkers ?? input.max_workers ?? 16
@@ -130,6 +147,10 @@ export function normalizeManifest(input, checkRegistry = {}) {
     if (raw.kind !== undefined) ticket.kind = raw.kind
     if (raw.produces !== undefined) ticket.produces = strings(raw.produces, id + '.produces')
     if (raw.consumes !== undefined) ticket.consumes = strings(raw.consumes, id + '.consumes')
+    if (raw.agent !== undefined) {
+      ticket.agent = safeId(raw.agent, id + '.agent')
+      ticket.agentSpec = agentSpec(agentRegistry, ticket.agent)
+    }
     byId.set(id, ticket)
     return ticket
   })

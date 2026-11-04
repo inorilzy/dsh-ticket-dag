@@ -29,7 +29,7 @@ const hook = registerHooks({
 const { apply } = await import('../src/index.mjs')
 hook.deregister()
 
-function harness() {
+function harness(extra = {}) {
   const calls = [],
     roster = new Map(),
     logs = new Map(),
@@ -96,7 +96,7 @@ function harness() {
     },
   }
   const checks = { lint: [['node', '--check', 'index.js']] }
-  apply(ctx, { checks, maxWorkers: 3, checkTimeoutMs: 500 })
+  apply(ctx, { checks, maxWorkers: 3, checkTimeoutMs: 500, ...extra })
   const invoke = (key, args, agent = root) =>
     tools.get(key).execute(args, { agent, signal: new AbortController().signal })
   return {
@@ -193,6 +193,32 @@ test('local child launch uses a worktree and caller-delivered completion, drains
   }
   await assert.rejects(h.api.launch(request), (error) => error === full)
   await assert.rejects(h.api.launch({ ...request, cwd: 'relative' }), /absolute/)
+  await h.close()
+})
+
+test('built-in agent presets are the default; profile presets replace them; a preset model reaches the child', async () => {
+  assert.deepEqual(Object.keys(harness().api.agents), ['implementer', 'test-writer', 'docs'])
+  const agents = { reviewer: { instructions: 'Review only.', model: 'fast-1', provider: 'acme' } }
+  const h = harness({ agents })
+  assert.deepEqual(h.api.agents, agents)
+  const received = []
+  h.ctx.subagents.startActivation = async (spec) => {
+    received.push(spec.request)
+    return { childId: spec.childId, result: new Promise(() => {}), dispose: async () => {} }
+  }
+  const request = {
+    parentId: 'root',
+    cwd: '/repo-wt',
+    prompt: 'x',
+    signal: new AbortController().signal,
+    runId: 'r',
+    ticketId: 'A',
+    attempt: 1,
+  }
+  await h.api.launch({ ...request, childId: 'c1', agentOptions: { provider: 'acme', model: 'fast-1' } })
+  await h.api.launch({ ...request, childId: 'c2' })
+  assert.deepEqual(received[0].agentOptions, { provider: 'acme', model: 'fast-1' })
+  assert.equal(Object.hasOwn(received[1], 'agentOptions'), false)
   await h.close()
 })
 

@@ -70,6 +70,7 @@ function specPrompt(meta, row, upstream) {
         (row.message || 'inspect the worktree')
       : '',
     'Ticket: ' + row.id + ' — ' + row.title,
+    row.agentSpec?.instructions ? 'Role (' + row.agent + '): ' + row.agentSpec.instructions : '',
     row.prompt,
     'Acceptance: ' + JSON.stringify(row.acceptance) + '. Required check IDs: ' + JSON.stringify(row.verify),
     'When work is complete, commit all intended changes on this branch and leave git status clean. The final commit message must end with these four separate Git trailers (in a final paragraph). A WIP commit is not a completion receipt:',
@@ -99,6 +100,16 @@ async function stampedSource(meta, row) {
   }
   return source
 }
+// Host child-agent route for one ticket; undefined keeps the host default.
+function agentOptions(row) {
+  const { provider, model, reasoningEffort } = row.agentSpec ?? {}
+  if (!model) return undefined
+  return { ...(provider && { provider }), model, ...(reasoningEffort && { reasoningEffort }) }
+}
+function modelRoute(row) {
+  const options = agentOptions(row)
+  return options ? [options.provider, options.model].filter(Boolean).join('/') : null
+}
 
 // A per-run asynchronous command queue. Long worker/model turns and test runs
 // run outside this queue; mutations that grant ownership or publish a ref do not.
@@ -126,6 +137,7 @@ export class Coordinator {
     canRetry = async () => false,
     rememberRun,
     checks = {},
+    agents = {},
     maxWorkers = 16,
     checkTimeoutMs = 120000,
     retryDelayMs = 1500,
@@ -142,6 +154,7 @@ export class Coordinator {
       canRetry,
       rememberRun,
       checks,
+      agents,
       maxWorkers,
       checkTimeoutMs,
       retryDelayMs,
@@ -153,7 +166,7 @@ export class Coordinator {
     this.stopping = false
   }
 
-  updateSettings({ checks, maxWorkers, checkTimeoutMs }) {
+  updateSettings({ checks, agents = this.agents, maxWorkers, checkTimeoutMs }) {
     requireValue(
       Number.isInteger(maxWorkers) && maxWorkers >= 1 && maxWorkers <= 32,
       'Host maxWorkers must be 1..32',
@@ -162,9 +175,9 @@ export class Coordinator {
       Number.isInteger(checkTimeoutMs) && checkTimeoutMs >= 1 && checkTimeoutMs <= 2_147_483_647,
       'Invalid check timeout',
     )
-    // Already-open runs retain their immutable verification command snapshots.
-    // A running worker or a verification process keeps its current handle.
-    Object.assign(this, { checks, maxWorkers, checkTimeoutMs })
+    // Already-open runs retain their immutable verification command and agent
+    // preset snapshots. A running worker or a verification process keeps its handle.
+    Object.assign(this, { checks, agents, maxWorkers, checkTimeoutMs })
     for (const run of this.runs.values()) this._wake(run)
   }
 
@@ -173,7 +186,7 @@ export class Coordinator {
       !this.stopping && typeof parentId === 'string' && parentId.length,
       'A live captain is required',
     )
-    const manifest = normalizeManifest(input, checks)
+    const manifest = normalizeManifest(input, checks, this.agents)
     const id = safeId(runId ?? 'r-' + hash(parentId + '\0' + manifest.specId).slice(0, 20))
     const run = await this._open({ cwd, parentId, runId: id }, { manifest, checks })
     const meta = run.db.meta()
@@ -469,10 +482,14 @@ export class Coordinator {
           message,
           autoRetries,
           retryAt,
+          agent,
+          agentSpec,
         }) => ({
           id,
           title,
           status,
+          agent: agent ?? null,
+          model: modelRoute({ agentSpec }),
           livePhase:
             status === 'RUNNING'
               ? (run.work.get(id)?.phase ?? null)
@@ -742,6 +759,7 @@ export class Coordinator {
         childId: row.childId,
         cwd: row.path,
         prompt: specPrompt(m, row, upstream),
+        agentOptions: agentOptions(row),
         signal: job.ctrl.signal,
         runId: m.runId,
         ticketId: row.id,
