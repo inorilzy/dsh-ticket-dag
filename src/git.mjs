@@ -36,13 +36,61 @@ function rootOf(repo) {
   return root
 }
 
-async function git(repo, ...args) {
-  // Persisted metadata identifies one repository, even if the original checkout
-  // path is subsequently replaced by another clone containing the very same SHAs.
-  if (typeof repo === 'object' && repo?.commonDir) {
-    const actual = await git(rootOf(repo), 'rev-parse', '--path-format=absolute', '--git-common-dir')
-    verify((await realpath(actual)) === repo.commonDir, 'Git repository identity changed')
+// Passed identity checks, keyed by checkout and expected common directory. An
+// entry is reused only while the checkout directory, its .git entry and any
+// commondir redirect are the very same unmodified filesystem objects.
+const verifiedIdentity = new Map()
+
+async function identityPrint(root) {
+  // Git itself keeps writing inside directories, so only their identity counts.
+  const entry = (s) => [s.dev, s.ino, s.birthtimeNs, ...(s.isDirectory() ? [] : [s.mtimeNs, s.size])].join('.')
+  try {
+    const dotGit = join(root, '.git')
+    const [dir, link] = await Promise.all([stat(root, { bigint: true }), lstat(dotGit, { bigint: true })])
+    const parts = [dir.dev, dir.ino, dir.birthtimeNs, entry(link)]
+    let admin = dotGit
+    if (link.isFile()) {
+      const text = await readFile(dotGit, 'utf8')
+      parts.push(text)
+      admin = resolve(root, text.replace(/^gitdir: */, '').trim())
+      parts.push(entry(await stat(admin, { bigint: true })))
+    } else if (!link.isDirectory()) return null
+    const commondir = join(admin, 'commondir')
+    try {
+      parts.push(entry(await lstat(commondir, { bigint: true })), await readFile(commondir, 'utf8'))
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err
+    }
+    return parts.join('|')
+  } catch {
+    // Unknown layout: never reuse a cached answer.
+    return null
   }
+}
+
+// Persisted metadata identifies one repository, even if the original checkout
+// path is subsequently replaced by another clone containing the very same SHAs.
+async function checkIdentity(repo) {
+  const root = rootOf(repo)
+  const key = root + '\0' + repo.commonDir
+  const print = await identityPrint(root)
+  const known = verifiedIdentity.get(key)
+  if (print !== null && known?.print === print) return known.check
+  const check = (async () => {
+    const actual = await git(root, 'rev-parse', '--path-format=absolute', '--git-common-dir')
+    verify((await realpath(actual)) === repo.commonDir, 'Git repository identity changed')
+  })()
+  if (print !== null) {
+    verifiedIdentity.set(key, { print, check })
+    check.catch(() => {
+      if (verifiedIdentity.get(key)?.check === check) verifiedIdentity.delete(key)
+    })
+  }
+  return check
+}
+
+async function git(repo, ...args) {
+  if (typeof repo === 'object' && repo?.commonDir) await checkIdentity(repo)
   const { stdout } = await exec('git', args, {
     cwd: rootOf(repo),
     env: envForCheckout(),

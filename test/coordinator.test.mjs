@@ -50,8 +50,11 @@ async function commit(job, body = job.ticketId) {
   await git(job.cwd, 'commit', '-qm', 'Deliver ' + job.ticketId, '-m', trailers)
 }
 const ticket = (id, depends_on = []) => ({ id, title: id, depends_on, verify: ['verify'] })
+// Every Git call and check is a process start, which costs several times more on Windows.
+const timeScale = process.platform === 'win32' ? 3 : 1
+const limit = (ms) => ms * timeScale
 async function until(check, label, ms = 90000) {
-  const deadline = Date.now() + ms
+  const deadline = Date.now() + limit(ms)
   while (Date.now() < deadline) {
     const v = await check()
     if (v) return v
@@ -62,7 +65,7 @@ async function until(check, label, ms = 90000) {
 
 test(
   '16 concurrent worker turns; no wave barrier; accepted dependencies, stable ref and one completion wake',
-  { timeout: 110000 },
+  { timeout: limit(110000) },
   async (t) => {
     const cwd = await repo(t),
       main = await git(cwd, 'rev-parse', 'HEAD'),
@@ -151,7 +154,7 @@ test(
 
 test(
   'terminal transport error keeps dirty state for retry; lost completion receipt is adopted',
-  { timeout: 45000 },
+  { timeout: limit(45000) },
   async (t) => {
     const cwd = await repo(t),
       attempts = new Map()
@@ -198,7 +201,7 @@ test(
 
 test(
   'failed verification keeps accepted tip; repair is a new attempt on original ticket branch',
-  { timeout: 45000 },
+  { timeout: limit(45000) },
   async (t) => {
     const cwd = await repo(t)
     const checks = {
@@ -249,7 +252,7 @@ test(
 
 test(
   'unknown activation is fenced; isolated retry leaves the old worktree and branch intact',
-  { timeout: 45000 },
+  { timeout: limit(45000) },
   async (t) => {
     const cwd = await repo(t),
       jobs = []
@@ -301,7 +304,7 @@ test(
 
 test(
   'saving settings changes admission without cancelling workers and preserves each open run’s checks',
-  { timeout: 45000 },
+  { timeout: limit(45000) },
   async (t) => {
     const cwd = await repo(t)
     const holds = new Map(['A', 'B'].map((id) => [id, gate()]))
@@ -367,7 +370,7 @@ test(
 
 test(
   'a ticket agent preset reaches the worker launch, its prompt and status; later edits do not change the run',
-  { timeout: 120000 },
+  { timeout: limit(120000) },
   async (t) => {
     const cwd = await repo(t)
     const jobs = []
@@ -420,7 +423,7 @@ test(
 
 test(
   'a preset concurrency cap holds back only that preset; raising it in settings admits more at once',
-  { timeout: 120000 },
+  { timeout: limit(120000) },
   async (t) => {
     const cwd = await repo(t)
     const holds = new Map(['D1', 'D2', 'D3', 'P'].map((id) => [id, gate()]))
@@ -479,7 +482,7 @@ test(
 
 test(
   'with approval required a run waits staged; the user approval sets each ticket preset and model, then dispatch starts',
-  { timeout: 120000 },
+  { timeout: limit(120000) },
   async (t) => {
     const cwd = await repo(t)
     const jobs = []
@@ -567,7 +570,7 @@ function tamper(file, sql) {
 
 test(
   'a staged run edited to active in the ledger is held, dispatches nothing and still waits for the user',
-  { timeout: 60000 },
+  { timeout: limit(60000) },
   async (t) => {
     const cwd = await repo(t)
     const jobs = []
@@ -610,7 +613,7 @@ test(
 
 test(
   'a ticket verify edited in the ledger holds the run and its submission is never integrated',
-  { timeout: 60000 },
+  { timeout: limit(60000) },
   async (t) => {
     const cwd = await repo(t)
     const worker = gate()
@@ -656,7 +659,7 @@ test(
 
 test(
   'a ticket whose planned preset was deleted from settings can still be approved with its frozen preset',
-  { timeout: 60000 },
+  { timeout: limit(60000) },
   async (t) => {
     const cwd = await repo(t)
     const jobs = []
@@ -692,7 +695,7 @@ test(
   },
 )
 
-test('a staged run can be discarded from the board without dispatching anything', { timeout: 60000 }, async (t) => {
+test('a staged run can be discarded from the board without dispatching anything', { timeout: limit(60000) }, async (t) => {
   const cwd = await repo(t)
   let launched = 0
   const co = new Coordinator({
@@ -719,7 +722,7 @@ test('a staged run can be discarded from the board without dispatching anything'
 
 test(
   'status identifies a running worker and the exact cumulative check being executed',
-  { timeout: 20000 },
+  { timeout: limit(20000) },
   async (t) => {
     const cwd = await repo(t)
     const release = join(cwd, '..', 'allow-final-check')
@@ -778,3 +781,92 @@ test(
     }
   },
 )
+
+test('a ledger error while recording a worker or merge failure holds the run without an unhandled rejection', { timeout: limit(60000) }, async (t) => {
+  const cwd = await repo(t)
+  const unhandled = []
+  const record = (err) => unhandled.push(err)
+  process.on('unhandledRejection', record)
+  t.after(() => process.off('unhandledRejection', record))
+  const worker = gate()
+  const co = new Coordinator({
+    checks: { ...noopChecks, fail: [[process.execPath, '-e', 'process.exit(17)']] },
+    launch: async (job) => ({
+      dispose: async () => {},
+      result: (async () => {
+        await worker.wait
+        if (job.runId === 'worker-fails') return { ok: false, detail: 'worker gave up' }
+        await commit(job)
+        return { ok: true }
+      })(),
+    }),
+  })
+  const brokenLedger = (runId) => {
+    const run = [...co.runs.values()].find((r) => r.db.meta().runId === runId)
+    const move = run.db.move.bind(run.db)
+    run.db.move = (...args) => {
+      if (args[3] === 'NEEDS_ATTENTION') throw Error('ledger write failed for ' + runId)
+      return move(...args)
+    }
+  }
+  const worked = { cwd, parentId: 'captain', runId: 'worker-fails' }
+  const merged = { cwd, parentId: 'captain', runId: 'merge-fails' }
+  try {
+    await co.start({ ...worked, manifest: { spec_id: 'w', tickets: [ticket('A')] } })
+    await co.start({ ...merged, manifest: { spec_id: 'm', tickets: [{ ...ticket('B'), verify: ['fail'] }] } })
+    brokenLedger('worker-fails')
+    brokenLedger('merge-fails')
+    worker.release()
+    for (const q of [worked, merged]) {
+      const held = await until(async () => {
+        const s = await co.status(q)
+        return s.mode === 'paused' && s
+      }, 'held ' + q.runId)
+      assert.match(held.diagnostic, new RegExp('ledger write failed for ' + q.runId))
+    }
+    await sleep(200)
+    assert.deepEqual(unhandled, [])
+  } finally {
+    worker.release()
+    await co.close()
+  }
+})
+
+test('shutdown closes every run even if one run fails to close', { timeout: limit(60000) }, async (t) => {
+  const cwd = await repo(t)
+  const options = { checks: noopChecks, requireApproval: true, launch: async () => Error('unexpected launch') }
+  const co = new Coordinator(options)
+  const runIds = ['close-a', 'close-b', 'close-c']
+  const closed = []
+  let broken
+  for (const runId of runIds)
+    await co.start({ cwd, parentId: 'captain', runId, manifest: { spec_id: runId, tickets: [ticket('A')] } })
+  for (const run of co.runs.values()) {
+    const { runId } = run.db.meta()
+    const [db, owner] = [run.db.close.bind(run.db), run.owner.close.bind(run.owner)]
+    run.owner.close = () => {
+      closed.push(runId + ' owner')
+      owner()
+    }
+    if (runId === 'close-a') {
+      broken = db
+      run.db.close = () => {
+        throw Error('ledger close failed')
+      }
+    } else
+      run.db.close = () => {
+        closed.push(runId + ' ledger')
+        db()
+      }
+  }
+  await assert.rejects(co.close(), (err) => err instanceof AggregateError && /ledger close failed/.test(err.errors[0].message))
+  broken()
+  assert.deepEqual(closed.sort(), ['close-a owner', 'close-b ledger', 'close-b owner', 'close-c ledger', 'close-c owner'])
+  // Every run's ownership lock is released, so another coordinator can take each one over.
+  const next = new Coordinator(options)
+  try {
+    for (const runId of runIds) assert.equal((await next.status({ cwd, parentId: 'captain', runId })).mode, 'staged')
+  } finally {
+    await next.close()
+  }
+})
