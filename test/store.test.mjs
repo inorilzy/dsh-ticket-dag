@@ -90,6 +90,19 @@ test('a ticket agent preset is frozen into the manifest; tickets without one are
     JSON.stringify(normalizeManifest(plan([ticket('A')]), checks, agents)),
     JSON.stringify(manifest([ticket('A')])),
   )
+  // Bytes produced by the 0.2.0 normalizer for the same plan.
+  assert.equal(
+    JSON.stringify(
+      normalizeManifest(
+        plan([ticket('A'), { ...ticket('B', ['A']), kind: 'code', produces: ['api'], acceptance: ['ok'] }]),
+        checks,
+        agents,
+      ),
+    ),
+    '{"specId":"test","baseRef":"refs/heads/main","maxWorkers":16,"tickets":[' +
+      '{"id":"A","title":"Implement A","prompt":"Implement A","dependsOn":[],"verify":["unit"],"acceptance":[]},' +
+      '{"id":"B","title":"Implement B","prompt":"Implement B","dependsOn":["A"],"verify":["unit"],"acceptance":["ok"],"kind":"code","produces":["api"]}]}',
+  )
   const m = normalizeManifest(plan([{ ...ticket('A'), agent: 'test-writer' }, ticket('B')]), checks, agents)
   assert.equal(m.tickets[0].agent, 'test-writer')
   assert.deepEqual(m.tickets[0].agentSpec, { instructions: 'Only add tests.', provider: 'acme', model: 'fast-1' })
@@ -262,8 +275,9 @@ test('ambiguous publication remains visible, blocks new publishing and cannot be
   }
 })
 
-test('a staged run admits nothing until approved; approval freezes each ticket choice into the manifest', (t) => {
-  const db = new RunStore(tempDb(t))
+test('a staged run admits nothing until approved; approval freezes each ticket choice beside the original manifest', (t) => {
+  const file = tempDb(t)
+  let db = new RunStore(file)
   try {
     const spec = manifest([ticket('A'), ticket('B', ['A'])])
     db.init({
@@ -292,9 +306,16 @@ test('a staged run admits nothing until approved; approval freezes each ticket c
     assert.equal(db.meta().diagnostic, null)
     assert.deepEqual(db.get('A').agentSpec, { instructions: 'Docs.', model: 'fast-1' })
     assert.equal(db.get('A').agent, 'docs')
-    assert.deepEqual(db.meta().manifest.tickets[0].agentSpec, { instructions: 'Docs.', model: 'fast-1' })
+    // The submitted manifest stays byte-identical so dag_run remains idempotent.
+    assert.equal(JSON.stringify(db.meta().manifest), JSON.stringify(spec))
     assert.equal(Object.hasOwn(db.get('B'), 'agent'), false)
-    assert.ok(db.claim('A', assignment('A')))
+    const claimed = db.claim('A', assignment('A'))
+    assert.deepEqual(claimed.agentSpec, { instructions: 'Docs.', model: 'fast-1' })
+    assert.deepEqual(db.tickets()[0].agentSpec, claimed.agentSpec)
+    db.close()
+    db = new RunStore(file)
+    assert.equal(JSON.stringify(db.meta().manifest), JSON.stringify(spec))
+    assert.equal(db.get('A').agent, 'docs')
     assert.equal(db.approve(choices), false, 'approval happens once')
     assert.deepEqual(
       db.pendingNotifications().map((n) => n.type),

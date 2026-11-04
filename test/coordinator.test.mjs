@@ -501,11 +501,10 @@ test(
       },
     })
     const q = { cwd, parentId: 'captain', runId: 'staged' }
+    const plan = { spec_id: 'staged', tickets: [{ ...ticket('A'), agent: 'docs' }, ticket('B', ['A'])] }
+    let reopened
     try {
-      const started = await co.start({
-        ...q,
-        manifest: { spec_id: 'staged', tickets: [{ ...ticket('A'), agent: 'docs' }, ticket('B', ['A'])] },
-      })
+      const started = await co.start({ ...q, manifest: plan })
       assert.equal(started.mode, 'staged')
       await sleep(400)
       assert.equal(jobs.length, 0, 'nothing is dispatched before approval')
@@ -520,6 +519,12 @@ test(
         { id: 'B', agent: 'impl', provider: '', model: '', reasoningEffort: '' },
       ])
       assert.equal(approved.mode, 'active')
+      // The captain may resubmit the original manifest: approval is not a manifest change.
+      const again = await co.start({ ...q, manifest: plan })
+      assert.equal(again.runId, 'staged')
+      assert.equal(again.mode, 'active')
+      assert.equal(again.tickets[0].model, 'acme/deep-2')
+      assert.equal(again.tickets[1].agent, 'impl')
       await until(async () => (await co.status(q)).complete, 'approved run integrates', 60000)
       const byId = Object.fromEntries(jobs.map((j) => [j.ticketId, j]))
       assert.deepEqual(byId.A.agentOptions, { provider: 'acme', model: 'deep-2', reasoningEffort: 'high' })
@@ -527,8 +532,23 @@ test(
       assert.equal(byId.B.agentOptions, undefined)
       assert.match(byId.B.prompt, /Role \(impl\): Implement\./)
       await assert.rejects(co.approve(file, []), /not waiting for approval/)
+      await co.close()
+      // A fresh coordinator loads the ledger and still accepts the original manifest.
+      reopened = new Coordinator({
+        checks: noopChecks,
+        requireApproval: true,
+        agents: co.agents,
+        launch: async () => {
+          throw Error('unexpected launch')
+        },
+      })
+      const loaded = await reopened.start({ ...q, manifest: plan })
+      assert.equal(loaded.complete, true)
+      assert.equal(loaded.tickets[0].model, 'acme/deep-2')
+      assert.equal(loaded.tickets[0].route.reasoningEffort, 'high')
     } finally {
       await co.close()
+      await reopened?.close()
     }
   },
 )
