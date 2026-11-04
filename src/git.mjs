@@ -1,6 +1,6 @@
-import { execFile } from 'node:child_process'
-import { lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises'
-import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { execFile, spawn } from 'node:child_process'
+import { lstat, mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
+import { delimiter, dirname, extname, isAbsolute, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
 const exec = promisify(execFile)
@@ -396,7 +396,123 @@ export async function publishCandidate(repo, ref, oldTip, candidateSha) {
   return candidate
 }
 
-/** Sequential trusted argv checks. No shell expansion. Timeout applies to each command and kills its direct process. */
+const isWindows = process.platform === 'win32'
+// Inside a double-quoted cmd.exe token these still expand, escape or end the quote.
+// The rest are rejected too, because batch scripts often re-expand %* unquoted.
+const cmdMeta = /["%!^&|<>\r\n]/
+
+function envValue(env, name) {
+  const key = Object.keys(env).find((k) => k.toUpperCase() === name)
+  return key ? env[key] : undefined
+}
+
+async function isFile(path) {
+  try {
+    return (await stat(path)).isFile()
+  } catch {
+    return false
+  }
+}
+
+/** Windows: the batch file argv[0] would launch (PATH/PATHEXT lookup), or null for a native executable. */
+async function windowsBatch(command, cwd, env) {
+  const exts = (envValue(env, 'PATHEXT') || '.COM;.EXE;.BAT;.CMD')
+    .split(';')
+    .filter(Boolean)
+    .map((ext) => ext.toLowerCase())
+  const names = extname(command) ? [command] : exts.map((ext) => command + ext)
+  const dirs = /[\\/]/.test(command)
+    ? [cwd]
+    : [cwd, ...(envValue(env, 'PATH') || '').split(delimiter).filter(Boolean)]
+  for (const dir of dirs) {
+    for (const name of names) {
+      const path = resolve(dir, name)
+      if (await isFile(path)) return /\.(?:bat|cmd)$/i.test(path) ? path : null
+    }
+  }
+  return null
+}
+
+function quoteForCmd(arg) {
+  verify(!cmdMeta.test(arg), 'Check argument contains a cmd.exe metacharacter ("%!^&|<>, CR or LF): ' + arg)
+  // Double trailing backslashes so the closing quote survives CRT argv parsing downstream.
+  return '"' + arg.replace(/(\\+)$/, '$1$1') + '"'
+}
+
+/** spawn() arguments; .cmd/.bat run via cmd.exe with strictly quoted, metacharacter-free tokens. */
+async function checkCommand(argv, cwd, env) {
+  const batch = isWindows ? await windowsBatch(argv[0], cwd, env) : null
+  if (!batch) return { file: argv[0], args: argv.slice(1), verbatim: false }
+  const line = [batch, ...argv.slice(1)].map(quoteForCmd).join(' ')
+  const comspec = envValue(env, 'COMSPEC') || 'cmd.exe'
+  return { file: comspec, args: ['/d', '/s', '/v:off', '/c', '"' + line + '"'], verbatim: true }
+}
+
+function killTree(child) {
+  if (!child.pid) return Promise.resolve()
+  if (isWindows) {
+    const root = process.env.SystemRoot
+    const taskkill = root ? join(root, 'System32', 'taskkill.exe') : 'taskkill'
+    return new Promise((done) =>
+      execFile(taskkill, ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true }, (err) => {
+        if (err) child.kill('SIGKILL')
+        done()
+      }),
+    )
+  }
+  try {
+    process.kill(-child.pid, 'SIGKILL')
+  } catch {
+    child.kill('SIGKILL')
+  }
+  return Promise.resolve()
+}
+
+/** Run one check; on abort or output overflow, kill its whole process tree and wait for stdio to close. */
+function runCheck(command, { cwd, env, signal }) {
+  return new Promise((done, fail) => {
+    const child = spawn(command.file, command.args, {
+      cwd,
+      env,
+      shell: false,
+      windowsHide: true,
+      windowsVerbatimArguments: command.verbatim,
+      // POSIX: own process group, so process.kill(-pid) reaches every descendant.
+      detached: !isWindows,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    const out = { stdout: '', stderr: '' }
+    let error = null
+    let killing = null
+    const stop = (cause) => {
+      error ??= cause
+      killing ??= killTree(child)
+    }
+    for (const name of ['stdout', 'stderr']) {
+      child[name].setEncoding('utf8')
+      child[name].on('data', (chunk) => {
+        out[name] += chunk
+        if (out[name].length > maxOutput) stop(new Error(name + ' maxBuffer length exceeded'))
+      })
+    }
+    const onAbort = () => stop(signal.reason ?? new Error('aborted'))
+    if (signal.aborted) onAbort()
+    else signal.addEventListener('abort', onAbort, { once: true })
+    child.once('error', (err) => {
+      error ??= err
+    })
+    child.once('close', async (code, signalName) => {
+      signal.removeEventListener('abort', onAbort)
+      await killing
+      if (!error && code !== 0)
+        error = new Error('Command exited with ' + (signalName ? 'signal ' + signalName : 'code ' + code))
+      if (!error) return done(out)
+      fail(Object.assign(new Error(error?.message ?? String(error), { cause: error }), out, { code }))
+    })
+  })
+}
+
+/** Sequential trusted argv checks. No shell expansion. Timeout or cancellation kills each command's whole process tree. */
 export async function runChecks(cwd, checks, { signal, timeoutMs = 120_000 } = {}) {
   verify(Array.isArray(checks), 'Checks must be an array of argv arrays')
   verify(
@@ -418,27 +534,8 @@ export async function runChecks(cwd, checks, { signal, timeoutMs = 120_000 } = {
     const timer = AbortSignal.timeout(timeoutMs)
     const stop = signal ? AbortSignal.any([timer, signal]) : timer
     try {
-      const options = {
-        cwd,
-        env: envForCheckout(),
-        shell: false,
-        windowsHide: true,
-        encoding: 'utf8',
-        signal: stop,
-        killSignal: 'SIGKILL',
-        maxBuffer: maxOutput,
-      }
-      const pending = exec(argv[0], argv.slice(1), options)
-      // Node may reject on AbortSignal before the killed child has closed its
-      // stdio/handle. A caller can safely reclaim the direct process's slot
-      // after this check settles; arbitrary child process trees need host supervision.
-      const closed = new Promise((resolve) => pending.child.once('close', resolve))
-      let output
-      try {
-        output = await pending
-      } finally {
-        await closed
-      }
+      const env = envForCheckout()
+      const output = await runCheck(await checkCommand(argv, cwd, env), { cwd, env, signal: stop })
       results.push({ argv: [...argv], stdout: output.stdout, stderr: output.stderr })
     } catch (cause) {
       const reason = timer.aborted ? 'timed out' : signal?.aborted ? 'was cancelled' : 'failed'
