@@ -82,9 +82,10 @@ function loadHost(seeds, { expanded = false, config = { status: 'loading' } } = 
   return host
 }
 
-// Editor state order: edit draft, notice, busy, model catalog.
-function editorFor(value, catalog) {
-  const Panel = loadSlots([null, null, false, catalog])['plugins.row.config']
+// Editor state order: edit draft, notice, busy, model catalog, expanded preset rows.
+// By default every preset row is seeded open so its fields can be inspected.
+function editorFor(value, catalog, open = new Set([0, 1, 2, 3, 4, 5])) {
+  const Panel = loadSlots([null, null, false, catalog, open])['plugins.row.config']
   const form = { state: { status: 'ready', value, writable: true, revision: 1 }, mutate: async () => true }
   return render({ type: Panel, props: { view: 'detail', form }, children: [] })
 }
@@ -361,14 +362,43 @@ test('the plugin page tab is the Agent preset page: max agents, presets, per-pre
   const page = host.renderSlot('plugins.tab', {})
   const input = (label) => find(page, (n) => n.props['aria-label'] === label)
   assert.equal(input('最大 Agent 数量').props.value, '6')
-  assert.equal(input('docs 的同时运行上限').props.value, '2')
-  assert.ok(input('docs 的模型'))
+  // Saved presets show as a compact list; fields appear only while editing.
+  assert.equal(input('docs 的模型'), undefined)
+  const row = find(page, (n) => n.props['data-dag-preset'] === 'docs')
+  assert.match(text(row), /docs/)
+  assert.match(text(row), /宿主默认模型/)
+  assert.match(text(row), /同时运行 ≤ 2/)
+  assert.ok(find(row, (n) => n.type === 'button' && text(n) === '编辑'))
   assert.equal(input('验收超时（毫秒）'), undefined)
   assert.equal(find(page, (n) => n.type === 'h3' && text(n) === '验收命令'), undefined)
   assert.ok(host.urls.includes('api/ticket-dag.models'))
 
   const loading = loadHost([]).renderSlot('plugins.tab', {})
   assert.match(text(loading), /正在读取插件配置/)
+})
+
+test('collapsed preset rows summarise model, effort and limit; an expanded row shows its fields', () => {
+  const value = {
+    agents: {
+      docs: { description: '文档', instructions: 'x', provider: 'acme', model: 'deep-2', reasoningEffort: 'high', maxConcurrent: 0 },
+      tests: { description: '测试', instructions: 'y', provider: 'acme', model: 'fast-1', reasoningEffort: '', maxConcurrent: 3 },
+    },
+  }
+  const collapsed = editorFor(value, catalog, new Set())
+  const rows = findAll(collapsed, (n) => n.props['data-dag-preset'] !== undefined)
+  assert.deepEqual(rows.map((r) => r.props['data-dag-preset']), ['docs', 'tests'])
+  assert.match(text(rows[0]), /文档/)
+  assert.match(text(rows[0]), /Deep 2 · High/)
+  assert.match(text(rows[0]), /不单独限制/)
+  assert.match(text(rows[1]), /Fast 1/)
+  assert.match(text(rows[1]), /同时运行 ≤ 3/)
+  assert.equal(find(collapsed, (n) => n.props['aria-label'] === 'docs 的模型'), undefined)
+
+  const one = editorFor(value, catalog, new Set([1]))
+  assert.equal(find(one, (n) => n.props['aria-label'] === 'docs 的模型'), undefined)
+  assert.ok(find(one, (n) => n.props['aria-label'] === 'tests 的模型'))
+  const done = find(one, (n) => n.props['data-dag-preset'] === 'tests')
+  assert.ok(find(done, (n) => n.type === 'button' && text(n) === '收起'))
 })
 
 test('the full settings form also edits each preset limit', () => {

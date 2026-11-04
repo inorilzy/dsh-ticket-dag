@@ -132,6 +132,10 @@ window.__ModuleLoader__.load({
 .dtd-steps [data-state=done] {border-color:var(--dtd-done);opacity:1}
 .dtd-steps [data-state=current] {border-color:var(--dtd-work);opacity:1;font-weight:600}
 .dtd-detail .dtd-run-head strong {font-size:.96rem}
+.dtd-panel .dtd-preset:not(.dtd-rule) {border:1px solid color-mix(in srgb,currentColor 16%,transparent);border-radius:.55rem;padding:.5rem .75rem}
+.dtd-preset-row {display:flex;flex-wrap:wrap;align-items:center;gap:.3rem .8rem}
+.dtd-preset-row .dtd-actions {margin-inline-start:auto}
+.dtd-preset-meta {font-size:.83rem;background:color-mix(in srgb,currentColor 7%,transparent);border-radius:.35rem;padding:.1rem .45rem}
 `
 
     function draftFor(value) {
@@ -373,16 +377,38 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function AgentRule({ agent, index, catalog, modify, remove }) {
+    // One line per preset: what it is, which model, how many may run at once.
+    function presetSummary(agent, catalog) {
+      const model = catalog?.providers
+        ?.find((p) => p.id === agent.provider)
+        ?.models.find((m) => m.id === agent.model)
+      const route = agent.model
+        ? (model?.name ?? [agent.provider, agent.model].filter(Boolean).join('/'))
+        : '宿主默认模型'
+      const effort = agent.reasoningEffort
+        ? (model?.efforts.find((x) => x.id === agent.reasoningEffort)?.name ?? agent.reasoningEffort)
+        : ''
+      const cap = Number(agent.maxConcurrent) || 0
+      return [route + (effort ? ' · ' + effort : ''), cap > 0 ? '同时运行 ≤ ' + cap : '不单独限制']
+    }
+
+    function AgentRule({ agent, index, catalog, open, toggle, modify, remove }) {
+      const name = agent.id || '预设 ' + (index + 1)
+      const [route, limit] = presetSummary(agent, catalog)
+      const head = h(
+        'div',
+        { className: 'dtd-preset-row' },
+        h('strong', null, name),
+        agent.description && h('span', { className: 'dtd-hint' }, agent.description),
+        h('span', { className: 'dtd-preset-meta' }, route),
+        h('span', { className: 'dtd-preset-meta' }, limit),
+        h('span', { className: 'dtd-actions' }, button(open ? '收起' : '编辑', toggle), button('移除', remove)),
+      )
+      if (!open) return h('section', { className: 'dtd-preset', 'data-dag-preset': agent.id, 'aria-label': '预设 ' + name }, head)
       return h(
         'section',
-        { className: 'dtd-rule', 'aria-label': '预设 ' + (agent.id || index + 1) },
-        h(
-          'div',
-          { className: 'dtd-head' },
-          h('h4', null, agent.id || '预设 ' + (index + 1)),
-          button('移除预设', remove),
-        ),
+        { className: 'dtd-rule dtd-preset', 'data-dag-preset': agent.id, 'aria-label': '预设 ' + name },
+        head,
         h(
           'div',
           { className: 'dtd-grid' },
@@ -442,6 +468,8 @@ window.__ModuleLoader__.load({
       const [notice, setNotice] = useState(null)
       const [busy, setBusy] = useState(false)
       const [catalog, setCatalog] = useState(null)
+      // Indices of preset rows being edited; saved presets show collapsed.
+      const [open, setOpen] = useState(() => new Set())
       const inFlight = useRef(false)
       useEffect(() => {
         const ctrl = new AbortController()
@@ -469,6 +497,14 @@ window.__ModuleLoader__.load({
       function discard() {
         setEdit(null)
         setNotice(null)
+        setOpen(new Set())
+      }
+      function toggle(i) {
+        setOpen((old) => {
+          const next = new Set(old)
+          if (!next.delete(i)) next.add(i)
+          return next
+        })
       }
       async function save(event) {
         event.preventDefault()
@@ -481,6 +517,7 @@ window.__ModuleLoader__.load({
             throw new Error('宿主未接受本次保存。请检查配置或重新载入当前值。')
           }
           setEdit(null)
+          setOpen(new Set())
           setNotice({ text: '配置已保存。' })
         } catch (error) {
           setNotice({ error: true, text: error.message || '保存失败，修改仍保留在表单中。' })
@@ -564,7 +601,10 @@ window.__ModuleLoader__.load({
             h(
               'div',
               { className: 'dtd-actions' },
-              button('添加预设 Agent', () => change((d) => d.agents.push(agentRow('', null)))),
+              button('添加预设 Agent', () => {
+                setOpen((old) => new Set(old).add(draft.agents.length))
+                change((d) => d.agents.push(agentRow('', null)))
+              }),
               button(
                 '补入内置预设',
                 () =>
@@ -584,8 +624,14 @@ window.__ModuleLoader__.load({
                 agent: a,
                 index: i,
                 catalog: catalog?.error ? null : catalog,
+                open: open.has(i),
+                toggle: () => toggle(i),
                 modify: (fn) => change((d) => fn(d.agents[i])),
-                remove: () => change((d) => d.agents.splice(i, 1)),
+                remove: () => {
+                  // Row indices shift after a removal, so editing state restarts collapsed.
+                  setOpen(new Set())
+                  change((d) => d.agents.splice(i, 1))
+                },
               }),
             ),
           ),
