@@ -1,0 +1,6 @@
+- insert:
+    - id: dsh-ticket-dag
+      name: dsh-ticket-dag
+      config:
+        maxWorkers: 16
+        checks: {}

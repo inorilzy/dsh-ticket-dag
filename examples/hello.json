@@ -1,0 +1,32 @@
+{
+  "spec_id": "hello-dag",
+  "base_ref": "main",
+  "max_workers": 2,
+  "tickets": [
+    {
+      "id": "A",
+      "title": "实现问候函数",
+      "prompt": "在 dag-demo/greet.cjs 导出 greet(name)，返回 Hello 加一个空格再加 name。",
+      "produces": ["greeting"],
+      "acceptance": ["greet('Ada') 返回 Hello Ada"],
+      "verify": ["greeting"]
+    },
+    {
+      "id": "C",
+      "title": "实现输入清理",
+      "prompt": "在 dag-demo/normalize.cjs 导出 normalize(name)，返回清除首尾空白后的字符串。",
+      "produces": ["normalizer"],
+      "acceptance": ["normalize(' Ada ') 返回 Ada"],
+      "verify": ["normalize"]
+    },
+    {
+      "id": "B",
+      "title": "组合上游函数",
+      "prompt": "在 dag-demo/welcome.cjs 导出 welcome(name)。使用相邻文件的 normalize 和 greet 生成结果。",
+      "depends_on": ["A", "C"],
+      "consumes": ["greeting", "normalizer"],
+      "acceptance": ["welcome(' Ada ') 返回 Hello Ada"],
+      "verify": ["welcome"]
+    }
+  ]
+}

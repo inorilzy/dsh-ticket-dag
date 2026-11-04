@@ -1,0 +1,119 @@
+# dsh-ticket-dag
+
+DeepSeek Harness 的本地 Git 工单调度插件。队长交给它一个已确认的 JSON 清单。插件为每张开发工单创建独立分支、worktree 和 DSH 子会话，并行执行就绪工单，将测试通过的候选逐个合入本轮集成分支。运行完成或需要处理时，插件给原队长发送持久消息。
+
+**版本 0.2.0** · DSH `0.2.1-rc.2` 或 `0.2.1-rc.5` · Node.js `^22.19.0 || >=24` · Git **2.43+**。包内含可直接执行的原生 ESM 源码和测试，无须编译。Git 仓库需要已有本地提交、可用的提交身份，以及创建同级 worktree 目录的权限。
+
+## 安装与首次运行
+
+1. 下载 `dsh-ticket-dag-0.2.0.tgz`，保存在运行 DSH 的电脑上。打开侧栏 **插件 → 添加插件 → 安装第三方插件**，输入该文件的本地绝对路径，例如 `D:\DSH-Plugins\dsh-ticket-dag-0.2.0.tgz`，然后安装并启用。使用命令行也可以在目标 profile 安装同一个文件：
+   ```powershell
+   dsh plugin --profile web add "$HOME\Downloads\dsh-ticket-dag-0.2.0.tgz"
+   ```
+   旧版用户可以等当前工单结束后，在同一 profile 使用上面的命令升级。SDK profile 将 `web` 换为 `sdk`。安装后重新打开插件详情；若宿主提示需要重启，则重启该 profile。
+2. 在 **插件 → 已安装 → dsh-ticket-dag** 中找到同名组件，点 **配置**。先运行示例时，点 **补入示例验收项**，再点 **保存配置**；已设置的同名验收项会保留。没有图形界面的 SDK 环境仍可将 `examples/profile.patch.yml` 中的配置合入当前 profile 的 `cordis.patch.yml`，并保留其他现有配置。
+3. 在一个临时 Git 仓库中试跑示例。可以用下面的命令初始化，随后在该仓库启动 DSH。已有项目可直接使用自己的清单。
+   ```powershell
+   git init -b main dag-playground
+   cd dag-playground
+   git -c user.name="DAG Demo" -c user.email=demo@example.invalid commit --allow-empty -m "Initial commit"
+   ```
+   接下来 worker 和集成器也要能提交。请先用 `git config user.name` 和 `git config user.email` 检查仓库是否已有身份；需要时在**此仓库**设置自己的身份。
+4. 将 `examples/hello.json` 的内容发给该仓库的队长会话，并附上：
+   > 我批准执行这份清单。调用 dag_run，runId 使用 hello-01，manifest 使用上面的 JSON。返回运行 ID 后结束本轮，让插件负责派工，并在完成时通知我。
+5. 应先并行执行 A、C，再运行依赖两者的 B。全部通过后检查：
+   ```sh
+   git log --oneline --first-parent main..integration/hello-01
+   git show integration/hello-01:dag-demo/welcome.cjs
+   git worktree list
+   ```
+   `integration/hello-01` 就是交付分支。主工作目录留在原分支，可按自己的流程审查后合到 main 或开 PR。
+
+**宿主配置。** 使用包含 `spawn`、agent、工作目录服务、持久化会话和 Session 查询的 profile，配置可用模型并授权本项目所需的文件与命令操作。测试验收命令在候选 worktree 中执行，依赖须在该环境可用。默认插件上限为 16，清单可设 1–32，实际受宿主 `maxActiveSubagents` 限制。桌面版使用独立的嵌入式宿主，先核对其版本。
+
+## 运行进度
+
+打开侧栏 **插件 → 工单进度** 查看运行看板，在 **插件 → 已安装 → dsh-ticket-dag** 详情页也能看到。选择运行 ID，面板每 2 秒读取一次最新状态，也可点“刷新进度”。完成数按已合入本轮集成分支的工单计算。子会话刚提交、正在排队试合并或正在验收的工单仍计为进行中。
+
+例如 A、C 同时开发、B 依赖两者时，先能看到 B 在等哪些上游；A 先合入，B 仍等 C。C 也合入后，B 才从当前集成提交开工。轮到验收时可查看当前检查 ID 及命令序号；遇到冲突或命令失败，可在工单中查看诊断，再回到原队长会话处理。
+
+运行历史按 profile 保存索引。旧版创建的运行在原队长会话重新接管后出现在看板。宿主重启后，历史记录显示最后持久化的状态；打开看板只读取数据，不会自动恢复派工。
+
+## 图形配置面板
+
+| 设置 | 默认值 | 用途 |
+| --- | --- | --- |
+| 并发工单数 | 16（可设 1–32） | 限制插件同时派发的开发工单数，单次运行还受清单的 `max_workers` 和宿主容量约束 |
+| 验收超时 | 120 秒 | 单条验收命令的时限；在配置文件中以毫秒保存为 `checkTimeoutMs` |
+| 验收项 | 空 | 为每个 ID 填入可执行程序和参数，工单用 `verify` 引用。同一个 ID 可以依次执行多条命令 |
+
+例如，可以添加一个名为 `git-check` 的验收项，将程序设为 `git`，参数分别设为 `diff`、`--check`、`HEAD^`、`HEAD`。程序和参数由 Git 候选工作树中的进程直接执行。请确认设置中的命令是你愿意在该仓库运行的。
+
+要配足 16 个并发，请同时在 **插件 → 子智能体 → 运行限制** 核对“子智能体并行数量上限”。插件表单只编辑本插件的字段。表单的修改在点击保存时写入当前 DSH profile。调低并发后，在途 worker 可以完成，后续工单等待容量。已打开的运行继续用原验收命令；新运行使用更新后的命令。宿主冷启动恢复旧运行时，若之前使用的命令已被修改，先恢复该组命令再继续。超时修改用于下一批开始的验收。
+
+## 工单与控制工具
+
+清单字段为 `spec_id`、`base_ref`、`max_workers`、`tickets[]`。工单至少需要 `id`、`title` 和非空的 `verify`。建议显式填写 `prompt`、`acceptance`、`depends_on`，可选 `produces`、`consumes` 和清单级 `external_inputs`。导入时校验重复、未知依赖、环、验收项及已声明产物关系。工单内容不会被当作验收命令执行。
+
+| 工具 | 入参 | 行为 |
+| --- | --- | --- |
+| `dag_run` | `manifest`、可选 `runId` | 清单可传 JSON 对象或 JSON 字符串。默认 ID 由原队长会话和 spec ID 派生。同一 ID、同一清单重复提交会返回已有运行 |
+| `dag_status` | `runId` | 返回各票状态、执行代次、工作目录、分支、基线、成果 SHA、落地 SHA、待投递通知及阻塞原因 |
+| `dag_pause` | `runId` | 暂停新工单和新的发布动作；在途 worker 可以提交成果 |
+| `dag_resume` | `runId` | 核对发布记录和真实 Git 后继续就绪队列 |
+| `dag_retry` | `runId, id`，可选 `isolated` | 对指定阻塞工单核对旧现场，接回完成提交或启动新尝试。无法确认旧 worker 退出时可显式选择 `isolated: true` |
+| `dag_cancel` | `runId` | 终止运行、请求停止已知 worker、保留证据，并对已发出的 Git 发布做对账。取消后的 run 为终态 |
+
+这些工具限定给原顶层队长。请先在对话中审查清单，再明确要求队长启动。本插件使用宿主及会话的授权机制，没有单独的图形审批页。
+
+**容易用错的一点。** `verify` 引用可信 profile 中定义的 ID，例如 `["welcome"]`。每个 ID 对应一组 argv 数组，按顺序、无 shell 地执行。示例用 `node -e` 做跨平台断言。Windows 优先使用直接可执行的 `.exe` 或 `node` 加脚本路径。默认每条命令超时 120000 毫秒，配置键为 `checkTimeoutMs`。不要在验收命令中启动常驻服务器。
+
+## 调度与 Git
+
+- 单次运行绑定 `repo.commonDir + parentId + integration/<runId>`。SQLite 单写者锁防止两个插件进程同时接管同一 run。单一协调器内的所有 run 共用插件并发上限。
+- 每张票启动时先在数据库里领取票、分支、路径和租约，再切换 Git。新票必须从本轮已验证 tip 开始，逐个确认依赖的 `landedSha` 在真实 checkout 的历史中。依赖验证、工作区干净状态与分支检查通过才启动 DSH。
+- 实施票在专属的物理 worktree 中运行。**一个结束就补一张 ready 票**，不同层可重叠。子会话和开发目录不会复用给下一张无关工单；在途模型数可以是 16，保留的工单目录数可能大于 16。
+- Worker 在最后的提交信息末尾写四条身份 trailer，插件会把准确的值发在任务 prompt 里。提交需要包含本票获准的基线，并保持 worktree 干净。只有与本轮、本票、当前代次匹配的完成提交才进入 `SUBMITTED`。普通 WIP 保留供续做。
+- 每次只发布一个候选。在独立 detached worktree 中对当前集成 tip 试合并工单提交，运行该票及所有已集成票声明的验收项（按 ID 去重），复核候选 HEAD 及干净状态。通过后先保存发布意图，再用带预期旧值的 `git update-ref` 推进目标分支，最后记 `INTEGRATED` 并解锁下游。
+- 无关票遇到组合冲突或测试失败时，其他可独立完成的票继续。失败票的状态含诊断和工作目录，修复时请针对工单分支提交改进；再次 `dag_retry` 会重新发放执行代次、重建并验证候选。
+- 集成 ref 在运行期间由插件独占管理。请勿在外部 checkout 或移动 `integration/<runId>`。遇到陌生 tip 会暂停并通知队长，不会强行覆盖。可用 `git show`、`git log` 或 detached 的只读检出查看内容。
+
+## 中断与持久化
+
+每一轮的数据在 `<git-common-dir>/dsh-ticket-dag/runs/<runId>/state.sqlite`。每票路径由 `dag_status` 返回；默认位于仓库同级的 `.dsh-ticket-worktrees/` 下。数据库、工单分支和工作树应一起保留。运行期间不要移动仓库或手工清除这些目录。
+
+| 情况 | 本版处理 |
+| --- | --- |
+| 模型请求中断 | 优先让 DSH 自身的请求恢复生效。worker 已经明确退出并且错误可识别为暂时性传输故障时，按退避最多自动重试两次。宿主容量不足稍后再派，不扣这个预算 |
+| 修改了一半 | 保留原基线、分支、工单目录和未提交修改；确认旧执行者已停止后可对同一票继续。断线时不得把新工单的“必须干净”条件套在旧现场上 |
+| 提交了但回执丢失 | 检查原执行代次的完成 trailer，再送入组合验收。缺少完成证据的提交继续作为待处理现场 |
+| 无法确认旧会话的写入是否已停止 | 普通重试保持阻塞。确认接受从冻结基线重新开工后，调用 `dag_retry({runId,id,isolated:true})`；新一代使用另一份目录和分支，旧目录/分支保留，旧内容不自动复制 |
+| Git 已经前进、SQLite 尚未记账 | 重启对照记录中的旧 tip、确切候选和两个父提交。目标已是候选则补账；仍为旧 tip 且允许继续时重试原发布。陌生状态需要人工核查 |
+| 队长不在线 | 通知与状态一起落库，带稳定事件 ID；在原会话恢复时重新投递并去重。宿主支持时使用持久 followup。队长可随时用 `dag_status` 查原有 run |
+
+已退休的插件子会话再次收到消息时，宿主适配器会在模型步骤和工具执行前核对持久租约。工单的旧会话不能继续通过这些入口写文件。这层检查无法终止先前已在系统中运行的外部进程。
+
+插件不会为你回滚 PR、部署或其他外部服务操作。若让 worker 使用有外部副作用的工具，请单独提供幂等键和收据，并在失去回执时先核对外部记录。工作树提供 Git 文件隔离；拥有任意 shell 权限的进程仍可访问其他路径。验收命令直接子进程的超时/取消由插件处理，额外派生的后台进程需要宿主或系统负责终止。
+
+## 开发与测试
+
+源码在 `src/index.mjs`（DSH 入口）、`coordinator.mjs`（调度和恢复）、`git.mjs`（工作树与集成）、`store.mjs`（SQLite 与清单）、`dashboard.mjs`（只读运行快照和历史索引）以及 `client.js`（DSH 原生面板）。测试和示例一同分发。与源文件同目录运行：
+
+```sh
+npm test
+```
+
+默认测试包含真实临时 Git 仓库、SQLite、并发控制、工单失败恢复及宿主契约测试。要运行真实 DSH 的端到端测试，先安装本版支持的官方 DSH CLI、npm、pnpm 以及 Git，然后设置：
+
+```sh
+DSH_TEST_BIN=/absolute/path/to/node_modules/@deepseek-ai/dsh/lib/bin.js \
+DSH_TEST_ROLLING=1 node --test test/dsh-e2e.mjs
+```
+
+该测试在临时 `DSH_HOME` 中安装打包产物，使用本机回环 SSE 服务模拟模型，实际运行 DSH SDK、子会话、Bash、Git、SQLite 和队长通知。大用例是 18 张票、16 并发、慢任务未结束先补位，最后的依赖票会检查上游文件。测试用的无交互授权仅用于可销毁的本地 fixture。本版尚未验证 Windows 上的端到端流程、桌面安装或真实的商业模型供应商。
+
+真实 Web 面板验收使用 Chromium 和 Puppeteer Core。在上面的 `DSH_TEST_BIN` 之外，设置 `DSH_TEST_CHROME` 为 Chromium 的可执行文件路径，`DSH_TEST_PUPPETEER` 为本机已安装的 puppeteer-core 的 JS 入口，然后运行 `node --test test/web-panel.mjs`。可选 `DSH_TEST_TARBALL` 用于指定实际安装的归档。该测试启动临时 DSH Web，经过真实浏览器验收配置保存、重新打开、启动两张有依赖的工单及看板自动刷新。
+
+## 当前范围
+
+本版面向单机、单仓库和已有 spec/tickets 的 Git 开发任务。只读审核报告暂不作为独立的 DAG 节点；交付由配置的可执行验收项把关。worker 默认使用宿主模型路由。专门的 LLM reviewer、按票切模型、同目录跨票工位池和自动发布 PR 均未包含。可先用上述 A/C/B 示例确定本机环境，再运行真实开发任务。

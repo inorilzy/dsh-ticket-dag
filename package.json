@@ -1,0 +1,28 @@
+{
+  "name": "dsh-ticket-dag",
+  "version": "0.2.0",
+  "description": "Local Git worktrees and a dependency-aware rolling ticket scheduler for DeepSeek Harness",
+  "type": "module",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./client": "./src/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": ["src", "test", "examples", "cordis.patch.yml", "README.md"],
+  "dsh": {
+    "bundle": {"patch": "./cordis.patch.yml"},
+    "client": {
+      "platform": "web",
+      "inject": ["@deepseek-ai/dsh-client-ui-plugin-manager"]
+    }
+  },
+  "engines": {"node": "^22.19.0 || >=24", "dsh": "0.2.1-rc.2 || 0.2.1-rc.5"},
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.2 || 0.2.1-rc.5",
+    "@deepseek-ai/dsh-llm": "0.2.1-rc.2 || 0.2.1-rc.5",
+    "@deepseek-ai/schemastery": "3.18.5"
+  },
+  "scripts": {"test": "node --test"}
+}

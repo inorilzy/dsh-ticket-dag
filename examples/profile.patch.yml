@@ -1,0 +1,17 @@
+# Headless alternative to the plugin settings panel. Merge into the active profile and keep other fields.
+- id: dsh-ticket-dag
+  config:
+    maxWorkers: 16
+    checkTimeoutMs: 120000
+    checks:
+      greeting:
+        - [node, -e, "require('node:assert/strict').equal(require('./dag-demo/greet.cjs').greet('Ada'), 'Hello Ada')"]
+      normalize:
+        - [node, -e, "require('node:assert/strict').equal(require('./dag-demo/normalize.cjs').normalize(' Ada '), 'Ada')"]
+      welcome:
+        - [node, -e, "require('node:assert/strict').equal(require('./dag-demo/welcome.cjs').welcome(' Ada '), 'Hello Ada')"]
+
+# The pinned host defaults to 8 live children per activation tree.
+- id: subagent
+  config:
+    maxActiveSubagents: 16
