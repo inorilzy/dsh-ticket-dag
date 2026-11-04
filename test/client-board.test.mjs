@@ -33,11 +33,15 @@ function loadHost(seeds, { expanded = false, config = { status: 'loading' } } = 
   const source = readFileSync(resolve(import.meta.dirname, '..', 'src', 'client.js'), 'utf8')
   const urls = []
   const posts = []
+  const postHeaders = []
   vm.runInNewContext(source, {
     window: { __ModuleLoader__: { load: (d) => (definition = d) } },
     fetch: (url, init) => {
       urls.push(url)
-      if (init?.method === 'POST') posts.push([url, JSON.parse(init.body)])
+      if (init?.method === 'POST') {
+        posts.push([url, JSON.parse(init.body)])
+        postHeaders.push(init.headers)
+      }
       return new Promise(() => {})
     },
     setTimeout: () => 0,
@@ -58,7 +62,7 @@ function loadHost(seeds, { expanded = false, config = { status: 'loading' } } = 
     useRef: (current) => ({ current }),
     useEffect: (fn) => void fn(),
   }
-  const host = { tabs: [], opened: [], slots: {}, urls, posts, sets, injected: [], namespaces: [], saved: [], sessions: [] }
+  const host = { tabs: [], opened: [], slots: {}, urls, posts, postHeaders, sets, injected: [], namespaces: [], saved: [], sessions: [] }
   const slots = {
     inject: (_, fn) => fn(),
     register: (meta, component) => (host.slots[meta.name] = { meta, component }),
@@ -552,6 +556,11 @@ test('plan review: named members with their tasks and model, compact task list, 
       },
     ],
   ])
+  assert.deepEqual(
+    { ...host.postHeaders[0] },
+    { 'content-type': 'application/json', 'x-dsh-ticket-dag': '1' },
+    'the approval request carries the JSON type and the plugin header the host requires',
+  )
 })
 
 function stagedRun(tickets) {

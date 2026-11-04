@@ -200,7 +200,7 @@ export function apply(ctx, config = {}) {
   ctx.inject?.(['connection'], (scope) => {
     // A ticket without its own model inherits the captain's route, so the board shows it.
     mountDashboard(scope, catalog, coordinator, (parentId) => ctx.agents.get(parentId)?.options)
-    mountApproval(scope, catalog, coordinator)
+    mountApproval(scope, catalog, coordinator, () => ctx.get('llm'))
     mountModels(scope, () => ctx.get('llm'))
   })
   ctx.on('loader/volatile-update', () => coordinator.updateSettings(settings()))

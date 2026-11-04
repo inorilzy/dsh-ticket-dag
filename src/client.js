@@ -1539,7 +1539,8 @@ window.__ModuleLoader__.load({
         try {
           const response = await fetch('api/ticket-dag.approve', {
             method: 'POST',
-            headers: { 'content-type': 'application/json' },
+            // The host refuses an approval without this header (CSRF guard).
+            headers: { 'content-type': 'application/json', 'x-dsh-ticket-dag': '1' },
             body: JSON.stringify({ key: run.key, ...body }),
           })
           if (!response.ok) throw new Error((await response.text()) || 'HTTP ' + response.status)
