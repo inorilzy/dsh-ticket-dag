@@ -1721,12 +1721,14 @@ window.__ModuleLoader__.load({
     // Only one request at a time. A changed selection supersedes an older
     // response; unmount aborts the pending read and clears the next timer.
     // With sessionId (the conversation sidebar) only that captain's runs show.
-    function Dashboard({ sessionId, openChild } = {}) {
+    // runKey pins the board to one run (one sidebar tab per run); without it
+    // the board follows this conversation's newest run.
+    function Dashboard({ sessionId, openChild, runKey } = {}) {
       const [data, setData] = useState(null)
-      const [selectedKey, setSelectedKey] = useState('')
+      const [selectedKey, setSelectedKey] = useState(runKey ?? '')
       const [error, setError] = useState('')
       const [lastRead, setLastRead] = useState(null)
-      const target = useRef('')
+      const target = useRef(runKey ?? '')
       const refresh = useRef(null)
       useEffect(() => {
         let disposed = false,
@@ -1745,6 +1747,9 @@ window.__ModuleLoader__.load({
           const timeout = setTimeout(() => active?.abort(), 12000)
           try {
             const response = await fetch(dashboardUrl(key, sessionId), { signal: active.signal, cache: 'no-store' })
+            if (response.status === 404 && runKey && key === runKey) {
+              throw new Error('这轮运行的记录已不可用。')
+            }
             if (response.status === 404 && key && !disposed && key === target.current) {
               target.current = ''
               setSelectedKey('')
@@ -1797,17 +1802,9 @@ window.__ModuleLoader__.load({
           active?.abort()
           refresh.current = null
         }
-      }, [sessionId])
-      function choose(event) {
-        const key = event.target.value
-        target.current = key
-        setSelectedKey(key)
-        setError('')
-        setLastRead(null)
-        void refresh.current?.()
-      }
+      }, [sessionId, runKey])
       const selected = data?.selected?.key === selectedKey ? data.selected : null
-      // The plan review carries its own title; the run picker stays only when there is a choice.
+      // The plan review carries its own title.
       const reviewing = selected?.mode === 'staged'
       return h(
         'section',
@@ -1844,23 +1841,6 @@ window.__ModuleLoader__.load({
                 : '在项目的队长会话里用 dag_run 启动一轮工单，进度会显示在这里。',
             ),
           ),
-        data?.runs.length > (reviewing ? 1 : 0) &&
-          h(
-            'label',
-            null,
-            '选择运行',
-            h(
-              'select',
-              { value: selectedKey, onChange: choose, 'aria-label': '选择运行' },
-              ...data.runs.map((run) =>
-                h(
-                  'option',
-                  { key: run.key, value: run.key },
-                  [run.runId, run.repoName, runMode(run)].filter(Boolean).join(' · '),
-                ),
-              ),
-            ),
-          ),
         selected?.available === false &&
           h(
             'p',
@@ -1878,11 +1858,19 @@ window.__ModuleLoader__.load({
 
     const tabId = 'dsh-ticket-dag/progress'
     const tabKind = 'ticket-dag'
+    // Each run opens at its own address, so it gets its own sidebar tab and
+    // reopening the same run reveals that tab.
+    const runPrefix = 'dsh-resource://ticket-dag/'
+    const runAddress = (run) => runPrefix + run.key + '/' + run.runId
+    function parseRun(address) {
+      const match = /^dsh-resource:\/\/ticket-dag\/([0-9a-f]{64})\/([a-z0-9][a-z0-9_-]{0,62})$/.exec(address ?? '')
+      return match ? { key: match[1], runId: match[2] } : null
+    }
 
     // Conversation header action. It appears once this conversation has started
-    // a run, and opens the sidebar by itself when a new run appears while the
-    // sidebar is collapsed.
-    function BoardEntry({ sessionId, openBoard, isExpanded }) {
+    // a run and opens the newest run's tab; a run that starts later opens its
+    // own tab by itself.
+    function BoardEntry({ sessionId, openRun }) {
       const [runs, setRuns] = useState(null)
       useEffect(() => {
         let disposed = false,
@@ -1897,7 +1885,7 @@ window.__ModuleLoader__.load({
             const fresh = view.runs.filter((run) => known && !known.has(run.key) && !run.complete)
             known = new Set(view.runs.map((run) => run.key))
             setRuns(view.runs)
-            if (fresh.length && !isExpanded()) openBoard()
+            if (fresh.length) openRun(fresh[0])
           } catch {
             // The next poll retries; the button keeps its last known state.
           } finally {
@@ -1928,7 +1916,8 @@ window.__ModuleLoader__.load({
             cursor: 'pointer',
             whiteSpace: 'nowrap',
           },
-          onClick: () => openBoard(),
+          // runs arrive newest first.
+          onClick: () => openRun(runs[0]),
         },
         '查看工单',
       )
@@ -2014,18 +2003,33 @@ window.__ModuleLoader__.load({
         })
         ctx.inject?.(['sidebarRight', 'sidebarRightTabs'], (native) => {
           native.effect(() =>
-            native.sidebarRightTabs.register({ id: tabId, kind: tabKind, title: () => '工单进度' }),
+            native.sidebarRightTabs.register({
+              id: tabId,
+              kind: tabKind,
+              patterns: [runPrefix + '**'],
+              canOpen: (address) => parseRun(address) !== null,
+              title: (address) => {
+                const run = parseRun(address)
+                return run ? '工单 · ' + run.runId : '工单进度'
+              },
+            }),
           )
           native.effect(() =>
             native.slots.inject('sidebar.right.pane.tab', () =>
               // The pane gives the tab its height; this element owns the scrolling.
-              native.slots.register({ name: 'sidebar.right.pane.tab', key: tabId }, ({ sessionId }) =>
-                h(
+              native.slots.register({ name: 'sidebar.right.pane.tab', key: tabId }, ({ sessionId, useTabInfo }) => {
+                const run = parseRun(useTabInfo?.().tab?.contentId)
+                return h(
                   'div',
                   { style: { height: '100%', overflowY: 'auto', padding: '0 .75rem 1.5rem', boxSizing: 'border-box' } },
-                  h(Dashboard, { sessionId, openChild: (parent, child) => openChild?.(parent, child) }),
-                ),
-              ),
+                  h(Dashboard, {
+                    key: run?.key ?? 'latest',
+                    sessionId,
+                    runKey: run?.key,
+                    openChild: (parent, child) => openChild?.(parent, child),
+                  }),
+                )
+              }),
             ),
           )
           native.effect(() =>
@@ -2036,8 +2040,7 @@ window.__ModuleLoader__.load({
                   id: 'ticket-dag-entry',
                   order: 55,
                   inject: () => ({
-                    openBoard: () => native.sidebarRight.openTab(tabKind),
-                    isExpanded: () => native.sidebarRight.isExpanded(),
+                    openRun: (run) => native.sidebarRight.openResource(runAddress(run), { kind: tabKind }),
                   }),
                 },
                 BoardEntry,

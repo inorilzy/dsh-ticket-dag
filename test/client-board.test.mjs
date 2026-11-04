@@ -72,7 +72,11 @@ function loadHost(seeds, { expanded = false, config = { status: 'loading' } } = 
         effect: (f) => f(),
         slots,
         sidebarRightTabs: { register: (definition) => (host.tabs.push(definition), () => {}) },
-        sidebarRight: { openTab: (kind) => host.opened.push(kind), isExpanded: () => expanded },
+        sidebarRight: {
+          openTab: (kind) => host.opened.push(kind),
+          openResource: (address, options) => host.opened.push([address, options?.kind]),
+          isExpanded: () => expanded,
+        },
         sessions: {
           refreshSubagents: async (parent) => host.sessions.push(['refresh', parent]),
           subagentAddress: () => undefined,
@@ -344,6 +348,31 @@ test('each conversation gets a right-sidebar tab that reads only its own runs', 
   assert.equal(host.slots['sidebar.right.pane.tab'].meta.key, 'dsh-ticket-dag/progress')
   host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-1' })
   assert.deepEqual(host.urls, ['api/ticket-dag.dashboard?parent=session-1'])
+
+  // Each run opens as its own tab: the address names the run, the title its runId.
+  const [tab] = host.tabs
+  const key = 'a'.repeat(64)
+  const address = 'dsh-resource://ticket-dag/' + key + '/demo-agents-02'
+  assert.deepEqual([...tab.patterns], ['dsh-resource://ticket-dag/**'])
+  assert.equal(tab.canOpen(address), true)
+  assert.equal(tab.canOpen('dsh-resource://ticket-dag/oops'), false)
+  assert.equal(tab.title(address), '工单 · demo-agents-02')
+  const pinned = loadHost([])
+  pinned.renderSlot('sidebar.right.pane.tab', {
+    sessionId: 'session-1',
+    useTabInfo: () => ({ tab: { contentId: address } }),
+  })
+  assert.deepEqual(pinned.urls, ['api/ticket-dag.dashboard?key=' + key + '&parent=session-1'])
+
+  const two = [
+    { key, runId: 'demo-agents-02', mode: 'active', total: 0, counts: {}, tickets: [] },
+    { key: 'b'.repeat(64), runId: 'demo-agents-01', mode: 'active', total: 0, counts: {}, tickets: [] },
+  ]
+  const shown = loadHost([{ runs: two, selected: two[0] }, key]).renderSlot('sidebar.right.pane.tab', {
+    sessionId: 'session-1',
+    useTabInfo: () => ({ tab: { contentId: address } }),
+  })
+  assert.equal(find(shown, (n) => n.props['aria-label'] === '选择运行'), undefined, 'a tab shows one run, no picker')
 
   const empty = loadHost([{ runs: [], selected: null }, ''])
   const pane = empty.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-1' })
@@ -637,11 +666,12 @@ test('the conversation header shows 查看工单 only when this conversation has
   assert.equal(none.renderSlot('conversation.session.header.actions', { sessionId: 's1' }), null)
   assert.deepEqual(none.urls, ['api/ticket-dag.dashboard?parent=s1'])
 
-  const host = loadHost([[{ key: 'k1', complete: false }]])
+  const key = 'c'.repeat(64)
+  const host = loadHost([[{ key, runId: 'latest', complete: false }, { key: 'd'.repeat(64), runId: 'older' }]])
   const entry = host.renderSlot('conversation.session.header.actions', { sessionId: 's1' })
   assert.equal(text(entry), '查看工单')
   entry.props.onClick()
-  assert.deepEqual(host.opened, ['ticket-dag'])
+  assert.deepEqual(host.opened, [['dsh-resource://ticket-dag/' + key + '/latest', 'ticket-dag']], 'opens the newest run')
 })
 
 test('the plugin page tab is the Agent preset page: max agents, presets, per-preset limit and model', () => {
