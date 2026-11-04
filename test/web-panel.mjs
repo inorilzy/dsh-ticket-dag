@@ -350,10 +350,11 @@ test(
     await waitForProgress('B', '已集成', 2)
     assert.equal(git('show', 'integration/web-board:B.txt'), 'done')
     await second.reload()
-    await second.locator('button[aria-label="插件"]').click()
-    await second.locator('::-p-aria(工单进度[role="tab"])').click()
+    // The board opens from the conversation header into its own right-sidebar tab.
+    await second.locator(button('查看工单')).click()
+    await second.locator('::-p-aria(工单 · web-board[role="tab"])').click()
     await waitForProgress('B', '已集成', 2)
-    t.diagnostic('The Plugins → 工单进度 tab reloaded the same completed run.')
+    t.diagnostic('The 工单 · web-board right-sidebar tab reloaded the same completed run.')
     t.diagnostic(
       'Dashboard observed A running with B waiting, B running after A integrated, and 2/2 integrated; final Git tree contains B.',
     )

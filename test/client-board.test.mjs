@@ -28,41 +28,70 @@ const loadBoard = (seeds) => loadHost(seeds).slots['sidebar.right.pane.tab'].com
 
 // Loads the entry with the conversation right-sidebar and settings services
 // present. Effects run immediately and fetch only records the URL it was asked for.
-function loadHost(seeds, { expanded = false, config = { status: 'loading' } } = {}) {
+// respond(url) may answer a GET; by default reads never settle. Timers are
+// recorded, not run, so a test fires each scheduled poll itself.
+function loadHost(seeds, { expanded = false, config = { status: 'loading' }, respond, document } = {}) {
   let definition
   const source = readFileSync(resolve(import.meta.dirname, '..', 'src', 'client.js'), 'utf8')
   const urls = []
   const posts = []
   const postHeaders = []
+  const timers = []
   vm.runInNewContext(source, {
     window: { __ModuleLoader__: { load: (d) => (definition = d) } },
+    ...(document && { document }),
     fetch: (url, init) => {
       urls.push(url)
       if (init?.method === 'POST') {
         posts.push([url, JSON.parse(init.body)])
         postHeaders.push(init.headers)
       }
-      return new Promise(() => {})
+      return respond && init?.method !== 'POST' ? respond(url) : new Promise(() => {})
     },
-    setTimeout: () => 0,
-    clearTimeout: () => {},
+    setTimeout: (fn, ms) => timers.push({ fn, ms, cleared: false }),
+    clearTimeout: (id) => {
+      if (timers[id - 1]) timers[id - 1].cleared = true
+    },
     AbortController,
     URLSearchParams,
     structuredClone,
   })
   const queue = [...seeds]
-  // Every state update is recorded so a test can inspect what an interaction would set.
+  // Every state update is recorded so a test can inspect what an interaction would set;
+  // indexed also names the hook (in call order) each update belongs to.
   const sets = []
+  const indexed = []
+  let hook = 0
   const react = {
     createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat() }),
-    useState: (init) => [
-      queue.length ? queue.shift() : typeof init === 'function' ? init() : init,
-      (value) => sets.push(value),
-    ],
+    useState: (init) => {
+      const at = hook++
+      return [
+        queue.length ? queue.shift() : typeof init === 'function' ? init() : init,
+        (value) => (sets.push(value), indexed.push([at, value])),
+      ]
+    },
     useRef: (current) => ({ current }),
     useEffect: (fn) => void fn(),
   }
-  const host = { tabs: [], opened: [], slots: {}, urls, posts, postHeaders, sets, injected: [], namespaces: [], saved: [], sessions: [] }
+  const host = {
+    tabs: [],
+    opened: [],
+    slots: {},
+    urls,
+    posts,
+    postHeaders,
+    sets,
+    indexed,
+    timers,
+    injected: [],
+    namespaces: [],
+    saved: [],
+    sessions: [],
+  }
+  // Timers still waiting to fire.
+  host.pending = () => timers.filter((t) => !t.cleared && !t.fired)
+  host.fire = (timer) => ((timer.fired = true), timer.fn())
   const slots = {
     inject: (_, fn) => fn(),
     register: (meta, component) => (host.slots[meta.name] = { meta, component }),
@@ -789,6 +818,146 @@ test('the full settings form also edits each preset limit', () => {
   const field = find(root, (n) => n.props['aria-label'] === 'docs 的同时运行上限')
   assert.equal(field.props.value, '3')
   assert.ok(find(root, (n) => n.props['aria-label'] === '最大并发工单数'))
+})
+
+// Dashboard hook order: data, selectedKey, error, lastRead.
+const DATA = 0
+const ERROR = 2
+const settle = () => new Promise((done) => setImmediate(done))
+const answer = (status, body) => ({ ok: status >= 200 && status < 300, status, json: async () => body })
+function snapshot(extra = {}) {
+  const selected = {
+    key: 'k'.repeat(64),
+    runId: 'poll',
+    mode: 'active',
+    total: 1,
+    counts: { RUNNING: 1 },
+    tickets: [{ id: 'A', title: 'A', status: 'RUNNING', dependsOn: [], attempt: 1, livePhase: { stage: 'agent' } }],
+    ...extra,
+  }
+  return { runs: [selected], selected }
+}
+function pollingTab(replies, { pinned = false, document } = {}) {
+  const queue = [...replies]
+  const host = loadHost([], {
+    document,
+    respond: async () => {
+      const next = queue.length > 1 ? queue.shift() : queue[0]
+      if (next instanceof Error) throw next
+      return next
+    },
+  })
+  const address = 'dsh-resource://ticket-dag/' + 'k'.repeat(64) + '/poll'
+  host.renderSlot('sidebar.right.pane.tab', {
+    sessionId: 's1',
+    ...(pinned && { useTabInfo: () => ({ tab: { contentId: address } }) }),
+  })
+  host.next = () => {
+    const pending = host.pending()
+    assert.equal(pending.length, 1, 'exactly one poll is scheduled')
+    return pending[0]
+  }
+  return host
+}
+
+test('a failed read keeps the last snapshot, says it may be stale and backs off to 30 seconds', async () => {
+  const view = snapshot()
+  const host = pollingTab([answer(200, view), answer(500), new TypeError('offline')])
+  await settle()
+  assert.ok(host.indexed.some(([at, v]) => at === DATA && v?.selected?.runId === 'poll'))
+  assert.equal(host.next().ms, 2000)
+  const delays = []
+  for (let i = 0; i < 6; i++) {
+    host.fire(host.next())
+    await settle()
+    delays.push(host.next().ms)
+  }
+  assert.deepEqual(delays, [4000, 8000, 16000, 30000, 30000, 30000])
+  assert.ok(!host.indexed.some(([at, v]) => at === DATA && v === null), 'the snapshot is never cleared')
+  assert.ok(host.indexed.some(([at, v]) => at === ERROR && v), 'the failure is reported')
+
+  // Rendered with the kept snapshot and the error, the board still shows the run.
+  const pane = loadHost([view, view.selected.key, '进度暂不可用。HTTP 500', new Date()]).renderSlot(
+    'sidebar.right.pane.tab',
+    { sessionId: 's1' },
+  )
+  assert.match(text(pane), /数据可能已过期/)
+  assert.ok(find(pane, (n) => n.props['data-dag-ticket'] === 'A'))
+})
+
+test('a 404 for a pinned run stops polling', async () => {
+  const host = pollingTab([answer(404)], { pinned: true })
+  await settle()
+  assert.equal(host.pending().length, 0)
+  assert.ok(host.indexed.some(([at, v]) => at === ERROR && /不可用/.test(v)))
+})
+
+test('a settled run polls every 30 seconds', async () => {
+  const host = pollingTab([answer(200, snapshot({ complete: true }))])
+  await settle()
+  assert.equal(host.next().ms, 30000)
+  const cancelled = pollingTab([answer(200, snapshot({ mode: 'cancelled' }))])
+  await settle()
+  assert.equal(cancelled.next().ms, 30000)
+})
+
+test('a hidden page pauses polling and refreshes at once when shown again', async () => {
+  const listeners = []
+  const document = {
+    visibilityState: 'visible',
+    addEventListener: (type, fn) => type === 'visibilitychange' && listeners.push(fn),
+    removeEventListener: () => {},
+  }
+  const host = pollingTab([answer(200, snapshot())], { document })
+  await settle()
+  assert.equal(host.urls.length, 1)
+  document.visibilityState = 'hidden'
+  host.fire(host.next())
+  await settle()
+  assert.equal(host.urls.length, 1, 'no read while hidden')
+  assert.equal(host.pending().length, 0)
+  document.visibilityState = 'visible'
+  for (const fn of listeners) fn()
+  await settle()
+  assert.equal(host.urls.length, 2, 'showing the page reads at once')
+  assert.equal(host.next().ms, 2000)
+})
+
+test('the header entry backs off on failure and stops on 404', async () => {
+  const replies = [answer(500), answer(404)]
+  const host = loadHost([], { respond: async () => replies.shift() })
+  host.renderSlot('conversation.session.header.actions', { sessionId: 's1' })
+  await settle()
+  const [timer] = host.pending()
+  assert.equal(timer.ms, 10000)
+  host.fire(timer)
+  await settle()
+  assert.equal(host.pending().length, 0)
+})
+
+test('status is not told by colour alone: current step, node labels and focusable plan nodes', () => {
+  const root = boardFor([
+    { id: 'A', title: 'Greeting', status: 'RUNNING', livePhase: { stage: 'merge' } },
+    { id: 'B', status: 'PENDING', dependsOn: ['A'] },
+  ])
+  const steps = findAll(root, (n) => n.props['data-dag-step'] !== undefined)
+  assert.deepEqual(
+    steps.map((s) => s.props['aria-current']),
+    [undefined, undefined, undefined, undefined, 'step', undefined, undefined],
+  )
+  const node = (tree, id) => find(tree, (n) => n.props['data-dag-node'] === id)
+  assert.match(node(root, 'A').props['aria-label'], /执行中/)
+  assert.match(node(root, 'B').props['aria-label'], /等待依赖/)
+
+  const selected = reviewRun()
+  const review = loadHost([{ runs: [selected], selected }, selected.key]).renderSlot('sidebar.right.pane.tab', {
+    sessionId: 'session-captain',
+  })
+  const plan = node(review, 'T')
+  assert.equal(plan.props.tabIndex, 0)
+  assert.match(plan.props['aria-label'], /T.*测试员.*编写测试.*等待依赖/)
+  const wizard = findAll(find(review, (n) => n.props['aria-label'] === '审查步骤'), (n) => n.type === 'li')
+  assert.deepEqual(wizard.map((li) => li.props['aria-current']), ['step', undefined, undefined])
 })
 
 test('a dependency cycle in a damaged ledger still renders every ticket', () => {
