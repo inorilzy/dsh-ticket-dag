@@ -744,7 +744,11 @@ window.__ModuleLoader__.load({
       return modes[run.mode] ?? run.mode
     }
 
-    function Ticket({ ticket, view }) {
+    // Opens the worker's own conversation; present once the ticket has a child session.
+    const chatButton = (ticket, open) =>
+      open && ticket.childId && button('查看对话', () => open(ticket.childId), { title: '打开这个工单子会话的对话记录' })
+
+    function Ticket({ ticket, view, open }) {
       const { id, title, status, dependsOn, attempt, retryAt, message } = ticket
       const info = [
         ['子会话', ticket.childId],
@@ -764,6 +768,7 @@ window.__ModuleLoader__.load({
           h('strong', null, id),
           title && title !== id && h('span', null, title),
           h('span', { className: 'dtd-badge ' + view.tone }, view.label),
+          chatButton(ticket, open),
         ),
         view.stage && h('p', { className: 'dtd-phase' }, view.stage),
         h(
@@ -801,7 +806,7 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function RunProgress({ run }) {
+    function RunProgress({ run, compact, openChild }) {
       const [filter, setFilter] = useState('all')
       const byId = new Map(run.tickets.map((t) => [t.id, t]))
       const rows = run.tickets.map((ticket) => ({ ticket, view: ticketView(ticket, byId, run.mode) }))
@@ -828,6 +833,54 @@ window.__ModuleLoader__.load({
               ? view.label === '等待依赖'
               : view.tone === 'work'),
       )
+      const open = openChild && run.parentId ? (childId) => openChild(run.parentId, childId) : null
+      const listFold = h(
+        'div',
+        { className: 'dtd-fold', key: 'list-fold' },
+        h(
+          'button',
+          { type: 'button', 'aria-expanded': listOpen, onClick: () => setListOpen(!listOpen) },
+          (listOpen ? '▾ ' : '▸ ') + run.tickets.length + ' 张工单',
+        ),
+        listOpen &&
+          h(
+            'label',
+            null,
+            '筛选',
+            h(
+              'select',
+              { 'aria-label': '筛选工单', value: filter, onChange: (e) => setFilter(e.target.value) },
+              h('option', { value: 'all' }, '全部工单'),
+              h('option', { value: 'working' }, '执行或集成中'),
+              h('option', { value: 'waiting' }, '等待依赖'),
+              h('option', { value: 'blocked' }, '需要处理'),
+            ),
+          ),
+      )
+      const listBody =
+        listOpen &&
+        (visible.length
+          ? h(
+              'ul',
+              { className: 'dtd-tickets', key: 'list' },
+              ...visible.map(({ ticket, view }) => h(Ticket, { key: ticket.id, ticket, view, open })),
+            )
+          : h('p', { className: 'dtd-hint', key: 'list' }, '当前没有符合筛选条件的工单。'))
+      const mapFold = h(
+        'div',
+        { className: 'dtd-fold', key: 'map-fold' },
+        h(
+          'button',
+          { type: 'button', 'aria-expanded': mapOpen, onClick: () => setMapOpen(!mapOpen) },
+          (mapOpen ? '▾ ' : '▸ ') + '工单依赖',
+        ),
+        h(
+          'span',
+          { className: 'dtd-hint' },
+          pinned ? '已固定 ' + pinned + ' · 再次点击取消' : '从左到右：上游合入后解锁 · 点击查看详情',
+        ),
+      )
+      const mapBody = mapOpen && h(DependencyMap, { key: 'map', rows, pinned, setPinned, open })
       return h(
         'section',
         { className: 'dtd-section', 'aria-label': '运行详情' },
@@ -892,52 +945,8 @@ window.__ModuleLoader__.load({
             attention + ' 张工单需要处理',
           ),
         run.diagnostic && h('p', { className: 'dtd-alert' }, run.diagnostic),
-        h(
-          'div',
-          { className: 'dtd-fold' },
-          h(
-            'button',
-            { type: 'button', 'aria-expanded': listOpen, onClick: () => setListOpen(!listOpen) },
-            (listOpen ? '▾ ' : '▸ ') + run.tickets.length + ' 张工单',
-          ),
-          listOpen &&
-            h(
-              'label',
-              null,
-              '筛选',
-              h(
-                'select',
-                { 'aria-label': '筛选工单', value: filter, onChange: (e) => setFilter(e.target.value) },
-                h('option', { value: 'all' }, '全部工单'),
-                h('option', { value: 'working' }, '执行或集成中'),
-                h('option', { value: 'waiting' }, '等待依赖'),
-                h('option', { value: 'blocked' }, '需要处理'),
-              ),
-            ),
-        ),
-        listOpen &&
-          (visible.length
-            ? h(
-                'ul',
-                { className: 'dtd-tickets' },
-                ...visible.map(({ ticket, view }) => h(Ticket, { key: ticket.id, ticket, view })),
-              )
-            : h('p', { className: 'dtd-hint' }, '当前没有符合筛选条件的工单。')),
-        h(
-          'div',
-          { className: 'dtd-fold' },
-          h(
-            'button',
-            { type: 'button', 'aria-expanded': mapOpen, onClick: () => setMapOpen(!mapOpen) },
-            (mapOpen ? '▾ ' : '▸ ') + '工单依赖',
-          ),
-          h(
-            'span',
-            { className: 'dtd-hint' },
-            pinned ? '已固定 ' + pinned + ' · 再次点击取消' : '从左到右：上游合入后解锁 · 点击查看详情',
-          ),
-        ),
-        mapOpen && h(DependencyMap, { rows, pinned, setPinned }),
+        // The narrow sidebar leads with the map; the ticket list follows it.
+        ...(compact ? [mapFold, mapBody, listFold, listBody] : [listFold, listBody, mapFold, mapBody]),
       )
     }
 
@@ -1011,7 +1020,7 @@ window.__ModuleLoader__.load({
       return new Set([...up, ...down])
     }
 
-    function DependencyMap({ rows, pinned, setPinned }) {
+    function DependencyMap({ rows, pinned, setPinned, open }) {
       if (!rows.length) return null
       const tickets = rows.map((r) => r.ticket)
       const layout = dagLayout(tickets)
@@ -1078,7 +1087,7 @@ window.__ModuleLoader__.load({
             }),
           ),
         ),
-        h(TicketDetail, { ...focus, tickets }),
+        h(TicketDetail, { ...focus, tickets, open }),
       )
     }
 
@@ -1104,7 +1113,7 @@ window.__ModuleLoader__.load({
       ])
     }
 
-    function TicketDetail({ ticket, view, tickets }) {
+    function TicketDetail({ ticket, view, tickets, open }) {
       const downstream = tickets.filter((t) => t.dependsOn.includes(ticket.id)).map((t) => t.id)
       const upstream = ticket.dependsOn.length
         ? '上游 ' +
@@ -1144,6 +1153,7 @@ window.__ModuleLoader__.load({
             (ticket.attempt ?? 0),
         ),
         ticket.message && ticket.status === 'NEEDS_ATTENTION' && h('p', { className: 'dtd-alert' }, ticket.message),
+        chatButton(ticket, open) && h('div', { className: 'dtd-actions' }, chatButton(ticket, open)),
       )
     }
 
@@ -1158,7 +1168,7 @@ window.__ModuleLoader__.load({
     // Only one request at a time. A changed selection supersedes an older
     // response; unmount aborts the pending read and clears the next timer.
     // With sessionId (the conversation sidebar) only that captain's runs show.
-    function Dashboard({ sessionId } = {}) {
+    function Dashboard({ sessionId, openChild } = {}) {
       const [data, setData] = useState(null)
       const [selectedKey, setSelectedKey] = useState('')
       const [error, setError] = useState('')
@@ -1300,7 +1310,9 @@ window.__ModuleLoader__.load({
             { role: 'status', className: 'dtd-alert' },
             selected.diagnostic || '这轮运行的持久记录暂不可读取。',
           ),
-        selected && selected.available !== false && h(RunProgress, { run: selected, key: selected.key }),
+        selected &&
+          selected.available !== false &&
+          h(RunProgress, { run: selected, key: selected.key, compact: Boolean(sessionId), openChild }),
         data?.runs.length > 0 && !selected && !error && h('p', { role: 'status' }, '正在读取所选运行…'),
       )
     }
@@ -1415,14 +1427,45 @@ window.__ModuleLoader__.load({
           ),
         )
         // Hosts without the conversation right sidebar keep the plugin-page board only.
+        // Worker transcripts are one-shot subagent sessions under the captain.
+        // Newer hosts list them in the parent's catalog first; older ones open by ID.
+        let openChild = null
+        ctx.inject?.(['sessions'], (scope) => {
+          const sessions = scope.sessions
+          openChild = async (parentSessionId, childSessionId) => {
+            const workspace = scope.get?.('uiWorkspace')
+            if (!sessions.open && workspace?.openSession) {
+              workspace.openSession({ parentSessionId, childSessionId, mode: 'one-shot' })
+              return
+            }
+            if (sessions.openSubagent && sessions.refreshSubagents) {
+              await sessions.refreshSubagents(parentSessionId)
+              const kept = sessions.subagentAddress?.(childSessionId)
+              sessions.openSubagent(
+                kept?.parentSessionId === parentSessionId ? kept : { parentSessionId, childSessionId, mode: 'one-shot' },
+              )
+            } else {
+              sessions.open?.(childSessionId)
+            }
+            scope.get?.('layout')?.selectPanel?.(null)
+          }
+          return () => {
+            openChild = null
+          }
+        })
         ctx.inject?.(['sidebarRight', 'sidebarRightTabs'], (native) => {
           native.effect(() =>
             native.sidebarRightTabs.register({ id: tabId, kind: tabKind, title: () => '工单进度' }),
           )
           native.effect(() =>
             native.slots.inject('sidebar.right.pane.tab', () =>
+              // The pane gives the tab its height; this element owns the scrolling.
               native.slots.register({ name: 'sidebar.right.pane.tab', key: tabId }, ({ sessionId }) =>
-                h(Dashboard, { sessionId }),
+                h(
+                  'div',
+                  { style: { height: '100%', overflowY: 'auto', padding: '0 .75rem 1.5rem', boxSizing: 'border-box' } },
+                  h(Dashboard, { sessionId, openChild: (parent, child) => openChild?.(parent, child) }),
+                ),
               ),
             ),
           )

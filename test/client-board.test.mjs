@@ -47,7 +47,7 @@ function loadHost(seeds, { expanded = false, config = { status: 'loading' } } = 
     useRef: (current) => ({ current }),
     useEffect: (fn) => void fn(),
   }
-  const host = { tabs: [], opened: [], slots: {}, urls, injected: [], namespaces: [], saved: [] }
+  const host = { tabs: [], opened: [], slots: {}, urls, injected: [], namespaces: [], saved: [], sessions: [] }
   const slots = {
     inject: (_, fn) => fn(),
     register: (meta, component) => (host.slots[meta.name] = { meta, component }),
@@ -62,6 +62,12 @@ function loadHost(seeds, { expanded = false, config = { status: 'loading' } } = 
         slots,
         sidebarRightTabs: { register: (definition) => (host.tabs.push(definition), () => {}) },
         sidebarRight: { openTab: (kind) => host.opened.push(kind), isExpanded: () => expanded },
+        sessions: {
+          refreshSubagents: async (parent) => host.sessions.push(['refresh', parent]),
+          subagentAddress: () => undefined,
+          openSubagent: (address) => host.sessions.push(['open', { ...address }]),
+        },
+        get: () => undefined,
         configForms: {
           get: (ns) => (
             host.namespaces.push(ns),
@@ -317,7 +323,7 @@ test('each conversation gets a right-sidebar tab that reads only its own runs', 
   const host = loadHost([])
   assert.deepEqual(
     host.injected.map((names) => [...names]),
-    [['configForms'], ['sidebarRight', 'sidebarRightTabs']],
+    [['configForms'], ['sessions'], ['sidebarRight', 'sidebarRightTabs']],
   )
   assert.deepEqual(
     host.tabs.map((t) => [t.id, t.kind, t.title()]),
@@ -330,6 +336,37 @@ test('each conversation gets a right-sidebar tab that reads only its own runs', 
   const empty = loadHost([{ runs: [], selected: null }, ''])
   const pane = empty.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-1' })
   assert.match(text(pane), /这个对话还没有启动工单运行/)
+})
+
+test('the sidebar board scrolls, shows the dependency map before the ticket list, and opens worker conversations', async () => {
+  const selected = {
+    key: 'k'.repeat(64),
+    runId: 'demo',
+    parentId: 'session-captain',
+    mode: 'active',
+    total: 2,
+    counts: { RUNNING: 1, PENDING: 1 },
+    tickets: [
+      { id: 'A', title: 'A', status: 'RUNNING', dependsOn: [], attempt: 1, childId: 'child-a', livePhase: { stage: 'agent' } },
+      { id: 'B', title: 'B', status: 'PENDING', dependsOn: ['A'], attempt: 0 },
+    ],
+  }
+  const host = loadHost([{ runs: [selected], selected }, selected.key])
+  const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  assert.equal(pane.props.style.overflowY, 'auto')
+  assert.equal(pane.props.style.height, '100%')
+  const order = findAll(pane, (n) => n.props['data-dag-map'] !== undefined || n.props['data-dag-ticket'] !== undefined)
+  assert.ok(order[0].props['data-dag-map'] !== undefined, 'map comes first in the sidebar')
+
+  const rowA = find(pane, (n) => n.props['data-dag-ticket'] === 'A')
+  assert.equal(find(find(pane, (n) => n.props['data-dag-ticket'] === 'B'), (n) => text(n) === '查看对话'), undefined)
+  await find(rowA, (n) => n.type === 'button' && text(n) === '查看对话').props.onClick()
+  const detail = find(pane, (n) => n.props['data-dag-detail'] === 'A')
+  assert.ok(find(detail, (n) => n.type === 'button' && text(n) === '查看对话'))
+  assert.deepEqual(host.sessions, [
+    ['refresh', 'session-captain'],
+    ['open', { parentSessionId: 'session-captain', childSessionId: 'child-a', mode: 'one-shot' }],
+  ])
 })
 
 test('the conversation header shows 查看工单 only when this conversation has runs, and opens the tab', () => {
