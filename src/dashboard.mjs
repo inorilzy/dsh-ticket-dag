@@ -129,6 +129,7 @@ export class RunCatalog {
             data.mode === 'staged' && {
               presets: Object.entries(coordinator.agents ?? {}).map(([id, p]) => ({
                 id,
+                name: p?.name ?? '',
                 description: p?.description ?? '',
                 provider: p?.provider ?? '',
                 model: p?.model ?? '',

@@ -324,6 +324,7 @@ test('without saved presets the config page starts from the built-in presets', a
   const values = (label) =>
     findAll(section, (n) => n.props['aria-label'] === label).map((n) => n.props.value)
   assert.deepEqual(values('Agent ID'), Object.keys(builtinAgents))
+  assert.deepEqual(values('显示名'), ['实现者', '测试员', '文档员'])
   assert.deepEqual(
     values('角色说明'),
     Object.values(builtinAgents).map((a) => a.instructions),
@@ -380,48 +381,84 @@ test('the sidebar board scrolls, shows the dependency map before the ticket list
   ])
 })
 
-test('a staged run shows the plan review: per-ticket preset and model, then approve or discard', () => {
-  const selected = {
+// The A/C/T/B/D plan of the review design: three named members own five tasks.
+function reviewRun() {
+  const presets = [
+    { id: 'implementer', name: '实现者', description: '', provider: 'acme', model: 'deep-2', reasoningEffort: 'high' },
+    { id: 'test-writer', name: '测试员', description: '', provider: 'acme', model: 'fast-1', reasoningEffort: '' },
+    { id: 'docs', name: '文档员', description: '', provider: '', model: '', reasoningEffort: '' },
+  ]
+  const route = (agent) => {
+    const p = presets.find((x) => x.id === agent)
+    return { provider: p.provider, model: p.model, reasoningEffort: p.reasoningEffort }
+  }
+  return {
     key: 'k'.repeat(64),
     runId: 'plan',
     parentId: 'session-captain',
     mode: 'staged',
     attached: true,
-    total: 2,
-    counts: { PENDING: 2 },
-    presets: [
-      { id: 'docs', description: '文档', provider: 'acme', model: 'fast-1', reasoningEffort: '' },
-      { id: 'impl', description: '实现', provider: '', model: '', reasoningEffort: '' },
-    ],
+    total: 5,
+    counts: { PENDING: 5 },
+    captain: { provider: 'magpie', model: 'auto/claude-opus-5-5' },
+    presets,
     tickets: [
-      {
-        id: 'A',
-        title: 'Docs',
-        status: 'PENDING',
-        dependsOn: [],
-        attempt: 0,
-        agent: 'docs',
-        route: { provider: 'acme', model: 'fast-1', reasoningEffort: '' },
-      },
-      { id: 'B', title: 'Code', status: 'PENDING', dependsOn: ['A'], attempt: 0, agent: null, route: null },
-    ],
+      ['A', '定义接口', [], 'implementer'],
+      ['C', '实现服务', ['A'], 'implementer'],
+      ['T', '编写测试', ['C'], 'test-writer'],
+      ['B', '接入客户端', ['A'], 'implementer'],
+      ['D', '更新文档', ['B'], 'docs'],
+    ].map(([id, title, dependsOn, agent]) => ({
+      id,
+      title,
+      status: 'PENDING',
+      dependsOn,
+      attempt: 0,
+      agent,
+      route: route(agent),
+    })),
   }
+}
+
+test('plan review: named members with their tasks and model, compact task list, map and fixed actions', () => {
+  const selected = reviewRun()
   const host = loadHost([{ runs: [selected], selected }, selected.key])
   const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
   const review = find(pane, (n) => n.props['data-dag-review'] !== undefined)
   assert.match(text(review), /执行前计划审查/)
   assert.match(text(review), /待确认/)
-  assert.match(text(review), /2 张工单 · 1 条依赖/)
+  assert.match(text(review), /3 名成员 · 5 项任务 · 4 条依赖/)
+  for (const step of ['审查计划', '确认模型', '开始执行']) assert.match(text(review), new RegExp(step))
+  assert.match(text(find(review, (n) => n.props['data-dag-captain'] !== undefined)), /队长 · 当前对话.*claude-opus-5-5/)
+
+  const members = findAll(review, (n) => n.props['data-dag-member'] !== undefined)
+  assert.deepEqual(members.map((m) => m.props['data-dag-member']), ['implementer', 'test-writer', 'docs'])
+  assert.match(text(members[0]), /实现者/)
+  assert.match(text(members[0]), /负责 A、C、B/)
+  assert.doesNotMatch(text(members[0]), /implementer/, 'members show their name, not the preset ID')
   const field = (label) => find(review, (n) => n.props['aria-label'] === label)
-  assert.equal(field('A 的预设').props.value, 'docs')
-  assert.equal(field('B 的预设').props.value, '')
-  assert.equal(field('A 的模型').props.value, JSON.stringify(['acme', 'fast-1']))
-  assert.equal(field('B 的模型').props.value, '')
-  assert.ok(find(review, (n) => n.props['data-dag-map'] !== undefined), 'the plan shows its dependency map')
-  assert.match(text(find(review, (n) => n.props['data-dag-detail'] === 'A')), /docs · acme\/fast-1/)
+  assert.equal(field('实现者 的模型').props.value, JSON.stringify(['acme', 'deep-2']))
+  assert.equal(field('实现者 的推理强度').props.value, 'high')
+  assert.equal(field('文档员 的模型').props.value, '')
+
+  const tasks = findAll(review, (n) => n.props['data-dag-task'] !== undefined)
+  assert.deepEqual(tasks.map((t) => t.props['data-dag-task']), ['A', 'C', 'T', 'B', 'D'])
+  assert.match(text(tasks[0]), /定义接口.*实现者 · 可开始/)
+  assert.match(text(tasks[2]), /编写测试.*测试员 · 等待 C/)
+  assert.equal(field('A 的负责人'), undefined, 'task rows stay collapsed')
+
+  const node = find(review, (n) => n.props['data-dag-node'] === 'A')
+  assert.equal(text(node), 'A', 'map nodes show an avatar and the ID only')
+  assert.equal(find(review, (n) => n.props['data-dag-detail'] !== undefined), undefined)
   assert.equal(find(pane, (n) => n.props['data-dag-ticket'] !== undefined), undefined, 'no progress list yet')
 
-  find(review, (n) => n.type === 'button' && text(n) === '确认并启动').props.onClick()
+  const bar = find(review, (n) => n.props['data-dag-actions'] !== undefined)
+  assert.deepEqual(
+    findAll(bar, (n) => n.type === 'button').map(text),
+    ['确认并启动', '返回对话修改', '放弃本次计划'],
+  )
+  find(bar, (n) => n.type === 'button' && text(n) === '确认并启动').props.onClick()
+  const impl = { agent: 'implementer', provider: 'acme', model: 'deep-2', reasoningEffort: 'high' }
   assert.deepEqual(host.posts, [
     [
       'api/ticket-dag.approve',
@@ -429,13 +466,15 @@ test('a staged run shows the plan review: per-ticket preset and model, then appr
         key: selected.key,
         action: 'approve',
         choices: [
-          { id: 'A', agent: 'docs', provider: 'acme', model: 'fast-1', reasoningEffort: '' },
-          { id: 'B', agent: '', provider: '', model: '', reasoningEffort: '' },
+          { id: 'A', ...impl },
+          { id: 'C', ...impl },
+          { id: 'T', agent: 'test-writer', provider: 'acme', model: 'fast-1', reasoningEffort: '' },
+          { id: 'B', ...impl },
+          { id: 'D', agent: 'docs', provider: '', model: '', reasoningEffort: '' },
         ],
       },
     ],
   ])
-  assert.ok(find(review, (n) => n.type === 'button' && text(n) === '放弃本次计划'))
 })
 
 function stagedRun(tickets) {
@@ -461,30 +500,37 @@ function stagedRun(tickets) {
   }
 }
 
-test('the board shows the captain and a vendor avatar per ticket, generic when unknown', () => {
-  const selected = stagedRun([
-    ['A', 'deepseek-official', 'deepseek-v4-pro'],
-    ['B', '', ''],
-    ['C', 'xai', 'grok-4'],
-    ['D', 'google', 'gemini-2.5-pro'],
-    ['E', 'openai', 'gpt-5'],
-    ['F', 'local', 'llama-3'],
-  ])
+test('the captain avatar follows its vendor; each member has its own colour, also on its map nodes', () => {
+  const selected = reviewRun()
   const host = loadHost([{ runs: [selected], selected }, selected.key])
   const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
-  const captain = find(pane, (n) => n.props['data-dag-captain'] !== undefined)
-  assert.match(text(captain), /队长/)
-  assert.match(text(captain), /当前对话/)
-  assert.match(text(captain), /magpie\/auto\/claude-opus-5-5/)
-  assert.equal(find(captain, (n) => n.props['data-dag-avatar'] !== undefined).props['data-dag-avatar'], 'claude')
-  const vendor = (id) =>
-    find(find(pane, (n) => n.props['data-dag-plan'] === id), (n) => n.props['data-dag-avatar'] !== undefined).props[
-      'data-dag-avatar'
-    ]
+  const avatar = (node) => find(node, (n) => n.props['data-dag-avatar'] !== undefined).props
+  assert.equal(avatar(find(pane, (n) => n.props['data-dag-captain'] !== undefined))['data-dag-avatar'], 'claude')
+  const colour = (match) => avatar(find(pane, match))['data-dag-color']
+  const members = ['implementer', 'test-writer', 'docs'].map((id) => colour((n) => n.props['data-dag-member'] === id))
+  assert.equal(new Set(members).size, 3)
+  assert.equal(colour((n) => n.props['data-dag-node'] === 'C'), members[0])
+  assert.equal(colour((n) => n.props['data-dag-node'] === 'D'), members[2])
+})
+
+test('vendor recognition covers the main model families and falls back to a generic figure', () => {
+  const vendorFor = (provider, model) => {
+    const selected = { ...reviewRun(), captain: { provider, model } }
+    const pane = loadHost([{ runs: [selected], selected }, selected.key]).renderSlot('sidebar.right.pane.tab', {
+      sessionId: 'session-captain',
+    })
+    const captain = find(pane, (n) => n.props['data-dag-captain'] !== undefined)
+    return find(captain, (n) => n.props['data-dag-avatar'] !== undefined).props['data-dag-avatar']
+  }
   assert.deepEqual(
-    ['A', 'B', 'C', 'D', 'E', 'F'].map(vendor),
-    ['deepseek', 'claude', 'grok', 'gemini', 'gpt', 'generic'],
-    'a ticket on the host default inherits the captain model',
+    [
+      ['deepseek-official', 'deepseek-v4-pro'],
+      ['xai', 'grok-4'],
+      ['google', 'gemini-2.5-pro'],
+      ['openai', 'gpt-5'],
+      ['local', 'llama-3'],
+    ].map(([p, m]) => vendorFor(p, m)),
+    ['deepseek', 'grok', 'gemini', 'gpt', 'generic'],
   )
 })
 
@@ -508,35 +554,38 @@ test('the progress board also shows the captain, and avatars on ticket rows and 
   assert.equal(avatar(find(pane, (n) => n.props['data-dag-node'] === 'A')), 'grok')
 })
 
-test('plan review: select all or some tickets and apply one model to them at once', () => {
-  const selected = stagedRun([
-    ['A', '', ''],
-    ['B', 'acme', 'fast-1'],
-    ['C', '', ''],
-  ])
-  const bulk = { provider: 'acme', model: 'deep-2', reasoningEffort: 'high' }
-  // Dashboard: data, selectedKey, error, lastRead; PlanReview: choices, catalog, busy,
-  // error, pinned, confirmDiscard, checked, bulk route.
-  const seeds = [{ runs: [selected], selected }, selected.key, '', null, null, null, false, '', null, false]
-  const host = loadHost([...seeds, new Set(['A', 'C']), bulk])
+test('checked members change model together; a task row expands to change its owner', () => {
+  const selected = reviewRun()
+  // Dashboard: data, selectedKey, error, lastRead. PlanReview: owners, routes,
+  // catalog, busy, error, confirmDiscard, checked members, expanded task.
+  const seeds = [{ runs: [selected], selected }, selected.key, '', null, null, null, catalog, false, '', false]
+  const host = loadHost([...seeds, new Set(['implementer', 'docs']), 'T'])
   const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
-  const all = find(pane, (n) => n.props['aria-label'] === '全选工单')
-  assert.equal(all.props.type, 'checkbox')
-  assert.equal(all.props.checked, false)
-  assert.equal(find(pane, (n) => n.props['aria-label'] === '选择 A').props.checked, true)
-  assert.equal(find(pane, (n) => n.props['aria-label'] === '选择 B').props.checked, false)
-  assert.ok(find(pane, (n) => n.props['aria-label'] === '批量 的模型'))
+  const field = (label) => find(pane, (n) => n.props['aria-label'] === label)
+  assert.equal(field('全选成员').props.type, 'checkbox')
+  assert.equal(field('全选成员').props.checked, false)
+  assert.equal(field('选择 实现者').props.checked, true)
+  assert.equal(field('选择 测试员').props.checked, false)
 
   host.sets.length = 0
-  find(pane, (n) => n.type === 'button' && text(n) === '应用到选中的 2 张工单').props.onClick()
-  const next = host.sets.find((v) => typeof v === 'function')(null)
-  assert.deepEqual(next.A, { agent: '', ...bulk })
-  assert.deepEqual(next.C, { agent: '', ...bulk })
-  assert.deepEqual(next.B, { agent: '', provider: 'acme', model: 'fast-1', reasoningEffort: '' })
+  field('文档员 的模型').props.onChange({ target: { value: JSON.stringify(['acme', 'deep-2']) } })
+  // The update runs inside the vm realm; compare plain data.
+  const routes = JSON.parse(JSON.stringify(host.sets.find((v) => typeof v === 'function')(null)))
+  const deep = { provider: 'acme', model: 'deep-2', reasoningEffort: '' }
+  assert.deepEqual(routes.docs, deep)
+  assert.deepEqual(routes.implementer, deep, 'a checked member follows')
+  assert.deepEqual(routes['test-writer'], { provider: 'acme', model: 'fast-1', reasoningEffort: '' })
+
+  const owner = field('T 的负责人')
+  assert.equal(owner.props.value, 'test-writer')
+  assert.match(text(owner), /实现者.*测试员.*文档员/)
+  host.sets.length = 0
+  owner.props.onChange({ target: { value: 'docs' } })
+  assert.equal(host.sets.find((v) => typeof v === 'function')(null).T, 'docs')
 
   host.sets.length = 0
-  all.props.onChange({ target: { checked: true } })
-  assert.deepEqual([...host.sets[0]], ['A', 'B', 'C'])
+  field('全选成员').props.onChange({ target: { checked: true } })
+  assert.deepEqual([...host.sets[0]], ['implementer', 'test-writer', 'docs'])
 })
 
 test('settings carry the approval switch, on by default', () => {

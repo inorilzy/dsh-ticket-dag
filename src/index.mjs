@@ -25,6 +25,7 @@ export const Config = z.object({
   agents: z
     .dict(
       z.object({
+        name: z.string().default(''),
         description: z.string().default(''),
         instructions: z.string().default(''),
         provider: z.string().default(''),
