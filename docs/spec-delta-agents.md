@@ -24,6 +24,7 @@
 ## 看板与路由
 
 - `GET /api/ticket-dag.dashboard` 的工单行新增 `agent`（ID 或 `null`）与 `model`（`provider/model`、`model` 或 `null`），热运行与冷历史一致。
+- `GET /api/ticket-dag.dashboard` 接受可选的 `parent`（队长会话 ID，`[A-Za-z0-9_.:-]{1,200}`，最多一个），只返回该会话发起的运行；`key` 不属于该会话时返回 404。对话右侧栏的「工单进度」标签和对话顶部的「查看工单」按钮用它读取本对话的运行。
 - 新增 owner-only `GET /api/ticket-dag.models`，返回 `{ providers: [{ id, name, models: [{ id, name, efforts: [{ id, name }], defaultEffort }] }], failures: [providerId] }`。数据来自宿主 `llm.listProviders`、`listModels`、`resolveModelInfo`；只读，不改变任何会话的模型。读取失败的 provider 列入 `failures`。
 
 ## 回归测试
