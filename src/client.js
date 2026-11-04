@@ -74,9 +74,9 @@ window.__ModuleLoader__.load({
 .dtd-dashboard {margin:1rem 0;overflow-wrap:anywhere}
 .dtd-dashboard progress {width:100%;height:.7rem;accent-color:#337cbd}
 .dtd-counts {display:flex;gap:.45rem;flex-wrap:wrap}.dtd-counts span,.dtd-badge {background:color-mix(in srgb,currentColor 7%,transparent);border-radius:.35rem;padding:.18rem .5rem;font-size:.83rem}
-.dtd-badge {font-weight:600}.dtd-badge.work {background:color-mix(in srgb,#548dc7 18%,transparent)}.dtd-badge.done {background:color-mix(in srgb,#47a478 22%,transparent)}.dtd-badge.blocked {background:color-mix(in srgb,#dd953c 25%,transparent)}
+.dtd-badge {font-weight:600}.dtd-badge.work {background:color-mix(in srgb,#548dc7 18%,transparent)}.dtd-badge.done {background:color-mix(in srgb,#47a478 22%,transparent)}
 .dtd-tickets {display:grid;gap:.55rem;list-style:none;margin:0;padding:0}
-.dtd-ticket {border:1px solid color-mix(in srgb,currentColor 20%,transparent);border-radius:.55rem;padding:.7rem .8rem;display:grid;gap:.32rem}
+.dtd-ticket {border:1px solid var(--dtd-line);background:var(--dtd-card);border-radius:.55rem;padding:.7rem .8rem;display:grid;gap:.32rem}
 .dtd-ticket-head {display:flex;flex-wrap:wrap;gap:.35rem .7rem;align-items:baseline}.dtd-ticket-head .dtd-badge {margin-inline-start:auto}
 .dtd-phase,.dtd-ticket details {font-size:.86rem}.dtd-ticket summary {cursor:pointer}
 .dtd-info {display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.25rem .75rem;margin:.3rem 0}
@@ -117,7 +117,7 @@ window.__ModuleLoader__.load({
 .dtd-fold {display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;border-radius:.5rem;padding:.3rem .5rem;background:var(--dtd-card)}
 .dtd-panel .dtd-fold button {border:0;padding:.2rem .3rem;font-weight:600}.dtd-fold .dtd-hint {margin-inline-start:auto}
 .dtd-fold label {display:flex;align-items:center;gap:.4rem;margin-inline-start:auto;font-size:.83rem}
-.dtd-ticket {border-color:var(--dtd-line);background:var(--dtd-card)}.dtd-ticket-head .dtd-dot {align-self:center}
+.dtd-ticket-head .dtd-dot {align-self:center}
 .dtd-graph {overflow:auto;padding:.2rem 0 .4rem}.dtd-canvas {position:relative}
 .dtd-canvas svg {position:absolute;inset:0;overflow:visible;pointer-events:none}
 .dtd-canvas path {fill:none;stroke:color-mix(in srgb,currentColor 30%,transparent);stroke-width:1.3}
@@ -374,50 +374,46 @@ window.__ModuleLoader__.load({
       const known = providers.find((p) => p.id === agent.provider)?.models.find((m) => m.id === agent.model)
       const efforts = known?.efforts ?? []
       const modelSelect = h(
-            'select',
-            {
-              'aria-label': name + ' 的模型',
-              value: current,
-              disabled,
-              onChange: (e) =>
-                modify((a) => {
-                  const [provider, model] = e.target.value ? JSON.parse(e.target.value) : ['', '']
-                  Object.assign(a, { provider, model, reasoningEffort: '' })
-                }),
-            },
-            h('option', { value: '' }, '宿主默认'),
-            current &&
-              !known &&
-              h(
-                'option',
-                { value: current },
-                [agent.provider, agent.model].filter(Boolean).join('/') + '（当前目录中没有）',
-              ),
-            ...providers.map((p) =>
-              h(
-                'optgroup',
-                { key: p.id, label: p.name },
-                ...p.models.map((m) => h('option', { key: m.id, value: routeKey(p.id, m.id) }, m.name)),
-              ),
-            ),
-          )
+        'select',
+        {
+          'aria-label': name + ' 的模型',
+          value: current,
+          disabled,
+          onChange: (e) =>
+            modify((a) => {
+              const [provider, model] = e.target.value ? JSON.parse(e.target.value) : ['', '']
+              Object.assign(a, { provider, model, reasoningEffort: '' })
+            }),
+        },
+        h('option', { value: '' }, '宿主默认'),
+        current &&
+          !known &&
+          h('option', { value: current }, [agent.provider, agent.model].filter(Boolean).join('/') + '（当前目录中没有）'),
+        ...providers.map((p) =>
+          h(
+            'optgroup',
+            { key: p.id, label: p.name },
+            ...p.models.map((m) => h('option', { key: m.id, value: routeKey(p.id, m.id) }, m.name)),
+          ),
+        ),
+      )
       const effortSelect = h(
-            'select',
-            {
-              'aria-label': name + ' 的推理强度',
-              value: agent.reasoningEffort,
-              disabled: disabled || (!efforts.length && !agent.reasoningEffort),
-              onChange: (e) =>
-                modify((a) => {
-                  a.reasoningEffort = e.target.value
-                }),
-            },
-            h('option', { value: '' }, '模型默认'),
-            agent.reasoningEffort &&
-              !efforts.some((x) => x.id === agent.reasoningEffort) &&
-              h('option', { value: agent.reasoningEffort }, agent.reasoningEffort + '（当前目录中没有）'),
-            ...efforts.map((x) => h('option', { key: x.id, value: x.id }, x.name)),
-          )
+        'select',
+        {
+          'aria-label': name + ' 的推理强度',
+          value: agent.reasoningEffort,
+          disabled: disabled || (!efforts.length && !agent.reasoningEffort),
+          onChange: (e) =>
+            modify((a) => {
+              a.reasoningEffort = e.target.value
+            }),
+        },
+        h('option', { value: '' }, '模型默认'),
+        agent.reasoningEffort &&
+          !efforts.some((x) => x.id === agent.reasoningEffort) &&
+          h('option', { value: agent.reasoningEffort }, agent.reasoningEffort + '（当前目录中没有）'),
+        ...efforts.map((x) => h('option', { key: x.id, value: x.id }, x.name)),
+      )
       if (bare) return h('div', { className: 'dtd-route' }, modelSelect, effortSelect)
       return h(
         'div',
@@ -1151,6 +1147,7 @@ window.__ModuleLoader__.load({
             ...rows.map(({ ticket, view }) => {
               const { x, y } = layout.at.get(ticket.id)
               const owner = ownerOf(ticket)
+              // Focusable so keyboard users can reach each task and hear its state.
               return h(
                 'div',
                 {
@@ -1158,6 +1155,11 @@ window.__ModuleLoader__.load({
                   className: 'dtd-node dtd-node-compact',
                   'data-dag-node': ticket.id,
                   'data-tone': view.tone,
+                  tabIndex: 0,
+                  role: 'group',
+                  'aria-label': [ticket.id, owner.name, ticket.title !== ticket.id && ticket.title, view.label]
+                    .filter(Boolean)
+                    .join(' · '),
                   title: [ticket.id, owner.name, ticket.title].filter(Boolean).join(' · '),
                   style: { left: x, top: y, width: node.width, height: node.height },
                 },
@@ -1204,6 +1206,16 @@ window.__ModuleLoader__.load({
             ...rows.map(({ ticket, view }) => {
               const { x, y } = layout.at.get(ticket.id)
               const owner = ownerOf(ticket)
+              // The state is spelled out, not only coloured.
+              const summary = [
+                ticket.id,
+                ticket.title !== ticket.id && ticket.title,
+                view.label,
+                view.stage,
+                ticket.agent && [owner.name, ticket.model].filter(Boolean).join(' / '),
+              ]
+                .filter(Boolean)
+                .join(' · ')
               return h(
                 'button',
                 {
@@ -1214,15 +1226,8 @@ window.__ModuleLoader__.load({
                   'data-tone': view.tone,
                   'data-dim': !chain.has(ticket.id),
                   'aria-pressed': pinned === ticket.id,
-                  title: [
-                    ticket.id,
-                    ticket.title !== ticket.id && ticket.title,
-                    view.label,
-                    view.stage,
-                    ticket.agent && [owner.name, ticket.model].filter(Boolean).join(' / '),
-                  ]
-                    .filter(Boolean)
-                    .join(' · '),
+                  'aria-label': summary,
+                  title: summary,
                   style: { left: x, top: y, width: node.width, height: node.height },
                   onClick: () => setPinned(pinned === ticket.id ? null : ticket.id),
                 },
@@ -1270,6 +1275,7 @@ window.__ModuleLoader__.load({
 
     function TicketDetail({ ticket, view, tickets, open, member }) {
       const downstream = tickets.filter((t) => t.dependsOn.includes(ticket.id)).map((t) => t.id)
+      const chat = chatButton(ticket, open)
       const upstream = ticket.dependsOn.length
         ? '上游 ' +
           ticket.dependsOn.join('、') +
@@ -1294,7 +1300,13 @@ window.__ModuleLoader__.load({
           ...stepStates(ticket).map(([stage, state]) =>
             h(
               'li',
-              { key: stage, 'data-dag-step': stage, 'data-state': state, title: stages[stage] },
+              {
+                key: stage,
+                'data-dag-step': stage,
+                'data-state': state,
+                'aria-current': state === 'current' ? 'step' : undefined,
+                title: stages[stage],
+              },
               stepLabels[stage],
             ),
           ),
@@ -1308,7 +1320,7 @@ window.__ModuleLoader__.load({
             (ticket.attempt ?? 0),
         ),
         ticket.message && ticket.status === 'NEEDS_ATTENTION' && h('p', { className: 'dtd-alert' }, ticket.message),
-        chatButton(ticket, open) && h('div', { className: 'dtd-actions' }, chatButton(ticket, open)),
+        chat && h('div', { className: 'dtd-actions' }, chat),
       )
     }
 
@@ -1387,7 +1399,6 @@ window.__ModuleLoader__.load({
       id ? presets?.find((p) => p.id === id)?.name || builtinAgents[id]?.name || id : '默认成员'
     // ids is every possible owner in a stable order, which fixes each member colour.
     const memberColor = (ids, id) => memberColors[Math.max(0, ids.indexOf(id)) % memberColors.length]
-    const blankRoute = () => ({ provider: '', model: '', reasoningEffort: '' })
     const routeFields = (r) => ({
       provider: r?.provider ?? '',
       model: r?.model ?? '',
@@ -1581,7 +1592,11 @@ window.__ModuleLoader__.load({
             ...['审查计划', '确认模型', '开始执行'].map((label, i) =>
               h(
                 'li',
-                { key: label, 'data-state': i === step ? 'current' : i < step ? 'done' : 'todo' },
+                {
+                  key: label,
+                  'data-state': i === step ? 'current' : i < step ? 'done' : 'todo',
+                  'aria-current': i === step ? 'step' : undefined,
+                },
                 h('span', null, i + 1),
                 label,
               ),
@@ -1647,15 +1662,14 @@ window.__ModuleLoader__.load({
             h(
               'div',
               { className: 'dtd-member-foot' },
-              changed &&
-                button(
-                  '恢复计划原值',
-                  () => {
-                    setOwners(null)
-                    setRoutes(null)
-                  },
-                  { disabled: busy },
-                ),
+              button(
+                '恢复计划原值',
+                () => {
+                  setOwners(null)
+                  setRoutes(null)
+                },
+                { disabled: busy },
+              ),
             ),
         ),
         h(
@@ -1748,8 +1762,58 @@ window.__ModuleLoader__.load({
       return 'api/ticket-dag.dashboard' + (text ? '?' + text : '')
     }
 
+    // Poll intervals in milliseconds: the open board tab, the conversation header
+    // entry, a run that has finished, and the longest retry after failures.
+    const tabPollMs = 2000
+    const entryPollMs = 5000
+    const settledPollMs = 30000
+    const maxBackoffMs = 30000
+    const backoff = (base, failures) => Math.min(maxBackoffMs, base * 2 ** failures)
+    const pageHidden = () => typeof document !== 'undefined' && document.visibilityState === 'hidden'
+
+    // Runs tick() now and again after the delay it resolves to; null stops.
+    // One tick at a time: a call during a tick runs once more right after it.
+    // While the page is hidden no tick runs; showing it ticks at once.
+    function poller(tick) {
+      let timer,
+        running = false,
+        again = false,
+        stopped = false
+      async function run() {
+        clearTimeout(timer)
+        if (stopped) return
+        if (running) {
+          again = true
+          return
+        }
+        if (pageHidden()) return
+        running = true
+        let delay = null
+        try {
+          delay = await tick()
+        } finally {
+          running = false
+          if (!stopped && (again || delay !== null)) timer = setTimeout(run, again ? 0 : delay)
+          again = false
+        }
+      }
+      const onVisibility = () => void (!pageHidden() && run())
+      if (typeof document !== 'undefined') document.addEventListener?.('visibilitychange', onVisibility)
+      void run()
+      return {
+        run,
+        stop() {
+          stopped = true
+          clearTimeout(timer)
+          if (typeof document !== 'undefined') document.removeEventListener?.('visibilitychange', onVisibility)
+        },
+      }
+    }
+
     // Only one request at a time. A changed selection supersedes an older
     // response; unmount aborts the pending read and clears the next timer.
+    // A failed read keeps the last snapshot and retries with backoff; a 404
+    // for the pinned run stops polling.
     // With sessionId (the conversation sidebar) only that captain's runs show.
     // runKey pins the board to one run (one sidebar tab per run); without it
     // the board follows this conversation's newest run.
@@ -1763,30 +1827,25 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         let disposed = false,
           active = null,
-          timer,
-          again = false
-        async function poll() {
-          clearTimeout(timer)
-          if (disposed) return
-          if (active) {
-            again = true
-            return
-          }
+          failures = 0,
+          settled = false
+        async function tick() {
           active = new AbortController()
           const key = target.current
           const timeout = setTimeout(() => active?.abort(), 12000)
           try {
             const response = await fetch(dashboardUrl(key, sessionId), { signal: active.signal, cache: 'no-store' })
-            if (response.status === 404 && runKey && key === runKey) {
-              throw new Error('这轮运行的记录已不可用。')
-            }
-            if (response.status === 404 && key && !disposed && key === target.current) {
+            if (disposed) return null
+            if (response.status === 404 && key && !runKey && key === target.current) {
               target.current = ''
               setSelectedKey('')
               setData(null)
               setLastRead(null)
-              again = true
-              return
+              return 0
+            }
+            if (response.status === 404) {
+              if (key === target.current) setError('运行记录已不可用（HTTP 404），已停止自动刷新。')
+              return null
             }
             if (!response.ok)
               throw new Error(
@@ -1798,37 +1857,37 @@ window.__ModuleLoader__.load({
             if (!Array.isArray(view?.runs) || (view.selected && !Array.isArray(view.selected.tickets))) {
               throw new Error('宿主未返回有效的运行快照。')
             }
-            if (disposed || key !== target.current) return
+            if (disposed) return null
+            failures = 0
+            if (key !== target.current) return tabPollMs
             const selected = view.selected?.key ?? ''
+            settled = Boolean(view.selected?.complete || view.selected?.mode === 'cancelled')
             target.current = selected
             setSelectedKey(selected)
             setData(view)
             setError('')
             setLastRead(new Date())
+            return settled ? settledPollMs : tabPollMs
           } catch (err) {
-            if (!disposed && key === target.current) {
-              setData(null)
-              setLastRead(null)
+            if (disposed) return null
+            failures++
+            if (key === target.current)
               setError(
                 err.name === 'AbortError'
                   ? '读取进度超时，将自动重试。'
                   : '进度暂不可用。' + (err.message ?? ''),
               )
-            }
+            return backoff(settled ? settledPollMs : tabPollMs, failures)
           } finally {
             clearTimeout(timeout)
             active = null
-            if (!disposed) {
-              timer = setTimeout(poll, again ? 0 : 2000)
-              again = false
-            }
           }
         }
-        refresh.current = poll
-        void poll()
+        const polling = poller(tick)
+        refresh.current = polling.run
         return () => {
           disposed = true
-          clearTimeout(timer)
+          polling.stop()
           active?.abort()
           refresh.current = null
         }
@@ -1853,10 +1912,12 @@ window.__ModuleLoader__.load({
           h(
             'p',
             { className: 'dtd-hint' },
-            '每 2 秒检查运行状态。',
+            selected?.complete || selected?.mode === 'cancelled'
+              ? '运行已结束，每 ' + settledPollMs / 1000 + ' 秒检查一次。'
+              : '每 ' + tabPollMs / 1000 + ' 秒检查运行状态。',
             lastRead && ' 最近更新 ' + lastRead.toLocaleTimeString('zh-CN'),
           ),
-        error && h('p', { className: 'dtd-alert', role: 'status' }, error),
+        error && h('p', { className: 'dtd-alert', role: 'status' }, data ? '数据可能已过期。' + error : error),
         !error && !data && h('p', { role: 'status' }, '正在读取运行进度…'),
         data?.runs.length === 0 &&
           h(
@@ -1904,28 +1965,32 @@ window.__ModuleLoader__.load({
       const [runs, setRuns] = useState(null)
       useEffect(() => {
         let disposed = false,
-          timer,
-          known = null
+          known = null,
+          failures = 0
         const ctrl = new AbortController()
-        async function poll() {
+        // A failed read keeps the button's last known state and retries with backoff.
+        async function tick() {
           try {
             const response = await fetch(dashboardUrl('', sessionId), { signal: ctrl.signal, cache: 'no-store' })
-            const view = response.ok ? await response.json() : null
-            if (disposed || !Array.isArray(view?.runs)) return
+            if (response.status === 404) return null
+            if (!response.ok) throw new Error('HTTP ' + response.status)
+            const view = await response.json()
+            if (disposed) return null
+            if (!Array.isArray(view?.runs)) throw new Error('invalid snapshot')
+            failures = 0
             const fresh = view.runs.filter((run) => known && !known.has(run.key) && !run.complete)
             known = new Set(view.runs.map((run) => run.key))
             setRuns(view.runs)
             if (fresh.length) openRun(fresh[0])
+            return entryPollMs
           } catch {
-            // The next poll retries; the button keeps its last known state.
-          } finally {
-            if (!disposed) timer = setTimeout(poll, 5000)
+            return disposed ? null : backoff(entryPollMs, ++failures)
           }
         }
-        void poll()
+        const polling = poller(tick)
         return () => {
           disposed = true
-          clearTimeout(timer)
+          polling.stop()
           ctrl.abort()
         }
       }, [sessionId])
@@ -1934,7 +1999,7 @@ window.__ModuleLoader__.load({
         'button',
         {
           type: 'button',
-          title: '在右侧栏查看这个对话的工单进度',
+          title: '在右侧栏打开「工单 · ' + runs[0].runId + '」标签',
           style: {
             font: 'inherit',
             fontSize: '.85rem',
@@ -2004,7 +2069,7 @@ window.__ModuleLoader__.load({
             ctx.slots.register({ name: 'plugins.row.config', key: 'dsh-ticket-dag#dsh-ticket-dag' }, Panel),
           ),
         )
-        // Hosts without the conversation right sidebar keep the plugin-page board only.
+        // The board lives only in the conversation right sidebar, one 「工单 · <runId>」 tab per run.
         // Worker transcripts are continuable subagent sessions under the captain (spawn with a fixed child ID).
         // Newer hosts list them in the parent's catalog first; older ones open by ID.
         let openChild = null
