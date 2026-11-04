@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process'
 import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { Coordinator } from '../src/coordinator.mjs'
 
@@ -549,6 +550,144 @@ test(
     } finally {
       await co.close()
       await reopened?.close()
+    }
+  },
+)
+
+// A worker or captain shell writing the ledger directly, outside the coordinator.
+function tamper(file, sql) {
+  const db = new DatabaseSync(file)
+  try {
+    db.exec('PRAGMA busy_timeout=5000')
+    db.exec(sql)
+  } finally {
+    db.close()
+  }
+}
+
+test(
+  'a staged run edited to active in the ledger is held, dispatches nothing and still waits for the user',
+  { timeout: 60000 },
+  async (t) => {
+    const cwd = await repo(t)
+    const jobs = []
+    const co = new Coordinator({
+      checks: noopChecks,
+      requireApproval: true,
+      launch: async (job) => {
+        jobs.push(job)
+        return {
+          dispose: async () => {},
+          result: (async () => {
+            await commit(job)
+            return { ok: true }
+          })(),
+        }
+      },
+    })
+    const q = { cwd, parentId: 'captain', runId: 'forged-approval' }
+    try {
+      await co.start({ ...q, manifest: { spec_id: 'forged', tickets: [ticket('A')] } })
+      const [file] = co.runs.keys()
+      tamper(file, "UPDATE run SET mode='active'")
+      const held = await co.status(q)
+      await sleep(400)
+      assert.equal(jobs.length, 0, 'a forged mode never dispatches')
+      const after = await co.status(q)
+      assert.equal(after.mode, 'staged')
+      assert.match(after.diagnostic, /outside the coordinator/)
+      assert.equal(held.tickets[0].status, 'PENDING')
+      await assert.rejects(co.resume(q), /approv/)
+      // The user can still approve the plan from the board.
+      await co.approve(file, [{ id: 'A' }])
+      await until(async () => (await co.status(q)).complete, 'approved run integrates', 30000)
+      assert.equal(jobs.length, 1)
+    } finally {
+      await co.close()
+    }
+  },
+)
+
+test(
+  'a ticket verify edited in the ledger holds the run and its submission is never integrated',
+  { timeout: 60000 },
+  async (t) => {
+    const cwd = await repo(t)
+    const worker = gate()
+    const co = new Coordinator({
+      checks: { ...noopChecks, skip: [[process.execPath, '-e', 'process.exit(0)']] },
+      launch: async (job) => ({
+        dispose: async () => {},
+        result: (async () => {
+          await worker.wait
+          await commit(job)
+          return { ok: true }
+        })(),
+      }),
+    })
+    const q = { cwd, parentId: 'captain', runId: 'forged-verify' }
+    try {
+      const s0 = await co.start({ ...q, manifest: { spec_id: 'forged', tickets: [ticket('A')] } })
+      const [file] = co.runs.keys()
+      await until(async () => (await co.status(q)).tickets[0].status === 'RUNNING', 'worker started', 10000)
+      tamper(file, `UPDATE tickets SET definition=json_set(definition,'$.verify',json('["skip"]')) WHERE id='A'`)
+      worker.release()
+      const held = await until(async () => {
+        const s = await co.status(q)
+        return s.mode === 'paused' && s.tickets[0].status === 'SUBMITTED' && s
+      }, 'run held with the submission waiting', 20000)
+      assert.match(held.diagnostic, /outside the coordinator/)
+      // A shell may also try to lift the hold.
+      tamper(file, "UPDATE run SET mode='active', diagnostic=NULL")
+      await co.status(q)
+      await sleep(600)
+      const after = await co.status(q)
+      assert.equal(after.tickets[0].status, 'SUBMITTED')
+      assert.equal(after.mode, 'paused')
+      assert.equal(await git(cwd, 'rev-parse', 'integration/forged-verify'), s0.verifiedSha)
+      await assert.rejects(co.resume(q), /outside the coordinator/)
+      assert.equal((await co.status(q)).tickets[0].status, 'SUBMITTED')
+    } finally {
+      worker.release()
+      await co.close()
+    }
+  },
+)
+
+test(
+  'a ticket whose planned preset was deleted from settings can still be approved with its frozen preset',
+  { timeout: 60000 },
+  async (t) => {
+    const cwd = await repo(t)
+    const jobs = []
+    const co = new Coordinator({
+      checks: noopChecks,
+      requireApproval: true,
+      agents: { docs: { instructions: 'Docs only.', provider: 'acme', model: 'fast-1' } },
+      launch: async (job) => {
+        jobs.push(job)
+        return {
+          dispose: async () => {},
+          result: (async () => {
+            await commit(job)
+            return { ok: true }
+          })(),
+        }
+      },
+    })
+    const q = { cwd, parentId: 'captain', runId: 'deleted-preset' }
+    try {
+      await co.start({ ...q, manifest: { spec_id: 'deleted', tickets: [{ ...ticket('A'), agent: 'docs' }] } })
+      co.updateSettings({ checks: noopChecks, maxWorkers: 16, checkTimeoutMs: 20000, agents: {} })
+      const [file] = co.runs.keys()
+      await assert.rejects(co.approve(file, [{ id: 'A', agent: 'ghost' }]), /unknown agent preset/)
+      const approved = await co.approve(file, [{ id: 'A', agent: 'docs', provider: 'acme', model: 'fast-1' }])
+      assert.equal(approved.mode, 'active')
+      await until(async () => (await co.status(q)).complete, 'approved run integrates', 30000)
+      assert.match(jobs[0].prompt, /Role \(docs\): Docs only\./)
+      assert.deepEqual(jobs[0].agentOptions, { provider: 'acme', model: 'fast-1' })
+    } finally {
+      await co.close()
     }
   },
 )

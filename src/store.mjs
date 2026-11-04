@@ -362,7 +362,13 @@ export class RunStore {
     })
   }
 
-  hold(message) {
+  /**
+   * Stop dispatch and record a diagnostic.
+   * @param message - the diagnostic shown to the captain and the board.
+   * @param options.staged - return the run to staged: the user never approved it.
+   * @returns true when the run was held.
+   */
+  hold(message, { staged = false } = {}) {
     text(message, 'diagnostic')
     return this.#transaction(() => {
       const run = this.meta()
@@ -370,8 +376,10 @@ export class RunStore {
         return false
       // A staged run keeps waiting for approval; it only records the diagnostic.
       this.#db
-        .prepare("UPDATE run SET mode=CASE WHEN mode='staged' THEN 'staged' ELSE 'paused' END,diagnostic=? WHERE singleton=1")
-        .run(message)
+        .prepare(
+          "UPDATE run SET mode=CASE WHEN mode='staged' OR ? THEN 'staged' ELSE 'paused' END,diagnostic=? WHERE singleton=1",
+        )
+        .run(staged ? 1 : 0, message)
       this.#event('run_blocked', null, message, { previousMode: run.mode }, true)
       return true
     })
@@ -406,6 +414,21 @@ export class RunStore {
       this.#event('run_approved', null, 'Plan approved by the user; dispatch started', {}, true)
       return true
     })
+  }
+
+  /**
+   * The raw ledger fields that decide what may run and how it is accepted:
+   * the run row (including mode), every ticket definition and the dependency
+   * edges. The coordinator pins a digest of them against outside edits.
+   */
+  integrity() {
+    return {
+      run: this.#db
+        .prepare('SELECT runId,repo,ref,baseSha,manifest,parentId,policyHash,mode FROM run WHERE singleton=1')
+        .get(),
+      tickets: this.#db.prepare('SELECT id,position,definition FROM tickets ORDER BY position').all(),
+      dependencies: this.#db.prepare('SELECT ticketId,upstream FROM dependencies ORDER BY ticketId,upstream').all(),
+    }
   }
 
   get(id) {

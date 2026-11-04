@@ -137,6 +137,100 @@ test('dashboard URL accepts only one opaque key and only supplies a GET route', 
   assert.deepEqual(parents, [null, null, 'session_01:abc-9'])
 })
 
+const approvalHeaders = { 'content-type': 'application/json', 'x-dsh-ticket-dag': '1' }
+const llm = {
+  listProviders: () => [{ id: 'acme', name: 'Acme' }],
+  async listModels(provider) {
+    return [
+      { provider, id: 'fast-1', name: 'Fast 1' },
+      { provider, id: 'deep-2', name: 'Deep 2' },
+    ]
+  },
+  async resolveModelInfo(provider, model) {
+    return model === 'deep-2' ? { reasoning: { efforts: [{ id: 'high' }], defaultEffort: 'high' } } : {}
+  },
+}
+
+function approvalRoute(getLlm = () => llm) {
+  let route
+  const calls = []
+  const key = 'b'.repeat(64)
+  const coordinator = {
+    runs: new Map([['/runs/a/state.sqlite', {}]]),
+    async approve(file, choices) {
+      calls.push(['approve', choices])
+      return { mode: 'active' }
+    },
+    async discard() {
+      calls.push(['discard'])
+      return { mode: 'cancelled' }
+    },
+  }
+  const catalog = { entries: () => [{ key, file: '/runs/a/state.sqlite' }] }
+  mountApproval({ connection: { fetch: { register: (r) => (route = r) } } }, catalog, coordinator, getLlm)
+  const post = (body, headers = approvalHeaders, url = 'http://localhost') =>
+    route.fetch(new Request(url + route.path, { method: 'POST', headers, body: JSON.stringify({ key, ...body }) }))
+  return { post, calls }
+}
+
+test('approval POST requires a JSON body, the plugin header and a same-origin caller', async () => {
+  const { post, calls } = approvalRoute()
+  const discard = { action: 'discard' }
+  assert.equal((await post(discard, { 'x-dsh-ticket-dag': '1' })).status, 415, 'no content type')
+  assert.equal((await post(discard, { 'content-type': 'text/plain', 'x-dsh-ticket-dag': '1' })).status, 415)
+  assert.equal((await post(discard, { 'content-type': 'application/json' })).status, 403, 'no plugin header')
+  assert.equal((await post(discard, { ...approvalHeaders, 'x-dsh-ticket-dag': '0' })).status, 403)
+  assert.equal((await post(discard, { ...approvalHeaders, origin: 'https://evil.example' })).status, 403)
+  assert.equal((await post(discard, { ...approvalHeaders, origin: 'null' })).status, 403)
+  assert.deepEqual(calls, [], 'a refused request never reaches the coordinator')
+  const json = { 'content-type': 'application/json; charset=utf-8', 'x-dsh-ticket-dag': '1' }
+  assert.equal((await post(discard, json)).status, 200)
+  assert.equal((await post(discard, { ...approvalHeaders, origin: 'http://127.0.0.1:4000' }, 'http://127.0.0.1:4000')).status, 200)
+  assert.equal(calls.length, 2)
+})
+
+test('approval checks each chosen model and reasoning effort against the model catalog', async () => {
+  const { post, calls } = approvalRoute()
+  const approve = (choice) => post({ action: 'approve', choices: [{ id: 'A', agent: 'docs', ...choice }] })
+  for (const [choice, pattern] of [
+    [{ provider: 'acme', model: 'missing-9' }, /missing-9/],
+    [{ provider: 'other', model: 'fast-1' }, /other/],
+    [{ provider: 'acme', model: 'fast-1', reasoningEffort: 'high' }, /high/],
+    [{ provider: 'acme', model: 'deep-2', reasoningEffort: 'max' }, /max/],
+    [{ provider: 'acme', model: 'x'.repeat(201) }, /200/],
+    [{ provider: 'acme', model: 7 }, /model/],
+  ]) {
+    const response = await approve(choice)
+    assert.equal(response.status, 400, JSON.stringify(choice))
+    assert.match(await response.text(), pattern)
+  }
+  assert.equal((await post({ action: 'approve', choices: [null] })).status, 400)
+  assert.deepEqual(calls, [])
+  for (const choice of [
+    { provider: 'acme', model: 'deep-2', reasoningEffort: 'high' },
+    { provider: 'acme', model: 'fast-1', reasoningEffort: '' },
+    { provider: '', model: 'fast-1' },
+    { provider: '', model: '', reasoningEffort: '' },
+  ]) {
+    assert.equal((await approve(choice)).status, 200, JSON.stringify(choice))
+  }
+  assert.equal(calls.length, 4)
+})
+
+test('without a model catalog approval refuses a chosen model but accepts the host default', async () => {
+  for (const getLlm of [
+    () => undefined,
+    () => ({ ...llm, listModels: async () => Promise.reject(Error('offline')) }),
+  ]) {
+    const { post, calls } = approvalRoute(getLlm)
+    const refused = await post({ action: 'approve', choices: [{ id: 'A', provider: 'acme', model: 'fast-1' }] })
+    assert.equal(refused.status, 503)
+    assert.match(await refused.text(), /模型目录/)
+    assert.equal((await post({ action: 'approve', choices: [{ id: 'A', model: '' }] })).status, 200)
+    assert.equal(calls.length, 1)
+  }
+})
+
 test('approval route approves or discards only an attached staged run named by its opaque key', async () => {
   let route
   const calls = []
@@ -153,11 +247,13 @@ test('approval route approves or discards only an attached staged run named by i
       return { mode: 'cancelled' }
     },
   }
-  mountApproval({ connection: { fetch: { register: (r) => (route = r) } } }, catalog, coordinator)
+  mountApproval({ connection: { fetch: { register: (r) => (route = r) } } }, catalog, coordinator, () => llm)
   assert.equal(route.path, '/api/ticket-dag.approve')
   assert.deepEqual(route.methods, ['POST'])
   const post = (body) =>
-    route.fetch(new Request('http://localhost' + route.path, { method: 'POST', body: JSON.stringify(body) }))
+    route.fetch(
+      new Request('http://localhost' + route.path, { method: 'POST', headers: approvalHeaders, body: JSON.stringify(body) }),
+    )
   const choices = [{ id: 'A', agent: 'docs', provider: 'acme', model: 'fast-1', reasoningEffort: '' }]
   const ok = await post({ key, action: 'approve', choices })
   assert.equal(ok.status, 200)
@@ -171,7 +267,8 @@ test('approval route approves or discards only an attached staged run named by i
   assert.equal((await post({ key: '../x', action: 'approve', choices })).status, 400)
   assert.equal((await post({ key, action: 'launch' })).status, 400)
   assert.equal(
-    (await route.fetch(new Request('http://localhost' + route.path, { method: 'POST', body: '{' }))).status,
+    (await route.fetch(new Request('http://localhost' + route.path, { method: 'POST', headers: approvalHeaders, body: '{' })))
+      .status,
     400,
   )
   coordinator.runs.clear()

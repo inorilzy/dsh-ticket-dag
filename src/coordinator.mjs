@@ -47,6 +47,24 @@ function copyChecks(manifest, registry) {
   }
   return Object.freeze(copy)
 }
+// Digest of the ledger fields that decide dispatch and acceptance. plan covers
+// the run row and submitted manifest; approval covers the per-ticket
+// definitions (approved presets, verify IDs) and dependency edges.
+function ledgerDigest(db) {
+  const { run, tickets, dependencies } = db.integrity()
+  return {
+    mode: run.mode,
+    plan: hash(
+      JSON.stringify([run.runId, run.repo, run.ref, run.baseSha, run.parentId, run.policyHash, run.manifest]),
+    ),
+    approval: hash(
+      JSON.stringify([
+        tickets.map((t) => [t.id, t.position, t.definition]),
+        dependencies.map((d) => [d.ticketId, d.upstream]),
+      ]),
+    ),
+  }
+}
 function eventText(meta, event) {
   return '[dsh-ticket-dag ' + meta.runId + '] ' + event.message + '\nevent_id=' + event.eventId
 }
@@ -315,6 +333,10 @@ export class Coordinator {
         safeChildren: new Set(),
         haltError: '',
         capacityUntil: 0,
+        // What this process last wrote or loaded. A run loaded from disk takes
+        // the ledger as found: an edit made while no coordinator was running
+        // cannot be detected, and a non-staged run counts as approved.
+        trust: { ...ledgerDigest(db), approved: meta.mode !== 'staged' },
       }
       for (const row of db.tickets()) {
         if (row.status === 'RUNNING')
@@ -444,8 +466,33 @@ export class Coordinator {
   }
   _hold(run, err) {
     run.haltError = message(err)
-    run.db.hold(run.haltError)
+    // A run the user never approved goes back to waiting for approval.
+    run.db.hold(run.haltError, { staged: !run.trust.approved })
+    run.trust.mode = run.db.meta()?.mode
     this._drainOutbox(run)
+  }
+  _setMode(run, mode) {
+    run.db.setMode(mode)
+    run.trust.mode = run.db.meta().mode
+  }
+  // The SQLite ledger is writable by any local shell. Compare it with what this
+  // process wrote or loaded before granting work or accepting a submission.
+  _checkLedger(run) {
+    const now = ledgerDigest(run.db),
+      trust = run.trust
+    const changed = ['mode', 'plan', 'approval'].filter((k) => now[k] !== trust[k])
+    if (now.mode === 'active' && !trust.approved && !changed.includes('mode')) changed.push('mode')
+    if (!changed.length) return
+    const err = new Error(
+      'The run ledger was modified outside the coordinator (' +
+        changed.join(', ') +
+        '). Dispatch and integration are held; restore ' +
+        run.file +
+        ' or start a new run.',
+    )
+    err.ledger = true
+    this._hold(run, err)
+    throw err
   }
   async _reconcile(run, publish = true) {
     const m = run.db.meta()
@@ -539,7 +586,7 @@ export class Coordinator {
   }
   async pause(q) {
     const run = await this._open(q)
-    await serial(run, () => run.db.setMode('paused'))
+    await serial(run, () => this._setMode(run, 'paused'))
     return this._snapshot(run)
   }
   async resume(q) {
@@ -547,12 +594,13 @@ export class Coordinator {
     await serial(run, async () => {
       requireValue(run.db.meta().mode !== 'cancelled', 'A cancelled run is final')
       requireValue(
-        run.db.meta().mode !== 'staged',
+        run.db.meta().mode !== 'staged' && run.trust.approved,
         'This run is waiting for the user to approve it in the 工单进度 board. It cannot be resumed from the conversation.',
       )
+      this._checkLedger(run)
       this._checkPolicy(run)
       run.haltError = ''
-      run.db.setMode('active')
+      this._setMode(run, 'active')
       try {
         await this._reconcile(run)
         await this._trustedTip(run)
@@ -617,7 +665,7 @@ export class Coordinator {
   async cancel(q) {
     const run = await this._open(q)
     await serial(run, async () => {
-      run.db.setMode('cancelled')
+      this._setMode(run, 'cancelled')
       await this._reconcile(run, false)
     })
     const jobs = [...run.work.values()]
@@ -635,7 +683,8 @@ export class Coordinator {
    * The user's approval of a staged run, from the board. Each choice names a
    * ticket and its preset (empty for none) plus provider/model/reasoningEffort;
    * tickets without a choice keep their planned preset. Presets resolve from
-   * the current settings and the result is frozen into the run.
+   * the current settings, except a planned preset since removed from them,
+   * which keeps the copy frozen at dag_run; the result is frozen into the run.
    * @param file - the run ledger the board selected.
    * @param choices - per-ticket selections.
    * @returns the run snapshot after approval.
@@ -647,12 +696,19 @@ export class Coordinator {
       const m = run.db.meta()
       requireValue(m.mode === 'staged', 'This run is not waiting for approval')
       requireValue(Array.isArray(choices), 'choices must be an array')
+      this._checkLedger(run)
       const byId = new Map(choices.map((c) => [c?.id, c]))
       const tickets = m.manifest.tickets.map((t) => {
         const c = byId.get(t.id)
         if (!c) return t
-        const { agent, agentSpec: _old, ...rest } = t
-        const preset = c.agent ? agentSpec(this.agents, String(c.agent)) : {}
+        const { agent, agentSpec: frozen, ...rest } = t
+        // The planned preset may have left the settings since dag_run; its
+        // frozen copy still describes the role.
+        const preset = !c.agent
+          ? {}
+          : String(c.agent) === agent && !Object.hasOwn(this.agents, agent)
+            ? (frozen ?? {})
+            : agentSpec(this.agents, String(c.agent))
         const spec = preset.instructions ? { instructions: preset.instructions } : {}
         for (const field of ['provider', 'model', 'reasoningEffort']) {
           const value = String(c[field] ?? '').trim()
@@ -669,6 +725,9 @@ export class Coordinator {
         }
       })
       requireValue(run.db.approve(tickets), 'This run is not waiting for approval')
+      const after = ledgerDigest(run.db)
+      run.trust = { ...run.trust, mode: after.mode, approval: after.approval, approved: true }
+      run.haltError = ''
       this._drainOutbox(run)
     })
     this._wake(run)
@@ -685,7 +744,7 @@ export class Coordinator {
     requireValue(run, 'Open the captain conversation of this run first')
     await serial(run, () => {
       requireValue(run.db.meta().mode === 'staged', 'This run is not waiting for approval')
-      run.db.setMode('cancelled')
+      this._setMode(run, 'cancelled')
     })
     this._wake(run)
     return this._snapshot(run)
@@ -739,6 +798,7 @@ export class Coordinator {
   async _pump(run) {
     if (this.stopping) return
     this._drainOutbox(run)
+    this._checkLedger(run)
     const m = run.db.meta()
     if (m.mode !== 'active') return
     if (run.db.intents().length) await this._reconcile(run)
@@ -756,6 +816,8 @@ export class Coordinator {
       run.integration = job
       job.promise = this._integrate(run, submitted, tip, job)
         .catch((err) => {
+          // A held ledger leaves the submission as it was for inspection.
+          if (err.ledger) return
           run.db.move(submitted.id, submitted.lease, 'SUBMITTED', 'NEEDS_ATTENTION', {
             message: message(err),
           })
@@ -927,6 +989,7 @@ export class Coordinator {
   }
 
   async _integrate(run, row, tip, job) {
+    await serial(run, () => this._checkLedger(run))
     const m = run.db.meta()
     const candidatePath = join(
       run.root,
@@ -951,6 +1014,7 @@ export class Coordinator {
       if (this.stopping || run.db.meta().mode !== 'active') return
       const t = run.db.get(row.id)
       if (t.status !== 'SUBMITTED' || t.lease !== row.lease || t.sourceSha !== row.sourceSha) return
+      this._checkLedger(run)
       this._checkPolicy(run)
       await this._trustedTip(run)
       requireValue((await stampedSource(m, t)) === row.sourceSha, 'Worker branch moved after submission')

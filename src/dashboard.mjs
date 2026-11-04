@@ -253,15 +253,76 @@ export function mountModels(ctx, getLlm) {
 }
 
 const approvalLimit = 256 * 1024
+const fieldLimit = 200
+const refuse = (status, text) => new Response(text, { status, headers: noStore })
+
+// A cross-site form cannot set a custom header or a JSON type without a CORS
+// preflight, and a browser that names an Origin must name this host.
+function crossSite(request) {
+  const type = (request.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase()
+  if (type !== 'application/json') return refuse(415, 'Approval requires an application/json body')
+  if (request.headers.get('x-dsh-ticket-dag') !== '1') return refuse(403, 'Missing x-dsh-ticket-dag: 1 header')
+  const origin = request.headers.get('origin')
+  if (origin !== null) {
+    let host
+    try {
+      host = new URL(origin).host
+    } catch {
+      host = null
+    }
+    if (!host || host !== (request.headers.get('host') ?? new URL(request.url).host))
+      return refuse(403, 'Cross-origin approval refused')
+  }
+  return null
+}
+
+class ChoiceError extends Error {
+  constructor(text, status = 400) {
+    super(text)
+    this.status = status
+  }
+}
+
+// Each choice names known text fields; a chosen model must be listed in the
+// model catalog, and its reasoning effort among that model's efforts.
+async function checkChoices(choices, getLlm) {
+  let models
+  for (const c of choices) {
+    if (c === null || typeof c !== 'object' || Array.isArray(c)) throw new ChoiceError('Each choice must be an object')
+    for (const field of ['id', 'agent', 'provider', 'model', 'reasoningEffort']) {
+      const value = c[field] ?? ''
+      if (typeof value !== 'string') throw new ChoiceError(field + ' must be text')
+      if (value.length > fieldLimit) throw new ChoiceError(field + ' is longer than ' + fieldLimit + ' characters')
+    }
+    const provider = (c.provider ?? '').trim(),
+      model = (c.model ?? '').trim(),
+      effort = (c.reasoningEffort ?? '').trim()
+    if (!model) continue
+    models ??= await modelCatalog(getLlm?.())
+    const listed = models.providers.filter((p) => !provider || p.id === provider)
+    const found = listed.flatMap((p) => p.models).find((m) => m.id === model)
+    if (!found) {
+      if (!models.providers.length || (provider ? models.failures.includes(provider) : models.failures.length))
+        throw new ChoiceError('模型目录暂不可用，无法校验 ' + model + '。请改用宿主默认模型或稍后重试。', 503)
+      throw new ChoiceError(
+        provider && !listed.length ? 'Unknown provider: ' + provider : 'Unknown model: ' + [provider, model].filter(Boolean).join('/'),
+      )
+    }
+    if (effort && !found.efforts.some((e) => e.id === effort))
+      throw new ChoiceError('Model ' + model + ' does not support reasoning effort ' + effort)
+  }
+}
 
 // The user's decision on a staged plan. Like the dashboard read, the managed
 // dispatcher admits only the owner; the body names the run by its opaque key.
-export function mountApproval(ctx, catalog, coordinator) {
+export function mountApproval(ctx, catalog, coordinator, getLlm = () => undefined) {
   ctx.connection.fetch.register({
     path: '/api/ticket-dag.approve',
     methods: ['POST'],
     requestBody: 'buffered',
     async fetch(request) {
+      const refused = crossSite(request)
+      if (refused) return refused
       let body
       try {
         const raw = await request.text()
@@ -278,6 +339,14 @@ export function mountApproval(ctx, catalog, coordinator) {
         (action === 'approve' && !Array.isArray(choices))
       ) {
         return new Response('Invalid approval request', { status: 400, headers: noStore })
+      }
+      if (action === 'approve') {
+        try {
+          await checkChoices(choices, getLlm)
+        } catch (error) {
+          if (!(error instanceof ChoiceError)) throw error
+          return refuse(error.status, error.message)
+        }
       }
       const entry = catalog.entries().find((row) => row.key === key)
       if (!entry) return new Response('Unknown run', { status: 404, headers: noStore })
