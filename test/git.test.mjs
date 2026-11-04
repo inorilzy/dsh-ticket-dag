@@ -203,3 +203,77 @@ test('checks use exact argv, stop on nonzero exit, timeout and honor cancellatio
   setTimeout(() => interrupted.abort(), 30)
   await assert.rejects(late, /cancelled/)
 })
+
+test('Windows .cmd checks run through cmd.exe without shell injection', { skip: process.platform !== 'win32' }, async (t) => {
+  const { root, main } = await fixture(t)
+  const bin = join(root, 'bin dir')
+  await mkdir(bin)
+  const script = join(bin, 'check.cmd')
+  await writeFile(script, '@echo off\r\necho cmd-ok %1 %2\r\n')
+  const [result] = await runChecks(main, [[script, 'a b', 'C:\\trailing\\']])
+  assert.equal(result.stdout.trim(), 'cmd-ok "a b" "C:\\trailing\\\\"')
+
+  const previous = process.env.PATH
+  process.env.PATH = bin + ';' + previous
+  t.after(() => (process.env.PATH = previous))
+  const [bare] = await runChecks(main, [['check', 'x']])
+  assert.match(bare.stdout, /cmd-ok "x"/)
+
+  const marker = join(root, 'injected.txt')
+  for (const arg of ['a & echo x > "' + marker + '"', '%PATH%', 'a | b', 'a"b', '!x!', 'a^b', 'line\nbreak']) {
+    await assert.rejects(runChecks(main, [[script, arg]]), /cmd\.exe metacharacter/)
+  }
+  await assert.rejects(access(marker))
+})
+
+for (const mode of ['timeout', 'cancel']) {
+  test('check ' + mode + ' kills the whole process tree', async (t) => {
+    const { root, main } = await fixture(t)
+    const pidFile = join(root, 'grandchild.pid')
+    // On Windows libuv puts node children in a kill-on-close job; breaking away
+    // models grandchildren of non-node tools, which nothing kills implicitly.
+    const parent = [
+      "const { spawn } = require('node:child_process')",
+      "const c = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore', detached: process.platform === 'win32' })",
+      "require('node:fs').writeFileSync(process.argv[1], String(c.pid))",
+      'setInterval(()=>{},1000)',
+    ].join(';')
+    let grandchild
+    t.after(() => {
+      try {
+        if (grandchild) process.kill(grandchild, 'SIGKILL')
+      } catch {}
+    })
+    const alive = (pid) => {
+      try {
+        process.kill(pid, 0)
+        return true
+      } catch (err) {
+        return err.code === 'EPERM'
+      }
+    }
+    const interrupted = new AbortController()
+    const pending = runChecks(main, [[process.execPath, '-e', parent, pidFile]], {
+      timeoutMs: mode === 'timeout' ? 2000 : 60_000,
+      signal: interrupted.signal,
+    })
+    if (mode === 'cancel') {
+      const started = Date.now()
+      while (Date.now() - started < 10_000) {
+        try {
+          await access(pidFile)
+          break
+        } catch {
+          await new Promise((r) => setTimeout(r, 25))
+        }
+      }
+      interrupted.abort()
+    }
+    await assert.rejects(pending, mode === 'timeout' ? /timed out/ : /cancelled/)
+    grandchild = Number(await readFile(pidFile, 'utf8'))
+    assert.ok(Number.isSafeInteger(grandchild) && grandchild > 0)
+    const deadline = Date.now() + 3000
+    while (alive(grandchild) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50))
+    assert.equal(alive(grandchild), false, 'grandchild ' + grandchild + ' survived the ' + mode)
+  })
+}
