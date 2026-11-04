@@ -448,7 +448,10 @@ test('plan review: named members with their tasks and model, compact task list, 
   assert.equal(field('A 的负责人'), undefined, 'task rows stay collapsed')
 
   const node = find(review, (n) => n.props['data-dag-node'] === 'A')
-  assert.equal(text(node), 'A', 'map nodes show an avatar and the ID only')
+  assert.equal(text(node), 'A实现者定义接口', 'a map node shows its ID, owner and task')
+  assert.equal(node.props['data-tone'], 'neutral', 'a task that can start is plain')
+  assert.equal(find(review, (n) => n.props['data-dag-node'] === 'T').props['data-tone'], 'wait')
+  assert.match(text(find(review, (n) => n.props['data-dag-node'] === 'T')), /T测试员编写测试/)
   assert.equal(find(review, (n) => n.props['data-dag-detail'] !== undefined), undefined)
   assert.equal(find(pane, (n) => n.props['data-dag-ticket'] !== undefined), undefined, 'no progress list yet')
 
@@ -509,8 +512,12 @@ test('the captain avatar follows its vendor; each member has its own colour, als
   const colour = (match) => avatar(find(pane, match))['data-dag-color']
   const members = ['implementer', 'test-writer', 'docs'].map((id) => colour((n) => n.props['data-dag-member'] === id))
   assert.equal(new Set(members).size, 3)
-  assert.equal(colour((n) => n.props['data-dag-node'] === 'C'), members[0])
-  assert.equal(colour((n) => n.props['data-dag-node'] === 'D'), members[2])
+  const owner = (id) =>
+    find(find(pane, (n) => n.props['data-dag-node'] === id), (n) => n.props['data-dag-color'] !== undefined).props[
+      'data-dag-color'
+    ]
+  assert.equal(owner('C'), members[0], 'a map node names its owner in the member colour')
+  assert.equal(owner('D'), members[2])
 })
 
 test('vendor recognition covers the main model families and falls back to a generic figure', () => {

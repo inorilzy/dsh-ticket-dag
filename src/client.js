@@ -175,8 +175,10 @@ window.__ModuleLoader__.load({
 .dtd-task-title {font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dtd-chevron {opacity:.6;font-size:1.15rem;line-height:1;transition:transform .15s}.dtd-task-row[aria-expanded=true] .dtd-chevron {transform:rotate(90deg)}
 .dtd-task-edit {padding:.1rem .15rem .75rem 2.5rem}.dtd-task-edit select {width:100%}
-.dtd-panel .dtd-node.dtd-node-compact {display:flex;align-items:center;gap:.45rem;padding:.3rem .6rem;border-radius:.55rem}
-.dtd-canvas marker path {fill:var(--dtd-work);stroke:none}
+.dtd-panel .dtd-node.dtd-node-compact {padding:.55rem .7rem;border-radius:.6rem;gap:.3rem;background:color-mix(in srgb,currentColor 4%,var(--dsw-alias-bg-layer-1,Canvas))}
+.dtd-node-compact .dtd-node-head small {font-family:ui-monospace,monospace;font-size:.76rem}
+.dtd-node-compact .dtd-node-title {font-size:.9rem;opacity:.8}
+.dtd-panel .dtd-node.dtd-node-compact[data-tone=wait] {border-color:color-mix(in srgb,var(--dtd-wait) 75%,transparent)}
 .dtd-actionbar {position:sticky;bottom:0;z-index:2;display:grid;grid-template-columns:1fr 1fr auto;gap:.6rem;padding:.8rem 0 .2rem;background:var(--dsw-alias-bg-layer-1,Canvas);border-top:1px solid var(--dtd-line)}
 .dtd-panel .dtd-actionbar button {padding:.6rem .9rem;font-weight:600;border-radius:.55rem}
 .dtd-panel .dtd-actionbar .dtd-danger {border-color:transparent;color:var(--dtd-blocked)}
@@ -1052,7 +1054,8 @@ window.__ModuleLoader__.load({
     }
 
     const fullNode = { width: 172, height: 76, gapX: 44, gapY: 14 }
-    const compactNode = { width: 92, height: 40, gapX: 48, gapY: 14 }
+    // Three columns fit a ~480px sidebar; deeper plans scroll sideways.
+    const compactNode = { width: 136, height: 76, gapX: 26, gapY: 14 }
 
     function dagLayout(tickets, node = fullNode) {
       const depth = depthMap(tickets)
@@ -1103,8 +1106,9 @@ window.__ModuleLoader__.load({
       return new Set([...up, ...down])
     }
 
-    // compact (plan review): avatar + ID nodes, arrowed edges, no focus or detail card.
-    function DependencyMap({ rows, pinned, setPinned, open, captain, compact = false, avatarOf }) {
+    // compact (plan review): each node card names its ID, owner and task; no focus
+    // or detail card. ownerOf(ticket) returns the owner's { name, color }.
+    function DependencyMap({ rows, pinned, setPinned, open, captain, compact = false, ownerOf }) {
       if (!rows.length) return null
       const tickets = rows.map((r) => r.ticket)
       const node = compact ? compactNode : fullNode
@@ -1119,38 +1123,31 @@ window.__ModuleLoader__.load({
             h(
               'svg',
               { width: layout.width, height: layout.height, 'aria-hidden': true },
-              h(
-                'defs',
-                null,
-                h(
-                  'marker',
-                  { id: 'dtd-arrow', viewBox: '0 0 8 8', refX: 7, refY: 4, markerWidth: 7, markerHeight: 7, orient: 'auto' },
-                  h('path', { d: 'M0 0L8 4L0 8z', fill: 'var(--dtd-work)' }),
-                ),
-              ),
               ...layout.edges.map((e) =>
-                h('path', {
-                  key: e.from + '>' + e.to,
-                  'data-dag-edge': e.from + '>' + e.to,
-                  'data-active': true,
-                  d: e.d,
-                  markerEnd: 'url(#dtd-arrow)',
-                }),
+                h('path', { key: e.from + '>' + e.to, 'data-dag-edge': e.from + '>' + e.to, d: e.d }),
               ),
             ),
-            ...rows.map(({ ticket }) => {
+            ...rows.map(({ ticket, view }) => {
               const { x, y } = layout.at.get(ticket.id)
+              const owner = ownerOf(ticket)
               return h(
                 'div',
                 {
                   key: ticket.id,
                   className: 'dtd-node dtd-node-compact',
                   'data-dag-node': ticket.id,
-                  title: ticket.title || ticket.id,
+                  'data-tone': view.tone,
+                  title: [ticket.id, owner.name, ticket.title].filter(Boolean).join(' · '),
                   style: { left: x, top: y, width: node.width, height: node.height },
                 },
-                avatarOf(ticket),
-                h('strong', null, ticket.id),
+                h(
+                  'span',
+                  { className: 'dtd-node-head', 'data-tone': view.tone },
+                  h('span', { className: 'dtd-dot' }),
+                  ticket.id,
+                  h('small', { 'data-dag-color': owner.color, style: { color: owner.color } }, owner.name),
+                ),
+                ticket.title && ticket.title !== ticket.id && h('span', { className: 'dtd-node-title' }, ticket.title),
               )
             }),
           ),
@@ -1623,7 +1620,7 @@ window.__ModuleLoader__.load({
           h(DependencyMap, {
             rows,
             compact: true,
-            avatarOf: (t) => h(Avatar, { route: routeOf(currentOwners[t.id]), color: colorOf(currentOwners[t.id]), size: 22 }),
+            ownerOf: (t) => ({ name: nameOf(currentOwners[t.id]), color: colorOf(currentOwners[t.id]) }),
           }),
         ),
         error && h('p', { className: 'dtd-alert', role: 'alert' }, error),
