@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { mkdtemp, mkdir, writeFile, readFile, rm, access } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, readFile, rename, rm, access } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
@@ -119,6 +119,19 @@ test('first dispatch is idempotent; a resume may keep dirty files but never the 
   assert.equal((await prepareWorktree(repo, slot, branch, base, { resume: true })).head, committed)
   await mkdir(join(slot, 'nested'))
   await assert.rejects(inspectWorktree(repo, join(slot, 'nested'), branch, base, { resume: true }))
+})
+
+test('a checkout replaced by another clone after a passed identity check is still rejected', async (t) => {
+  const { root, main, repo, base } = await fixture(t)
+  // Pass (and remember) the identity check first.
+  assert.equal(await resolveRef(repo, 'HEAD'), base)
+  assert.equal(await resolveRef(repo, 'HEAD'), base)
+  await rename(main, join(root, 'original'))
+  await g(root, 'clone', '-q', '--separate-git-dir', join(root, 'elsewhere.git'), join(root, 'original'), main)
+  // Same checkout path and SHAs, but a different Git administration directory.
+  assert.equal(await g(main, 'rev-parse', 'HEAD'), base)
+  await assert.rejects(resolveRef(repo, 'HEAD'), /identity changed/)
+  await assert.rejects(resolveRef(repo, 'HEAD'), /identity changed/)
 })
 
 test('trial merges use exact parents, cannot publish a stale tip or checked-out integration, clean up only owned checkouts', async (t) => {

@@ -471,6 +471,15 @@ export class Coordinator {
     run.trust.mode = run.db.meta()?.mode
     this._drainOutbox(run)
   }
+  // Last resort for detached job promises: a failure while recording a failure
+  // holds the run instead of surfacing as an unhandled rejection.
+  _holdQuietly(run, err) {
+    try {
+      this._hold(run, err)
+    } catch {
+      run.haltError ||= message(err)
+    }
+  }
   _setMode(run, mode) {
     run.db.setMode(mode)
     run.trust.mode = run.db.meta().mode
@@ -595,7 +604,9 @@ export class Coordinator {
       requireValue(run.db.meta().mode !== 'cancelled', 'A cancelled run is final')
       requireValue(
         run.db.meta().mode !== 'staged' && run.trust.approved,
-        'This run is waiting for the user to approve it in the 工单进度 board. It cannot be resumed from the conversation.',
+        'This run is waiting for the user to approve it in the 「工单 · ' +
+          run.db.meta().runId +
+          '」 tab of the conversation right sidebar. It cannot be resumed from the conversation.',
       )
       this._checkLedger(run)
       this._checkPolicy(run)
@@ -826,6 +837,7 @@ export class Coordinator {
           run.integration = null
           this._wake(run)
         })
+        .catch((err) => this._holdQuietly(run, err))
     }
     for (const old of ready) {
       if (this.stopping || this.activeCount >= this.maxWorkers || run.work.size >= run.limit) break
@@ -867,6 +879,7 @@ export class Coordinator {
           run.work.delete(row.id)
           for (const other of this.runs.values()) this._wake(other)
         })
+        .catch((err) => this._holdQuietly(run, err))
     }
   }
 
@@ -1058,22 +1071,39 @@ export class Coordinator {
     const runs = [...this.runs.values()]
     // Stop admission first; wait for pumps to finish acquiring any work they already own.
     await Promise.allSettled(runs.map((r) => r.pump))
+    const errors = []
     for (const r of runs) {
-      clearTimeout(r.timer)
-      r.integration?.ctrl.abort()
-      for (const j of r.work.values()) {
-        j.ctrl.abort()
-        if (j.handle) j.handle.dispose().catch(() => {})
+      try {
+        clearTimeout(r.timer)
+        r.integration?.ctrl.abort()
+        for (const j of r.work.values()) {
+          j.ctrl.abort()
+          if (j.handle) Promise.resolve().then(() => j.handle.dispose()).catch(() => {})
+        }
+      } catch (err) {
+        errors.push(err)
       }
     }
+    // Each run releases its ledger and ownership lock even if another run fails to.
     for (const r of runs) {
-      await Promise.allSettled(
-        [...r.work.values()].map((j) => j.promise).concat([r.integration?.promise, r.notifier]),
-      )
-      await r.serial
-      r.db.close()
-      r.owner.close()
+      try {
+        await Promise.allSettled(
+          [...r.work.values()].map((j) => j.promise).concat([r.integration?.promise, r.notifier]),
+        )
+        await r.serial
+      } catch (err) {
+        errors.push(err)
+      } finally {
+        for (const release of [() => r.db.close(), () => r.owner.close()]) {
+          try {
+            release()
+          } catch (err) {
+            errors.push(err)
+          }
+        }
+      }
     }
     this.runs.clear()
+    if (errors.length) throw new AggregateError(errors, 'Some runs did not close cleanly')
   }
 }
