@@ -159,11 +159,12 @@ window.__ModuleLoader__.load({
 .dtd-wizard [data-state=current] {opacity:1;color:var(--dtd-work);font-weight:600}
 .dtd-wizard [data-state=current] span {background:var(--dtd-work);color:#fff}
 .dtd-wizard [data-state=done] {opacity:1}.dtd-wizard [data-state=done] span {background:var(--dtd-done);color:#fff}
-.dtd-member-head,.dtd-member {display:grid;grid-template-columns:1.1rem 2.2rem minmax(0,1fr) minmax(6.5rem,9.5rem) minmax(4.6rem,6rem);align-items:center;gap:.65rem}
-.dtd-member-head h4 {grid-column:2 / 4}
-.dtd-member {padding:.55rem 0;border-top:1px solid var(--dtd-line)}
-.dtd-member .dtd-route {display:contents}
-.dtd-member select {width:100%}
+.dtd-member-head,.dtd-member {display:grid;grid-template-columns:1.1rem 2rem minmax(0,1fr) 7.5rem 6rem;align-items:center;gap:.5rem}
+.dtd-member-head h4 {grid-column:2 / 4}.dtd-member-head h4 small {font-weight:400;font-size:.8rem}
+.dtd-member {padding:.4rem 0;border-top:1px solid var(--dtd-line)}
+.dtd-member .dtd-route,.dtd-member-head .dtd-route {display:contents}
+.dtd-panel .dtd-member select,.dtd-panel .dtd-member-head select {width:100%;padding:.25rem .35rem;font-size:.84rem}
+.dtd-member-head select {border-color:color-mix(in srgb,var(--dtd-work) 60%,transparent)}
 .dtd-member-name {display:grid;min-width:0}.dtd-member-name small {opacity:.7;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dtd-panel .dtd-member input[type=checkbox],.dtd-panel .dtd-member-head input[type=checkbox] {width:1.05rem;height:1.05rem;margin:0;accent-color:var(--dtd-work)}
 .dtd-member-foot {display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;padding-top:.3rem}.dtd-member-foot button {margin-inline-start:auto}
@@ -440,13 +441,13 @@ window.__ModuleLoader__.load({
     }
 
     function AgentRule({ agent, index, catalog, open, toggle, modify, remove }) {
-      const name = agent.name || agent.id || '预设 ' + (index + 1)
+      const name = agent.name || builtinAgents[agent.id]?.name || agent.id || '预设 ' + (index + 1)
       const [route, limit] = presetSummary(agent, catalog)
       const head = h(
         'div',
         { className: 'dtd-preset-row' },
         h('strong', null, name),
-        agent.name && agent.id && h('code', { className: 'dtd-hint' }, agent.id),
+        agent.id && name !== agent.id && h('code', { className: 'dtd-hint' }, agent.id),
         agent.description && h('span', { className: 'dtd-hint' }, agent.description),
         h('span', { className: 'dtd-preset-meta' }, route),
         h('span', { className: 'dtd-preset-meta' }, limit),
@@ -1363,6 +1364,52 @@ window.__ModuleLoader__.load({
       reasoningEffort: r?.reasoningEffort ?? '',
     })
 
+    // Header picker for checked members. It starts on a "修改模型" placeholder, so
+    // nothing changes until a model is picked; effort follows the picked model.
+    function BulkPicker({ bulk, catalog, disabled, onModel, onEffort }) {
+      const providers = catalog?.providers ?? []
+      const known = bulk && providers.find((p) => p.id === bulk.provider)?.models.find((m) => m.id === bulk.model)
+      const efforts = known?.efforts ?? []
+      return h(
+        'div',
+        { className: 'dtd-route' },
+        h(
+          'select',
+          {
+            'aria-label': '批量修改模型',
+            value: bulk ? routeKey(bulk.provider, bulk.model) : '__pick',
+            disabled,
+            onChange: (e) => {
+              if (e.target.value === '__pick') return
+              const [provider, model] = e.target.value ? JSON.parse(e.target.value) : ['', '']
+              onModel(provider, model)
+            },
+          },
+          h('option', { value: '__pick', disabled: true }, '修改模型'),
+          h('option', { value: '' }, '宿主默认'),
+          ...providers.map((p) =>
+            h(
+              'optgroup',
+              { key: p.id, label: p.name },
+              ...p.models.map((m) => h('option', { key: m.id, value: routeKey(p.id, m.id) }, m.name)),
+            ),
+          ),
+        ),
+        h(
+          'select',
+          {
+            'aria-label': '批量修改推理强度',
+            value: bulk?.effortSet ? bulk.reasoningEffort : '__pick',
+            disabled: disabled || !efforts.length,
+            onChange: (e) => e.target.value !== '__pick' && onEffort(e.target.value),
+          },
+          h('option', { value: '__pick', disabled: true }, '推理强度'),
+          h('option', { value: '' }, '模型默认'),
+          ...efforts.map((x) => h('option', { key: x.id, value: x.id }, x.name)),
+        ),
+      )
+    }
+
     // Focus the conversation composer so the user can tell the captain what to change.
     function backToChat() {
       if (typeof document === 'undefined') return
@@ -1381,9 +1428,11 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState(false)
       const [error, setError] = useState('')
       const [confirmDiscard, setConfirmDiscard] = useState(false)
-      // Members whose model changes together, and the task row being edited.
+      // Members the header picker changes, the task row being edited, and the
+      // header picker's last choice (null until a model is picked).
       const [checked, setChecked] = useState(() => new Set())
       const [expanded, setExpanded] = useState(null)
+      const [bulk, setBulk] = useState(null)
       useEffect(() => {
         const ctrl = new AbortController()
         fetch('api/ticket-dag.models', { signal: ctrl.signal, cache: 'no-store' })
@@ -1413,7 +1462,8 @@ window.__ModuleLoader__.load({
       const memberIds = [...presets.map((p) => p.id), ...allIds.filter((id) => id && !presetOf(id)), ''].filter(
         (id) => owned(id).length,
       )
-      const nameOf = (id) => (id ? presetOf(id)?.name || id : '默认成员')
+      // Presets saved before display names existed fall back to the built-in name.
+      const nameOf = (id) => (id ? presetOf(id)?.name || builtinAgents[id]?.name || id : '默认成员')
       const colorOf = (id) => memberColors[Math.max(0, allIds.indexOf(id)) % memberColors.length]
       const edges = run.tickets.reduce((n, t) => n + t.dependsOn.length, 0)
       const byId = new Map(run.tickets.map((t) => [t.id, t]))
@@ -1426,16 +1476,34 @@ window.__ModuleLoader__.load({
           if (!next.delete(id)) next.add(id)
           return next
         })
-      // Editing a checked member edits every checked member.
+      // A member row changes only that member.
       const changeRoute = (id, fn) =>
         setRoutes((old) => {
           const next = structuredClone(old ?? plannedRoutes)
-          for (const member of checked.has(id) ? [...checked] : [id]) {
+          next[id] = { ...(next[id] ?? routeFields(presetOf(id))) }
+          fn(next[id])
+          return next
+        })
+      // The header picker writes to every checked member.
+      const changeChecked = (fn) =>
+        setRoutes((old) => {
+          const next = structuredClone(old ?? plannedRoutes)
+          for (const member of checked) {
             next[member] = { ...(next[member] ?? routeFields(presetOf(member))) }
             fn(next[member])
           }
           return next
         })
+      const bulkModel = (provider, model) => {
+        setBulk({ provider, model, reasoningEffort: '', effortSet: false })
+        changeChecked((r) => Object.assign(r, { provider, model, reasoningEffort: '' }))
+      }
+      const bulkEffort = (reasoningEffort) => {
+        setBulk((old) => ({ ...old, reasoningEffort, effortSet: true }))
+        changeChecked((r) => {
+          r.reasoningEffort = reasoningEffort
+        })
+      }
       async function send(body) {
         setBusy(true)
         setError('')
@@ -1507,9 +1575,15 @@ window.__ModuleLoader__.load({
               disabled: busy,
               onChange: (e) => setChecked(e.target.checked ? new Set(memberIds) : new Set()),
             }),
-            h('h4', null, '成员与模型'),
-            h('span', { className: 'dtd-hint' }, '模型'),
-            h('span', { className: 'dtd-hint' }, '推理强度'),
+            h(
+              'h4',
+              null,
+              '成员与模型',
+              checked.size > 0 && h('small', { className: 'dtd-hint' }, ' 已选 ' + checked.size),
+            ),
+            checked.size > 0
+              ? h(BulkPicker, { bulk, catalog: models, disabled: busy, onModel: bulkModel, onEffort: bulkEffort })
+              : [h('span', { key: 'm', className: 'dtd-hint' }, '模型'), h('span', { key: 'e', className: 'dtd-hint' }, '推理强度')],
           ),
           ...memberIds.map((id) =>
             h(
@@ -1539,12 +1613,10 @@ window.__ModuleLoader__.load({
               }),
             ),
           ),
-          (checked.size > 1 || changed) &&
+          changed &&
             h(
               'div',
               { className: 'dtd-member-foot' },
-              checked.size > 1 &&
-                h('small', { className: 'dtd-hint' }, '已勾选 ' + checked.size + ' 名成员：改其中任一成员的模型，会同步到所有勾选成员。'),
               changed &&
                 button(
                   '恢复计划原值',

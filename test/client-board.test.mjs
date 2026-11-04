@@ -440,6 +440,7 @@ test('plan review: named members with their tasks and model, compact task list, 
   assert.equal(field('实现者 的模型').props.value, JSON.stringify(['acme', 'deep-2']))
   assert.equal(field('实现者 的推理强度').props.value, 'high')
   assert.equal(field('文档员 的模型').props.value, '')
+  assert.equal(field('批量修改模型'), undefined, 'the bulk picker appears only once members are checked')
 
   const tasks = findAll(review, (n) => n.props['data-dag-task'] !== undefined)
   assert.deepEqual(tasks.map((t) => t.props['data-dag-task']), ['A', 'C', 'T', 'B', 'D'])
@@ -503,6 +504,18 @@ function stagedRun(tickets) {
   }
 }
 
+test('built-in presets saved without a display name still show their Chinese name', () => {
+  const selected = reviewRun()
+  selected.presets = selected.presets.map((p) => ({ ...p, name: '' }))
+  const pane = loadHost([{ runs: [selected], selected }, selected.key]).renderSlot('sidebar.right.pane.tab', {
+    sessionId: 'session-captain',
+  })
+  const names = findAll(pane, (n) => n.props['data-dag-member'] !== undefined).map((m) => text(m))
+  assert.match(names[0], /实现者/)
+  assert.match(names[1], /测试员/)
+  assert.match(names[2], /文档员/)
+})
+
 test('the captain avatar follows its vendor; each member has its own colour, also on its map nodes', () => {
   const selected = reviewRun()
   const host = loadHost([{ runs: [selected], selected }, selected.key])
@@ -561,7 +574,7 @@ test('the progress board also shows the captain, and avatars on ticket rows and 
   assert.equal(avatar(find(pane, (n) => n.props['data-dag-node'] === 'A')), 'grok')
 })
 
-test('checked members change model together; a task row expands to change its owner', () => {
+test('checked members get a header bulk model picker; a member row changes only itself; tasks expand to change owner', () => {
   const selected = reviewRun()
   // Dashboard: data, selectedKey, error, lastRead. PlanReview: owners, routes,
   // catalog, busy, error, confirmDiscard, checked members, expanded task.
@@ -569,19 +582,34 @@ test('checked members change model together; a task row expands to change its ow
   const host = loadHost([...seeds, new Set(['implementer', 'docs']), 'T'])
   const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
   const field = (label) => find(pane, (n) => n.props['aria-label'] === label)
+  // The update runs inside the vm realm; compare plain data.
+  const nextRoutes = () => JSON.parse(JSON.stringify(host.sets.find((v) => typeof v === 'function')(null)))
   assert.equal(field('全选成员').props.type, 'checkbox')
   assert.equal(field('全选成员').props.checked, false)
   assert.equal(field('选择 实现者').props.checked, true)
   assert.equal(field('选择 测试员').props.checked, false)
 
+  const impl = { provider: 'acme', model: 'deep-2', reasoningEffort: 'high' }
+  const writer = { provider: 'acme', model: 'fast-1', reasoningEffort: '' }
   host.sets.length = 0
   field('文档员 的模型').props.onChange({ target: { value: JSON.stringify(['acme', 'deep-2']) } })
-  // The update runs inside the vm realm; compare plain data.
-  const routes = JSON.parse(JSON.stringify(host.sets.find((v) => typeof v === 'function')(null)))
-  const deep = { provider: 'acme', model: 'deep-2', reasoningEffort: '' }
-  assert.deepEqual(routes.docs, deep)
-  assert.deepEqual(routes.implementer, deep, 'a checked member follows')
-  assert.deepEqual(routes['test-writer'], { provider: 'acme', model: 'fast-1', reasoningEffort: '' })
+  let routes = nextRoutes()
+  assert.deepEqual(routes.docs, { provider: 'acme', model: 'deep-2', reasoningEffort: '' })
+  assert.deepEqual(routes.implementer, impl, 'a member row never changes another member')
+
+  const bulk = field('批量修改模型')
+  assert.equal(bulk.props.value, '__pick')
+  assert.match(text(bulk), /修改模型/)
+  assert.equal(field('批量修改推理强度').props.disabled, true, 'effort waits for a bulk model')
+  host.sets.length = 0
+  bulk.props.onChange({ target: { value: JSON.stringify(['acme', 'fast-1']) } })
+  routes = nextRoutes()
+  assert.deepEqual(routes.implementer, writer)
+  assert.deepEqual(routes.docs, writer)
+  assert.deepEqual(routes['test-writer'], writer, 'unchecked members keep their own model')
+  host.sets.length = 0
+  bulk.props.onChange({ target: { value: '__pick' } })
+  assert.equal(host.sets.length, 0, 'the placeholder is not a choice')
 
   const owner = field('T 的负责人')
   assert.equal(owner.props.value, 'test-writer')
