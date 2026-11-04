@@ -185,6 +185,8 @@ window.__ModuleLoader__.load({
 .dtd-panel .dtd-actionbar .dtd-danger {border-color:transparent;color:var(--dtd-blocked)}
 .dtd-preset-row .dtd-actions {margin-inline-start:auto}
 .dtd-preset-meta {font-size:.83rem;background:color-mix(in srgb,currentColor 7%,transparent);border-radius:.35rem;padding:.1rem .45rem}
+.dtd-owner {font-size:.84rem;font-weight:600;white-space:nowrap}
+.dtd-ticket-head .dtd-task-title {min-width:0}
 `
 
     function draftFor(value) {
@@ -828,7 +830,11 @@ window.__ModuleLoader__.load({
     // A ticket row knows its model as "provider/model"; the vendor match reads the whole string.
     const ticketRoute = (ticket, captain) => (ticket.model ? { model: ticket.model } : captain)
 
-    function Ticket({ ticket, view, open, captain }) {
+    // A member's name in its own colour; ID-free like the plan review.
+    const memberTag = (member) =>
+      h('span', { className: 'dtd-owner', 'data-dag-color': member.color, style: { color: member.color } }, member.name)
+
+    function Ticket({ ticket, view, open, captain, member }) {
       const { id, title, status, dependsOn, attempt, retryAt, message } = ticket
       const info = [
         ['子会话', ticket.childId],
@@ -846,8 +852,9 @@ window.__ModuleLoader__.load({
           { className: 'dtd-ticket-head', 'data-tone': view.tone },
           h('span', { className: 'dtd-dot' }),
           h(Avatar, { route: ticketRoute(ticket, captain), size: 22 }),
-          h('strong', null, id),
-          title && title !== id && h('span', null, title),
+          h('span', { className: 'dtd-chip' }, id),
+          title && title !== id && h('span', { className: 'dtd-task-title' }, title),
+          memberTag(member),
           h('span', { className: 'dtd-badge ' + view.tone }, view.label),
           chatButton(ticket, open),
         ),
@@ -855,11 +862,7 @@ window.__ModuleLoader__.load({
         h(
           'p',
           { className: 'dtd-hint' },
-          '上游：' +
-            (dependsOn.length ? dependsOn.join('、') : '无') +
-            '　执行尝试：' +
-            (attempt ?? 0) +
-            (ticket.agent ? '　Agent：' + ticket.agent : ''),
+          '上游：' + (dependsOn.length ? dependsOn.join('、') : '无') + '　执行尝试：' + (attempt ?? 0),
         ),
         status === 'PENDING' &&
           view.missing.length > 0 &&
@@ -894,6 +897,10 @@ window.__ModuleLoader__.load({
       const [listOpen, setListOpen] = useState(true)
       const [mapOpen, setMapOpen] = useState(true)
       const [pinned, setPinned] = useState(null)
+      // Frozen tickets name their agent; the snapshot presets give its display name.
+      const presets = run.presets ?? []
+      const memberIds = [...new Set([...presets.map((p) => p.id), ...run.tickets.map((t) => t.agent ?? '')])]
+      const memberOf = (t) => ({ name: memberName(t.agent, presets), color: memberColor(memberIds, t.agent ?? '') })
       const counts = run.counts
       const complete = counts.INTEGRATED ?? 0
       const count = (s) => counts[s] ?? 0
@@ -945,7 +952,7 @@ window.__ModuleLoader__.load({
               'ul',
               { className: 'dtd-tickets', key: 'list' },
               ...visible.map(({ ticket, view }) =>
-                h(Ticket, { key: ticket.id, ticket, view, open, captain: run.captain }),
+                h(Ticket, { key: ticket.id, ticket, view, open, captain: run.captain, member: memberOf(ticket) }),
               ),
             )
           : h('p', { className: 'dtd-hint', key: 'list' }, '当前没有符合筛选条件的工单。'))
@@ -964,14 +971,27 @@ window.__ModuleLoader__.load({
         ),
       )
       const mapBody =
-        mapOpen && h(DependencyMap, { key: 'map', rows, pinned, setPinned, open, captain: run.captain })
+        mapOpen &&
+        h(DependencyMap, { key: 'map', rows, pinned, setPinned, open, captain: run.captain, ownerOf: memberOf })
+      const listBlock = h(
+        'section',
+        { className: 'dtd-block', 'aria-label': '工单列表', key: 'list-block' },
+        listFold,
+        listBody,
+      )
+      const mapBlock = h(
+        'section',
+        { className: 'dtd-block', 'aria-label': '依赖图', key: 'map-block' },
+        mapFold,
+        mapBody,
+      )
       return h(
         'section',
         { className: 'dtd-section', 'aria-label': '运行详情' },
         h(CaptainCard, { run }),
         h(
-          'div',
-          { className: 'dtd-card' },
+          'section',
+          { className: 'dtd-block', 'aria-label': '运行' },
           h(
             'div',
             { className: 'dtd-run-head' },
@@ -989,8 +1009,8 @@ window.__ModuleLoader__.load({
             h('p', { className: 'dtd-hint' }, '持久记录 · 当前宿主未接管，本页显示最近记录的工单状态。'),
         ),
         h(
-          'div',
-          { className: 'dtd-section' },
+          'section',
+          { className: 'dtd-block', 'aria-label': '总进度' },
           h('h4', null, '总进度'),
           h('progress', {
             className: 'dtd-sr',
@@ -1031,7 +1051,7 @@ window.__ModuleLoader__.load({
           ),
         run.diagnostic && h('p', { className: 'dtd-alert' }, run.diagnostic),
         // The narrow sidebar leads with the map; the ticket list follows it.
-        ...(compact ? [mapFold, mapBody, listFold, listBody] : [listFold, listBody, mapFold, mapBody]),
+        ...(compact ? [mapBlock, listBlock] : [listBlock, mapBlock]),
       )
     }
 
@@ -1107,8 +1127,8 @@ window.__ModuleLoader__.load({
       return new Set([...up, ...down])
     }
 
-    // compact (plan review): each node card names its ID, owner and task; no focus
-    // or detail card. ownerOf(ticket) returns the owner's { name, color }.
+    // Each node card names its ID, owner and task; ownerOf(ticket) returns the
+    // owner's { name, color }. compact (plan review) has no focus or detail card.
     function DependencyMap({ rows, pinned, setPinned, open, captain, compact = false, ownerOf }) {
       if (!rows.length) return null
       const tickets = rows.map((r) => r.ticket)
@@ -1183,12 +1203,13 @@ window.__ModuleLoader__.load({
             ),
             ...rows.map(({ ticket, view }) => {
               const { x, y } = layout.at.get(ticket.id)
+              const owner = ownerOf(ticket)
               return h(
                 'button',
                 {
                   key: ticket.id,
                   type: 'button',
-                  className: 'dtd-node',
+                  className: 'dtd-node dtd-node-compact',
                   'data-dag-node': ticket.id,
                   'data-tone': view.tone,
                   'data-dim': !chain.has(ticket.id),
@@ -1198,7 +1219,7 @@ window.__ModuleLoader__.load({
                     ticket.title !== ticket.id && ticket.title,
                     view.label,
                     view.stage,
-                    ticket.agent && [ticket.agent, ticket.model].filter(Boolean).join(' / '),
+                    ticket.agent && [owner.name, ticket.model].filter(Boolean).join(' / '),
                   ]
                     .filter(Boolean)
                     .join(' · '),
@@ -1211,14 +1232,17 @@ window.__ModuleLoader__.load({
                   h('span', { className: 'dtd-dot' }),
                   h(Avatar, { route: ticketRoute(ticket, captain), size: 16 }),
                   ticket.id,
-                  h('small', null, ticket.agent || view.label),
+                  // An unassigned ticket keeps its state here instead of a placeholder owner.
+                  ticket.agent
+                    ? h('small', { 'data-dag-color': owner.color, style: { color: owner.color } }, owner.name)
+                    : h('small', null, view.label),
                 ),
                 ticket.title && ticket.title !== ticket.id && h('span', { className: 'dtd-node-title' }, ticket.title),
               )
             }),
           ),
         ),
-        h(TicketDetail, { ...focus, tickets, open }),
+        h(TicketDetail, { ...focus, tickets, open, member: ownerOf(focus.ticket) }),
       )
     }
 
@@ -1244,7 +1268,7 @@ window.__ModuleLoader__.load({
       ])
     }
 
-    function TicketDetail({ ticket, view, tickets, open }) {
+    function TicketDetail({ ticket, view, tickets, open, member }) {
       const downstream = tickets.filter((t) => t.dependsOn.includes(ticket.id)).map((t) => t.id)
       const upstream = ticket.dependsOn.length
         ? '上游 ' +
@@ -1263,7 +1287,7 @@ window.__ModuleLoader__.load({
         ),
         h('p', null, upstream),
         ticket.agent &&
-          h('p', { className: 'dtd-hint' }, ticket.agent + ' · ' + (ticket.model || '宿主默认模型')),
+          h('p', { className: 'dtd-hint' }, memberTag(member), ' · ' + (ticket.model || '宿主默认模型')),
         h(
           'ol',
           { className: 'dtd-steps', 'aria-label': '工单阶段' },
@@ -1357,6 +1381,12 @@ window.__ModuleLoader__.load({
 
     // Plan-review member colours, assigned by a stable member order.
     const memberColors = ['#6d8cf5', '#3fbf8a', '#b07ce8', '#f0a04b', '#e8697a', '#41b6c9', '#c9a227', '#8a94a6']
+    // Shared by the plan review and the progress board. Presets saved before
+    // display names existed fall back to the built-in name; '' is the default worker.
+    const memberName = (id, presets) =>
+      id ? presets?.find((p) => p.id === id)?.name || builtinAgents[id]?.name || id : '默认成员'
+    // ids is every possible owner in a stable order, which fixes each member colour.
+    const memberColor = (ids, id) => memberColors[Math.max(0, ids.indexOf(id)) % memberColors.length]
     const blankRoute = () => ({ provider: '', model: '', reasoningEffort: '' })
     const routeFields = (r) => ({
       provider: r?.provider ?? '',
@@ -1462,9 +1492,8 @@ window.__ModuleLoader__.load({
       const memberIds = [...presets.map((p) => p.id), ...allIds.filter((id) => id && !presetOf(id)), ''].filter(
         (id) => owned(id).length,
       )
-      // Presets saved before display names existed fall back to the built-in name.
-      const nameOf = (id) => (id ? presetOf(id)?.name || builtinAgents[id]?.name || id : '默认成员')
-      const colorOf = (id) => memberColors[Math.max(0, allIds.indexOf(id)) % memberColors.length]
+      const nameOf = (id) => memberName(id, presets)
+      const colorOf = (id) => memberColor(allIds, id)
       const edges = run.tickets.reduce((n, t) => n + t.dependsOn.length, 0)
       const byId = new Map(run.tickets.map((t) => [t.id, t]))
       const rows = run.tickets.map((ticket) => ({ ticket, view: ticketView(ticket, byId, 'staged') }))

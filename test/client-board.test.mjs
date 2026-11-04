@@ -264,16 +264,60 @@ test('integrated and waiting tickets show a fully done or untouched stepper', ()
   assert.deepEqual(states('PENDING'), Array(7).fill('todo'))
 })
 
-test('nodes and the detail card name the ticket agent preset and its model', () => {
+test('nodes and the detail card name the ticket member and its model', () => {
   const root = boardFor([
     { id: 'A', title: 'Docs', status: 'RUNNING', agent: 'docs', model: 'acme/fast-1', livePhase: { stage: 'agent' } },
     { id: 'B', status: 'PENDING', dependsOn: ['A'] },
   ])
   const node = find(root, (n) => n.props['data-dag-node'] === 'A')
-  assert.match(text(node), /docs/)
-  assert.match(node.props.title, /acme\/fast-1/)
-  assert.match(text(find(root, (n) => n.props['data-dag-detail'] === 'A')), /docs · acme\/fast-1/)
+  assert.match(text(node), /文档员/)
+  assert.match(node.props.title, /文档员 \/ acme\/fast-1/)
+  assert.match(text(find(root, (n) => n.props['data-dag-detail'] === 'A')), /文档员 · acme\/fast-1/)
   assert.doesNotMatch(text(find(root, (n) => n.props['data-dag-node'] === 'B')), /默认/)
+})
+
+test('the progress board names members everywhere instead of preset IDs, in review-style blocks', () => {
+  const selected = {
+    key: 'k'.repeat(64),
+    runId: 'named',
+    parentId: 'session-captain',
+    mode: 'active',
+    attached: true,
+    total: 3,
+    counts: { RUNNING: 1, PENDING: 2 },
+    captain: { provider: 'magpie', model: 'auto/claude-opus-5-5' },
+    presets: [
+      { id: 'implementer', name: '' },
+      { id: 'test-writer', name: '写测试的' },
+    ],
+    tickets: [
+      { id: 'A', title: '定义接口', status: 'RUNNING', dependsOn: [], attempt: 1, agent: 'implementer', livePhase: { stage: 'agent' } },
+      { id: 'T', title: '编写测试', status: 'PENDING', dependsOn: ['A'], attempt: 0, agent: 'test-writer' },
+      { id: 'B', title: '接入客户端', status: 'PENDING', dependsOn: ['A'], attempt: 0, agent: null },
+    ],
+  }
+  const pane = loadHost([{ runs: [selected], selected }, selected.key]).renderSlot('sidebar.right.pane.tab', {
+    sessionId: 'session-captain',
+  })
+  assert.doesNotMatch(text(pane), /implementer|test-writer|Agent：/, 'no preset ID is shown')
+  const row = (id) => text(find(pane, (n) => n.props['data-dag-ticket'] === id))
+  assert.match(row('A'), /实现者/, 'a preset without a display name falls back to the built-in name')
+  assert.match(row('T'), /写测试的/)
+  assert.match(row('B'), /默认成员/)
+  const node = (id) => find(pane, (n) => n.props['data-dag-node'] === id)
+  assert.match(text(node('A')), /A.*实现者.*定义接口/, 'a map node shows its ID, owner and task')
+  assert.match(text(node('T')), /T.*写测试的.*编写测试/)
+  assert.match(node('A').props.title, /实现者/)
+  assert.doesNotMatch(node('A').props.title, /implementer/)
+  assert.match(text(find(pane, (n) => n.props['data-dag-detail'] === 'A')), /实现者 · 宿主默认模型/)
+  const colour = (id) =>
+    find(node(id), (n) => n.props['data-dag-color'] !== undefined && n.props['data-dag-avatar'] === undefined)?.props[
+      'data-dag-color'
+    ]
+  assert.ok(colour('A') && colour('T') && colour('A') !== colour('T'), 'each member has its own colour')
+  const block = (label) => find(pane, (n) => n.props['aria-label'] === label)
+  for (const label of ['总进度', '工单列表', '依赖图']) assert.match(block(label).props.className, /dtd-block/, label)
+  assert.ok(find(block('工单列表'), (n) => n.props['aria-label'] === '筛选工单'))
 })
 
 const catalog = {

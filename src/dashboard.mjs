@@ -125,17 +125,15 @@ export class RunCatalog {
           ...summary,
           captain: route?.model ? { provider: route.provider ?? '', model: route.model } : null,
           // The plan review offers the current presets; approval resolves them on the host.
-          ...(attached &&
-            data.mode === 'staged' && {
-              presets: Object.entries(coordinator.agents ?? {}).map(([id, p]) => ({
-                id,
-                name: p?.name ?? '',
-                description: p?.description ?? '',
-                provider: p?.provider ?? '',
-                model: p?.model ?? '',
-                reasoningEffort: p?.reasoningEffort ?? '',
-              })),
-            }),
+          // Every other mode only reads them to name each ticket's frozen agent.
+          presets: Object.entries(coordinator.agents ?? {}).map(([id, p]) => ({
+            id,
+            name: p?.name ?? '',
+            description: p?.description ?? '',
+            provider: p?.provider ?? '',
+            model: p?.model ?? '',
+            reasoningEffort: p?.reasoningEffort ?? '',
+          })),
           tickets: data.tickets.map((t) => ({
             id: t.id,
             title: t.title,
