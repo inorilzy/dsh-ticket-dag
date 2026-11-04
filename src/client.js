@@ -1427,7 +1427,7 @@ window.__ModuleLoader__.load({
           ),
         )
         // Hosts without the conversation right sidebar keep the plugin-page board only.
-        // Worker transcripts are one-shot subagent sessions under the captain.
+        // Worker transcripts are continuable subagent sessions under the captain (spawn with a fixed child ID).
         // Newer hosts list them in the parent's catalog first; older ones open by ID.
         let openChild = null
         ctx.inject?.(['sessions'], (scope) => {
@@ -1435,14 +1435,14 @@ window.__ModuleLoader__.load({
           openChild = async (parentSessionId, childSessionId) => {
             const workspace = scope.get?.('uiWorkspace')
             if (!sessions.open && workspace?.openSession) {
-              workspace.openSession({ parentSessionId, childSessionId, mode: 'one-shot' })
+              workspace.openSession({ parentSessionId, childSessionId, mode: 'continuable' })
               return
             }
             if (sessions.openSubagent && sessions.refreshSubagents) {
               await sessions.refreshSubagents(parentSessionId)
               const kept = sessions.subagentAddress?.(childSessionId)
               sessions.openSubagent(
-                kept?.parentSessionId === parentSessionId ? kept : { parentSessionId, childSessionId, mode: 'one-shot' },
+                kept?.parentSessionId === parentSessionId ? kept : { parentSessionId, childSessionId, mode: 'continuable' },
               )
             } else {
               sessions.open?.(childSessionId)

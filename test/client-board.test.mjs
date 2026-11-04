@@ -365,7 +365,7 @@ test('the sidebar board scrolls, shows the dependency map before the ticket list
   assert.ok(find(detail, (n) => n.type === 'button' && text(n) === '查看对话'))
   assert.deepEqual(host.sessions, [
     ['refresh', 'session-captain'],
-    ['open', { parentSessionId: 'session-captain', childSessionId: 'child-a', mode: 'one-shot' }],
+    ['open', { parentSessionId: 'session-captain', childSessionId: 'child-a', mode: 'continuable' }],
   ])
 })
 
