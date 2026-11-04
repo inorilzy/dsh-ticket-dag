@@ -1067,9 +1067,18 @@ window.__ModuleLoader__.load({
       )
     }
 
+    const dashboardUrl = (key, sessionId) => {
+      const query = new URLSearchParams()
+      if (key) query.set('key', key)
+      if (sessionId) query.set('parent', sessionId)
+      const text = query.toString()
+      return 'api/ticket-dag.dashboard' + (text ? '?' + text : '')
+    }
+
     // Only one request at a time. A changed selection supersedes an older
     // response; unmount aborts the pending read and clears the next timer.
-    function Dashboard() {
+    // With sessionId (the conversation sidebar) only that captain's runs show.
+    function Dashboard({ sessionId } = {}) {
       const [data, setData] = useState(null)
       const [selectedKey, setSelectedKey] = useState('')
       const [error, setError] = useState('')
@@ -1092,8 +1101,7 @@ window.__ModuleLoader__.load({
           const key = target.current
           const timeout = setTimeout(() => active?.abort(), 12000)
           try {
-            const url = 'api/ticket-dag.dashboard' + (key ? '?key=' + encodeURIComponent(key) : '')
-            const response = await fetch(url, { signal: active.signal, cache: 'no-store' })
+            const response = await fetch(dashboardUrl(key, sessionId), { signal: active.signal, cache: 'no-store' })
             if (response.status === 404 && key && !disposed && key === target.current) {
               target.current = ''
               setSelectedKey('')
@@ -1146,7 +1154,7 @@ window.__ModuleLoader__.load({
           active?.abort()
           refresh.current = null
         }
-      }, [])
+      }, [sessionId])
       function choose(event) {
         const key = event.target.value
         target.current = key
@@ -1180,11 +1188,13 @@ window.__ModuleLoader__.load({
           h(
             'div',
             { className: 'dtd-section' },
-            h('h4', null, '暂无运行记录'),
+            h('h4', null, sessionId ? '这个对话还没有启动工单运行' : '暂无运行记录'),
             h(
               'p',
               { className: 'dtd-hint' },
-              '在项目的队长会话里用 dag_run 启动一轮工单，进度会显示在这里。',
+              sessionId
+                ? '在这个对话里让队长用 dag_run 启动一轮工单，进度会显示在这里。'
+                : '在项目的队长会话里用 dag_run 启动一轮工单，进度会显示在这里。',
             ),
           ),
         data?.runs.length > 0 &&
@@ -1212,6 +1222,64 @@ window.__ModuleLoader__.load({
           ),
         selected && selected.available !== false && h(RunProgress, { run: selected, key: selected.key }),
         data?.runs.length > 0 && !selected && !error && h('p', { role: 'status' }, '正在读取所选运行…'),
+      )
+    }
+
+    const tabId = 'dsh-ticket-dag/progress'
+    const tabKind = 'ticket-dag'
+
+    // Conversation header action. It appears once this conversation has started
+    // a run, and opens the sidebar by itself when a new run appears while the
+    // sidebar is collapsed.
+    function BoardEntry({ sessionId, openBoard, isExpanded }) {
+      const [runs, setRuns] = useState(null)
+      useEffect(() => {
+        let disposed = false,
+          timer,
+          known = null
+        const ctrl = new AbortController()
+        async function poll() {
+          try {
+            const response = await fetch(dashboardUrl('', sessionId), { signal: ctrl.signal, cache: 'no-store' })
+            const view = response.ok ? await response.json() : null
+            if (disposed || !Array.isArray(view?.runs)) return
+            const fresh = view.runs.filter((run) => known && !known.has(run.key) && !run.complete)
+            known = new Set(view.runs.map((run) => run.key))
+            setRuns(view.runs)
+            if (fresh.length && !isExpanded()) openBoard()
+          } catch {
+            // The next poll retries; the button keeps its last known state.
+          } finally {
+            if (!disposed) timer = setTimeout(poll, 5000)
+          }
+        }
+        void poll()
+        return () => {
+          disposed = true
+          clearTimeout(timer)
+          ctrl.abort()
+        }
+      }, [sessionId])
+      if (!runs?.length) return null
+      return h(
+        'button',
+        {
+          type: 'button',
+          title: '在右侧栏查看这个对话的工单进度',
+          style: {
+            font: 'inherit',
+            fontSize: '.85rem',
+            color: 'inherit',
+            background: 'transparent',
+            border: '1px solid var(--dsw-alias-border-l2, color-mix(in srgb, currentColor 22%, transparent))',
+            borderRadius: '.5rem',
+            padding: '.25rem .6rem',
+            cursor: 'pointer',
+            whiteSpace: 'nowrap',
+          },
+          onClick: () => openBoard(),
+        },
+        '查看工单',
       )
     }
 
@@ -1248,6 +1316,35 @@ window.__ModuleLoader__.load({
             ctx.slots.register({ name: 'plugins.row.config', key: 'dsh-ticket-dag#dsh-ticket-dag' }, Panel),
           ),
         )
+        // Hosts without the conversation right sidebar keep the plugin-page board only.
+        ctx.inject?.(['sidebarRight', 'sidebarRightTabs'], (native) => {
+          native.effect(() =>
+            native.sidebarRightTabs.register({ id: tabId, kind: tabKind, title: () => '工单进度' }),
+          )
+          native.effect(() =>
+            native.slots.inject('sidebar.right.pane.tab', () =>
+              native.slots.register({ name: 'sidebar.right.pane.tab', key: tabId }, ({ sessionId }) =>
+                h(Dashboard, { sessionId }),
+              ),
+            ),
+          )
+          native.effect(() =>
+            native.slots.inject('conversation.session.header.actions', () =>
+              native.slots.register(
+                {
+                  name: 'conversation.session.header.actions',
+                  id: 'ticket-dag-entry',
+                  order: 55,
+                  inject: () => ({
+                    openBoard: () => native.sidebarRight.openTab(tabKind),
+                    isExpanded: () => native.sidebarRight.isExpanded(),
+                  }),
+                },
+                BoardEntry,
+              ),
+            ),
+          )
+        })
       },
     }
   },

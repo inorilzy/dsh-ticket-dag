@@ -72,6 +72,11 @@ test('dashboard history survives restart, separates projects, and never attaches
     assert.equal(first.db.get('A').lease, job.lease)
     assert.equal(first.db.events().length, initialEvents)
     assert.deepEqual(new RunCatalog(join(root, 'other-profile')).read(cold, null).runs, [])
+    const own = restored.read(cold, null, 'captain-repo-1')
+    assert.deepEqual(own.runs.map((r) => r.repoName), ['repo-1'])
+    assert.equal(own.selected.repoName, 'repo-1')
+    assert.deepEqual(restored.read(cold, null, 'someone-else'), { runs: [], selected: null })
+    assert.equal(restored.read(cold, keys.get('repo-2'), 'captain-repo-1'), null)
     assert.equal(restored.read(cold, keys.get('repo-1').replace(/^./, 'g')), null)
     second.db.close()
     rmSync(second.file)
@@ -86,6 +91,7 @@ test('dashboard history survives restart, separates projects, and never attaches
 test('dashboard URL accepts only one opaque key and only supplies a GET route', async () => {
   let route,
     reads = 0
+  const parents = []
   mountDashboard(
     {
       connection: {
@@ -97,8 +103,9 @@ test('dashboard URL accepts only one opaque key and only supplies a GET route', 
       },
     },
     {
-      read(_co, key) {
+      read(_co, key, parent) {
         reads++
+        parents.push(parent)
         return key ? null : { runs: [], selected: null }
       },
     },
@@ -106,14 +113,24 @@ test('dashboard URL accepts only one opaque key and only supplies a GET route', 
   )
   assert.deepEqual(route.methods, ['GET'])
   const get = (suffix) => route.fetch(new Request('http://localhost' + route.path + suffix))
-  for (const input of ['?path=/tmp/private.sqlite', '?key=../private', '?key=a&key=b', '?extra=1']) {
-    assert.equal((await get(input)).status, 400)
+  for (const input of [
+    '?path=/tmp/private.sqlite',
+    '?key=../private',
+    '?key=a&key=b',
+    '?extra=1',
+    '?parent=a&parent=b',
+    '?parent=' + encodeURIComponent('../x y'),
+    '?parent=',
+  ]) {
+    assert.equal((await get(input)).status, 400, input)
   }
   assert.equal(reads, 0)
   const list = await get('')
   assert.match(list.headers.get('cache-control'), /no-store/)
   assert.deepEqual(await list.json(), { runs: [], selected: null })
   assert.equal((await get('?key=' + 'a'.repeat(64))).status, 404)
+  assert.equal((await get('?parent=session_01:abc-9')).status, 200)
+  assert.deepEqual(parents, [null, null, 'session_01:abc-9'])
 })
 
 test('model catalog route lists every provider, its models and efforts, and reports a failing provider', async () => {

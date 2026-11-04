@@ -26,6 +26,52 @@ function loadSlots(seeds) {
 }
 const loadBoard = (seeds) => loadSlots(seeds)['plugins.tab']
 
+// Loads the entry with the conversation right-sidebar services present. Effects
+// run immediately and fetch only records the URL it was asked for.
+function loadHost(seeds, { expanded = false } = {}) {
+  let definition
+  const source = readFileSync(resolve(import.meta.dirname, '..', 'src', 'client.js'), 'utf8')
+  const urls = []
+  vm.runInNewContext(source, {
+    window: { __ModuleLoader__: { load: (d) => (definition = d) } },
+    fetch: (url) => (urls.push(url), new Promise(() => {})),
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+    AbortController,
+    URLSearchParams,
+  })
+  const queue = [...seeds]
+  const react = {
+    createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat() }),
+    useState: (init) => [queue.length ? queue.shift() : typeof init === 'function' ? init() : init, () => {}],
+    useRef: (current) => ({ current }),
+    useEffect: (fn) => void fn(),
+  }
+  const host = { tabs: [], opened: [], slots: {}, urls, injected: [] }
+  const slots = {
+    inject: (_, fn) => fn(),
+    register: (meta, component) => (host.slots[meta.name] = { meta, component }),
+  }
+  definition.factory(() => react).apply({
+    effect: (fn) => fn(),
+    slots,
+    inject(names, fn) {
+      host.injected.push(names)
+      fn({
+        effect: (f) => f(),
+        slots,
+        sidebarRightTabs: { register: (definition) => (host.tabs.push(definition), () => {}) },
+        sidebarRight: { openTab: (kind) => host.opened.push(kind), isExpanded: () => expanded },
+      })
+    },
+  })
+  host.renderSlot = (name, props) => {
+    const { meta, component } = host.slots[name]
+    return render({ type: component, props: { ...props, ...meta.inject?.(props.sessionId) }, children: [] })
+  }
+  return host
+}
+
 // Editor state order: edit draft, notice, busy, model catalog.
 function editorFor(value, catalog) {
   const Panel = loadSlots([null, null, false, catalog])['plugins.row.config']
@@ -254,6 +300,34 @@ test('without saved presets the config page starts from the built-in presets', a
     values('角色说明'),
     Object.values(builtinAgents).map((a) => a.instructions),
   )
+})
+
+test('each conversation gets a right-sidebar tab that reads only its own runs', () => {
+  const host = loadHost([])
+  assert.deepEqual(host.injected.map((names) => [...names]), [['sidebarRight', 'sidebarRightTabs']])
+  assert.deepEqual(
+    host.tabs.map((t) => [t.id, t.kind, t.title()]),
+    [['dsh-ticket-dag/progress', 'ticket-dag', '工单进度']],
+  )
+  assert.equal(host.slots['sidebar.right.pane.tab'].meta.key, 'dsh-ticket-dag/progress')
+  host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-1' })
+  assert.deepEqual(host.urls, ['api/ticket-dag.dashboard?parent=session-1'])
+
+  const empty = loadHost([{ runs: [], selected: null }, ''])
+  const pane = empty.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-1' })
+  assert.match(text(pane), /这个对话还没有启动工单运行/)
+})
+
+test('the conversation header shows 查看工单 only when this conversation has runs, and opens the tab', () => {
+  const none = loadHost([[]])
+  assert.equal(none.renderSlot('conversation.session.header.actions', { sessionId: 's1' }), null)
+  assert.deepEqual(none.urls, ['api/ticket-dag.dashboard?parent=s1'])
+
+  const host = loadHost([[{ key: 'k1', complete: false }]])
+  const entry = host.renderSlot('conversation.session.header.actions', { sessionId: 's1' })
+  assert.equal(text(entry), '查看工单')
+  entry.props.onClick()
+  assert.deepEqual(host.opened, ['ticket-dag'])
 })
 
 test('a dependency cycle in a damaged ledger still renders every ticket', () => {

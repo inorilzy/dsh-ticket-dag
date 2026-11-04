@@ -80,8 +80,9 @@ export class RunCatalog {
     return [...known.values()].sort((a, b) => b.createdAt - a.createdAt || a.key.localeCompare(b.key))
   }
 
-  read(coordinator, key) {
-    const known = this.entries()
+  // parent limits the view to runs started by that captain session.
+  read(coordinator, key, parent = null) {
+    const known = this.entries().filter((entry) => parent === null || entry.parentId === parent)
     if (key && !known.some((entry) => entry.key === key)) return null
     const selectedKey = key ?? known[0]?.key
     let selected = null
@@ -247,15 +248,18 @@ export function mountDashboard(ctx, catalog, coordinator) {
     async fetch(request) {
       const query = new URL(request.url).searchParams
       const key = query.get('key')
+      const parent = query.get('parent')
       if (
-        [...query.keys()].some((k) => k !== 'key') ||
+        [...query.keys()].some((k) => k !== 'key' && k !== 'parent') ||
         query.getAll('key').length > 1 ||
-        (key !== null && !/^[0-9a-f]{64}$/.test(key))
+        query.getAll('parent').length > 1 ||
+        (key !== null && !/^[0-9a-f]{64}$/.test(key)) ||
+        (parent !== null && !/^[A-Za-z0-9_.:-]{1,200}$/.test(parent))
       ) {
         return new Response('Invalid run key', { status: 400, headers: noStore })
       }
       try {
-        const view = catalog.read(coordinator, key)
+        const view = catalog.read(coordinator, key, parent)
         return view
           ? Response.json(view, { headers: noStore })
           : new Response('Unknown run', { status: 404, headers: noStore })
