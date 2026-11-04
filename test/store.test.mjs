@@ -262,6 +262,73 @@ test('ambiguous publication remains visible, blocks new publishing and cannot be
   }
 })
 
+test('a staged run admits nothing until approved; approval freezes each ticket choice into the manifest', (t) => {
+  const db = new RunStore(tempDb(t))
+  try {
+    const spec = manifest([ticket('A'), ticket('B', ['A'])])
+    db.init({
+      runId: 'run-1',
+      repo: { root: '/work', commonDir: '/work/.git' },
+      ref: 'refs/heads/integration/run-1',
+      baseSha: 'start',
+      parentId: 'parent',
+      policyHash: 'checks-hash',
+      manifest: spec,
+      mode: 'staged',
+    })
+    assert.equal(db.meta().mode, 'staged')
+    assert.equal(db.claim('A', assignment('A')), null)
+    // The captain's pause/resume cannot leave the staged state; only approval or cancel can.
+    assert.equal(db.setMode('active'), false)
+    assert.equal(db.setMode('paused'), false)
+    assert.equal(db.hold('broken policy'), true)
+    assert.equal(db.meta().mode, 'staged')
+    const choices = [
+      { ...spec.tickets[0], agent: 'docs', agentSpec: { instructions: 'Docs.', model: 'fast-1' } },
+      spec.tickets[1],
+    ]
+    assert.equal(db.approve(choices), true)
+    assert.equal(db.meta().mode, 'active')
+    assert.equal(db.meta().diagnostic, null)
+    assert.deepEqual(db.get('A').agentSpec, { instructions: 'Docs.', model: 'fast-1' })
+    assert.equal(db.get('A').agent, 'docs')
+    assert.deepEqual(db.meta().manifest.tickets[0].agentSpec, { instructions: 'Docs.', model: 'fast-1' })
+    assert.equal(Object.hasOwn(db.get('B'), 'agent'), false)
+    assert.ok(db.claim('A', assignment('A')))
+    assert.equal(db.approve(choices), false, 'approval happens once')
+    assert.deepEqual(
+      db.pendingNotifications().map((n) => n.type),
+      ['run_blocked', 'run_approved'],
+    )
+    assert.throws(() => db.approve([{ ...spec.tickets[0], id: 'Z' }]), /ticket set/)
+  } finally {
+    db.close()
+  }
+})
+
+test('a staged run can be discarded, and approval must name exactly the run tickets', (t) => {
+  const db = new RunStore(tempDb(t))
+  try {
+    const spec = manifest([ticket('A')])
+    db.init({
+      runId: 'run-1',
+      repo: { root: '/work', commonDir: '/work/.git' },
+      ref: 'refs/heads/integration/run-1',
+      baseSha: 'start',
+      parentId: 'parent',
+      policyHash: 'checks-hash',
+      manifest: spec,
+      mode: 'staged',
+    })
+    assert.throws(() => db.approve([]), /ticket set/)
+    assert.equal(db.setMode('cancelled'), true)
+    assert.equal(db.get('A').status, 'CANCELLED')
+    assert.equal(db.approve(spec.tickets), false)
+  } finally {
+    db.close()
+  }
+})
+
 test('pause stops dispatch; cancellation preserves running and potentially published tickets', (t) => {
   const db = new RunStore(tempDb(t))
   try {

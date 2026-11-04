@@ -32,9 +32,14 @@ function loadHost(seeds, { expanded = false, config = { status: 'loading' } } = 
   let definition
   const source = readFileSync(resolve(import.meta.dirname, '..', 'src', 'client.js'), 'utf8')
   const urls = []
+  const posts = []
   vm.runInNewContext(source, {
     window: { __ModuleLoader__: { load: (d) => (definition = d) } },
-    fetch: (url) => (urls.push(url), new Promise(() => {})),
+    fetch: (url, init) => {
+      urls.push(url)
+      if (init?.method === 'POST') posts.push([url, JSON.parse(init.body)])
+      return new Promise(() => {})
+    },
     setTimeout: () => 0,
     clearTimeout: () => {},
     AbortController,
@@ -47,7 +52,7 @@ function loadHost(seeds, { expanded = false, config = { status: 'loading' } } = 
     useRef: (current) => ({ current }),
     useEffect: (fn) => void fn(),
   }
-  const host = { tabs: [], opened: [], slots: {}, urls, injected: [], namespaces: [], saved: [], sessions: [] }
+  const host = { tabs: [], opened: [], slots: {}, urls, posts, injected: [], namespaces: [], saved: [], sessions: [] }
   const slots = {
     inject: (_, fn) => fn(),
     register: (meta, component) => (host.slots[meta.name] = { meta, component }),
@@ -367,6 +372,73 @@ test('the sidebar board scrolls, shows the dependency map before the ticket list
     ['refresh', 'session-captain'],
     ['open', { parentSessionId: 'session-captain', childSessionId: 'child-a', mode: 'continuable' }],
   ])
+})
+
+test('a staged run shows the plan review: per-ticket preset and model, then approve or discard', () => {
+  const selected = {
+    key: 'k'.repeat(64),
+    runId: 'plan',
+    parentId: 'session-captain',
+    mode: 'staged',
+    attached: true,
+    total: 2,
+    counts: { PENDING: 2 },
+    presets: [
+      { id: 'docs', description: '文档', provider: 'acme', model: 'fast-1', reasoningEffort: '' },
+      { id: 'impl', description: '实现', provider: '', model: '', reasoningEffort: '' },
+    ],
+    tickets: [
+      {
+        id: 'A',
+        title: 'Docs',
+        status: 'PENDING',
+        dependsOn: [],
+        attempt: 0,
+        agent: 'docs',
+        route: { provider: 'acme', model: 'fast-1', reasoningEffort: '' },
+      },
+      { id: 'B', title: 'Code', status: 'PENDING', dependsOn: ['A'], attempt: 0, agent: null, route: null },
+    ],
+  }
+  const host = loadHost([{ runs: [selected], selected }, selected.key])
+  const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  const review = find(pane, (n) => n.props['data-dag-review'] !== undefined)
+  assert.match(text(review), /执行前计划审查/)
+  assert.match(text(review), /待确认/)
+  assert.match(text(review), /2 张工单 · 1 条依赖/)
+  const field = (label) => find(review, (n) => n.props['aria-label'] === label)
+  assert.equal(field('A 的预设').props.value, 'docs')
+  assert.equal(field('B 的预设').props.value, '')
+  assert.equal(field('A 的模型').props.value, JSON.stringify(['acme', 'fast-1']))
+  assert.equal(field('B 的模型').props.value, '')
+  assert.ok(find(review, (n) => n.props['data-dag-map'] !== undefined), 'the plan shows its dependency map')
+  assert.match(text(find(review, (n) => n.props['data-dag-detail'] === 'A')), /docs · acme\/fast-1/)
+  assert.equal(find(pane, (n) => n.props['data-dag-ticket'] !== undefined), undefined, 'no progress list yet')
+
+  find(review, (n) => n.type === 'button' && text(n) === '确认并启动').props.onClick()
+  assert.deepEqual(host.posts, [
+    [
+      'api/ticket-dag.approve',
+      {
+        key: selected.key,
+        action: 'approve',
+        choices: [
+          { id: 'A', agent: 'docs', provider: 'acme', model: 'fast-1', reasoningEffort: '' },
+          { id: 'B', agent: '', provider: '', model: '', reasoningEffort: '' },
+        ],
+      },
+    ],
+  ])
+  assert.ok(find(review, (n) => n.type === 'button' && text(n) === '放弃本次计划'))
+})
+
+test('settings carry the approval switch, on by default', () => {
+  const root = editorFor({}, catalog)
+  const box = find(root, (n) => n.props['aria-label'] === '启动前需要我确认')
+  assert.equal(box.props.type, 'checkbox')
+  assert.equal(box.props.checked, true)
+  const off = editorFor({ requireApproval: false }, catalog)
+  assert.equal(find(off, (n) => n.props['aria-label'] === '启动前需要我确认').props.checked, false)
 })
 
 test('the conversation header shows 查看工单 only when this conversation has runs, and opens the tab', () => {

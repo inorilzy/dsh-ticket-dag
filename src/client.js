@@ -134,6 +134,9 @@ window.__ModuleLoader__.load({
 .dtd-detail .dtd-run-head strong {font-size:.96rem}
 .dtd-panel .dtd-preset:not(.dtd-rule) {border:1px solid color-mix(in srgb,currentColor 16%,transparent);border-radius:.55rem;padding:.5rem .75rem}
 .dtd-preset-row {display:flex;flex-wrap:wrap;align-items:center;gap:.3rem .8rem}
+.dtd-panel label.dtd-check {display:flex;align-items:flex-start;gap:.6rem}.dtd-panel label.dtd-check input {width:auto;margin-top:.3rem}
+.dtd-check span {display:grid;gap:.15rem}
+[data-dag-plan] select {width:100%}
 .dtd-preset-row .dtd-actions {margin-inline-start:auto}
 .dtd-preset-meta {font-size:.83rem;background:color-mix(in srgb,currentColor 7%,transparent);border-radius:.35rem;padding:.1rem .45rem}
 `
@@ -141,6 +144,7 @@ window.__ModuleLoader__.load({
     function draftFor(value) {
       return {
         maxWorkers: String(value.maxWorkers ?? 16),
+        requireApproval: value.requireApproval ?? true,
         checkTimeoutMs: String(value.checkTimeoutMs ?? 120000),
         rules: Object.entries(value.checks ?? {}).map(([id, commands]) => ({ id, commands })),
         agents: Object.entries(value.agents ?? builtinAgents).map(([id, preset]) => agentRow(id, preset)),
@@ -203,6 +207,9 @@ window.__ModuleLoader__.load({
       ]) {
         const value = numberField(draft[field], max, label)
         if (value !== Number(base[field])) changed.push({ op: 'set', path: [field], value })
+      }
+      if (base.requireApproval !== draft.requireApproval) {
+        changed.push({ op: 'set', path: ['requireApproval'], value: draft.requireApproval })
       }
       if (JSON.stringify(base.rules) !== JSON.stringify(draft.rules)) {
         changed.push({ op: 'set', path: ['checks'], value: checksFrom(draft.rules) })
@@ -581,6 +588,29 @@ window.__ModuleLoader__.load({
             ),
           ),
           h(
+            'label',
+            { className: 'dtd-check' },
+            h('input', {
+              type: 'checkbox',
+              'aria-label': '启动前需要我确认',
+              checked: draft.requireApproval,
+              onChange: (e) =>
+                change((d) => {
+                  d.requireApproval = e.target.checked
+                }),
+            }),
+            h(
+              'span',
+              null,
+              h('strong', null, '启动前需要我确认'),
+              h(
+                'small',
+                null,
+                '打开时，队长提交的工单先停在“执行前计划审查”，你在对话右侧栏确认每张工单的预设和模型后才开始派工。关闭则提交后立即派工。',
+              ),
+            ),
+          ),
+          h(
             'section',
             { className: 'dtd-section', 'aria-label': '预设 Agent' },
             h('h3', null, '预设 Agent'),
@@ -697,7 +727,7 @@ window.__ModuleLoader__.load({
       )
     }
 
-    const modes = { active: '运行中', paused: '已暂停', cancelled: '已取消' }
+    const modes = { staged: '待确认', active: '运行中', paused: '已暂停', cancelled: '已取消' }
     const states = {
       RUNNING: ['执行中', 'work'],
       SUBMITTED: ['等待集成', 'work'],
@@ -1157,6 +1187,171 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // A staged run waits for the user. Every ticket shows its planned preset and
+    // model; the user may change both, then approve (dispatch starts) or discard.
+    function PlanReview({ run, refresh }) {
+      const [choices, setChoices] = useState(null)
+      const [catalog, setCatalog] = useState(null)
+      const [busy, setBusy] = useState(false)
+      const [error, setError] = useState('')
+      const [pinned, setPinned] = useState(null)
+      const [confirmDiscard, setConfirmDiscard] = useState(false)
+      useEffect(() => {
+        const ctrl = new AbortController()
+        fetch('api/ticket-dag.models', { signal: ctrl.signal, cache: 'no-store' })
+          .then((r) => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))))
+          .then((data) => setCatalog(Array.isArray(data?.providers) ? data : { error: true }))
+          .catch((e) => e.name !== 'AbortError' && setCatalog({ error: true }))
+        return () => ctrl.abort()
+      }, [])
+      const presets = run.presets ?? []
+      const planned = Object.fromEntries(
+        run.tickets.map((t) => [
+          t.id,
+          {
+            agent: t.agent ?? '',
+            provider: t.route?.provider ?? '',
+            model: t.route?.model ?? '',
+            reasoningEffort: t.route?.reasoningEffort ?? '',
+          },
+        ]),
+      )
+      const current = choices ?? planned
+      const edges = run.tickets.reduce((n, t) => n + t.dependsOn.length, 0)
+      const byId = new Map(run.tickets.map((t) => [t.id, t]))
+      // The map and detail card follow the current selections, not the plan.
+      const rows = run.tickets.map((ticket) => {
+        const c = current[ticket.id]
+        return {
+          ticket: {
+            ...ticket,
+            agent: c.agent || null,
+            model: c.model ? [c.provider, c.model].filter(Boolean).join('/') : null,
+          },
+          view: ticketView(ticket, byId, 'staged'),
+        }
+      })
+      const update = (id, fn) =>
+        setChoices((old) => {
+          const next = structuredClone(old ?? planned)
+          fn(next[id])
+          return next
+        })
+      async function send(body) {
+        setBusy(true)
+        setError('')
+        try {
+          const response = await fetch('api/ticket-dag.approve', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ key: run.key, ...body }),
+          })
+          if (!response.ok) throw new Error((await response.text()) || 'HTTP ' + response.status)
+          refresh()
+        } catch (err) {
+          setError(err.message || '操作失败，请重试。')
+        } finally {
+          setBusy(false)
+        }
+      }
+      const approve = () =>
+        send({
+          action: 'approve',
+          choices: run.tickets.map((t) => ({ id: t.id, ...current[t.id] })),
+        })
+      return h(
+        'section',
+        { className: 'dtd-section', 'data-dag-review': '', 'aria-label': '执行前计划审查' },
+        h(
+          'div',
+          { className: 'dtd-card' },
+          h(
+            'div',
+            { className: 'dtd-run-head' },
+            h('strong', null, '执行前计划审查'),
+            h('span', { className: 'dtd-badge wait' }, '待确认'),
+          ),
+          h('p', { className: 'dtd-hint' }, run.tickets.length + ' 张工单 · ' + edges + ' 条依赖 · ' + run.runId),
+          h(
+            'p',
+            { className: 'dtd-hint' },
+            '工单尚未派出。确认每张工单用哪个预设和模型，再点“确认并启动”。要修改工单内容，请回到对话告诉队长，再重新提交。',
+          ),
+        ),
+        run.attached === false &&
+          h('p', { className: 'dtd-alert', role: 'status' }, '这轮计划的队长对话当前未打开。请先打开发起它的对话，再在这里确认。'),
+        catalog?.error && h('p', { className: 'dtd-alert', role: 'status' }, '模型列表暂不可用，仍可保留预设里的模型。'),
+        h(
+          'ul',
+          { className: 'dtd-tickets' },
+          ...run.tickets.map((t) => {
+            const c = current[t.id]
+            return h(
+              'li',
+              { key: t.id, className: 'dtd-ticket', 'data-dag-plan': t.id },
+              h(
+                'div',
+                { className: 'dtd-ticket-head' },
+                h('strong', null, t.id),
+                t.title && t.title !== t.id && h('span', null, t.title),
+                h('span', { className: 'dtd-hint' }, t.dependsOn.length ? '等待 ' + t.dependsOn.join('、') : '无依赖'),
+              ),
+              h(
+                'label',
+                null,
+                h('span', null, '预设'),
+                h(
+                  'select',
+                  {
+                    'aria-label': t.id + ' 的预设',
+                    value: c.agent,
+                    disabled: busy,
+                    onChange: (e) =>
+                      update(t.id, (x) => {
+                        const preset = presets.find((p) => p.id === e.target.value)
+                        x.agent = e.target.value
+                        x.provider = preset?.provider ?? ''
+                        x.model = preset?.model ?? ''
+                        x.reasoningEffort = preset?.reasoningEffort ?? ''
+                      }),
+                  },
+                  h('option', { value: '' }, '不使用预设'),
+                  c.agent &&
+                    !presets.some((p) => p.id === c.agent) &&
+                    h('option', { value: c.agent }, c.agent + '（配置中已没有）'),
+                  ...presets.map((p) =>
+                    h('option', { key: p.id, value: p.id }, p.description ? p.id + ' · ' + p.description : p.id),
+                  ),
+                ),
+              ),
+              h(ModelPicker, {
+                agent: { id: t.id, ...c },
+                catalog: catalog?.error ? null : catalog,
+                modify: (fn) => update(t.id, fn),
+              }),
+            )
+          }),
+        ),
+        h(DependencyMap, { rows, pinned, setPinned }),
+        error && h('p', { className: 'dtd-alert', role: 'alert' }, error),
+        h(
+          'div',
+          { className: 'dtd-actions' },
+          h(
+            'button',
+            { type: 'button', className: 'dtd-primary', disabled: busy || run.attached === false, onClick: approve },
+            '确认并启动',
+          ),
+          choices && button('恢复计划原值', () => setChoices(null), { disabled: busy }),
+          button(
+            confirmDiscard ? '再次点击确认放弃' : '放弃本次计划',
+            () => (confirmDiscard ? send({ action: 'discard' }) : setConfirmDiscard(true)),
+            { disabled: busy || run.attached === false },
+          ),
+        ),
+      )
+    }
+
     const dashboardUrl = (key, sessionId) => {
       const query = new URLSearchParams()
       if (key) query.set('key', key)
@@ -1312,7 +1507,9 @@ window.__ModuleLoader__.load({
           ),
         selected &&
           selected.available !== false &&
-          h(RunProgress, { run: selected, key: selected.key, compact: Boolean(sessionId), openChild }),
+          (selected.mode === 'staged'
+            ? h(PlanReview, { run: selected, key: selected.key, refresh: () => void refresh.current?.() })
+            : h(RunProgress, { run: selected, key: selected.key, compact: Boolean(sessionId), openChild })),
         data?.runs.length > 0 && !selected && !error && h('p', { role: 'status' }, '正在读取所选运行…'),
       )
     }

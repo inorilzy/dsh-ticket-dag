@@ -3,7 +3,7 @@ import { access, lstat, mkdir, readFile, readdir, writeFile } from 'node:fs/prom
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import * as git from './git.mjs'
-import { normalizeManifest, RunStore } from './store.mjs'
+import { agentSpec, normalizeManifest, RunStore } from './store.mjs'
 
 const hash = (text) => createHash('sha256').update(text).digest('hex')
 const message = (err) => String(err?.message ?? err).slice(-3500)
@@ -138,6 +138,7 @@ export class Coordinator {
     rememberRun,
     checks = {},
     agents = {},
+    requireApproval = false,
     maxWorkers = 16,
     checkTimeoutMs = 120000,
     retryDelayMs = 1500,
@@ -155,6 +156,7 @@ export class Coordinator {
       rememberRun,
       checks,
       agents,
+      requireApproval,
       maxWorkers,
       checkTimeoutMs,
       retryDelayMs,
@@ -175,7 +177,7 @@ export class Coordinator {
     return cap > 0 && (this.activeByAgent.get(agent) ?? 0) >= cap
   }
 
-  updateSettings({ checks, agents = this.agents, maxWorkers, checkTimeoutMs }) {
+  updateSettings({ checks, agents = this.agents, requireApproval = this.requireApproval, maxWorkers, checkTimeoutMs }) {
     requireValue(
       Number.isInteger(maxWorkers) && maxWorkers >= 1 && maxWorkers <= 32,
       'Host maxWorkers must be 1..32',
@@ -186,7 +188,7 @@ export class Coordinator {
     )
     // Already-open runs retain their immutable verification command and agent
     // preset snapshots. A running worker or a verification process keeps its handle.
-    Object.assign(this, { checks, agents, maxWorkers, checkTimeoutMs })
+    Object.assign(this, { checks, agents, requireApproval, maxWorkers, checkTimeoutMs })
     for (const run of this.runs.values()) this._wake(run)
   }
 
@@ -197,7 +199,10 @@ export class Coordinator {
     )
     const manifest = normalizeManifest(input, checks, this.agents)
     const id = safeId(runId ?? 'r-' + hash(parentId + '\0' + manifest.specId).slice(0, 20))
-    const run = await this._open({ cwd, parentId, runId: id }, { manifest, checks })
+    const run = await this._open(
+      { cwd, parentId, runId: id },
+      { manifest, checks, mode: this.requireApproval ? 'staged' : 'active' },
+    )
     const meta = run.db.meta()
     requireValue(
       JSON.stringify(meta.manifest) === JSON.stringify(manifest),
@@ -257,6 +262,7 @@ export class Coordinator {
           baseSha,
           manifest: seed.manifest,
           policyHash: policyHash(seed.manifest, seed.checks),
+          mode: seed.mode,
         })
       }
       requireValue(
@@ -499,6 +505,11 @@ export class Coordinator {
           status,
           agent: agent ?? null,
           model: modelRoute({ agentSpec }),
+          route: {
+            provider: agentSpec?.provider ?? '',
+            model: agentSpec?.model ?? '',
+            reasoningEffort: agentSpec?.reasoningEffort ?? '',
+          },
           livePhase:
             status === 'RUNNING'
               ? (run.work.get(id)?.phase ?? null)
@@ -535,6 +546,10 @@ export class Coordinator {
     const run = await this._open(q)
     await serial(run, async () => {
       requireValue(run.db.meta().mode !== 'cancelled', 'A cancelled run is final')
+      requireValue(
+        run.db.meta().mode !== 'staged',
+        'This run is waiting for the user to approve it in the 工单进度 board. It cannot be resumed from the conversation.',
+      )
       this._checkPolicy(run)
       run.haltError = ''
       run.db.setMode('active')
@@ -612,6 +627,66 @@ export class Coordinator {
     }
     run.integration?.ctrl.abort()
     await Promise.allSettled(jobs.map((j) => j.promise))
+    this._wake(run)
+    return this._snapshot(run)
+  }
+
+  /**
+   * The user's approval of a staged run, from the board. Each choice names a
+   * ticket and its preset (empty for none) plus provider/model/reasoningEffort;
+   * tickets without a choice keep their planned preset. Presets resolve from
+   * the current settings and the result is frozen into the run.
+   * @param file - the run ledger the board selected.
+   * @param choices - per-ticket selections.
+   * @returns the run snapshot after approval.
+   */
+  async approve(file, choices) {
+    const run = this.runs.get(file)
+    requireValue(run, 'Open the captain conversation of this run first')
+    await serial(run, async () => {
+      const m = run.db.meta()
+      requireValue(m.mode === 'staged', 'This run is not waiting for approval')
+      requireValue(Array.isArray(choices), 'choices must be an array')
+      const byId = new Map(choices.map((c) => [c?.id, c]))
+      const tickets = m.manifest.tickets.map((t) => {
+        const c = byId.get(t.id)
+        if (!c) return t
+        const { agent, agentSpec: _old, ...rest } = t
+        const preset = c.agent ? agentSpec(this.agents, String(c.agent)) : {}
+        const spec = preset.instructions ? { instructions: preset.instructions } : {}
+        for (const field of ['provider', 'model', 'reasoningEffort']) {
+          const value = String(c[field] ?? '').trim()
+          if (value) spec[field] = value
+        }
+        requireValue(
+          spec.model || !(spec.provider || spec.reasoningEffort),
+          t.id + ' sets a provider or reasoning effort without a model',
+        )
+        return {
+          ...rest,
+          ...(c.agent && { agent: String(c.agent) }),
+          ...(Object.keys(spec).length && { agentSpec: spec }),
+        }
+      })
+      requireValue(run.db.approve(tickets), 'This run is not waiting for approval')
+      this._drainOutbox(run)
+    })
+    this._wake(run)
+    return this._snapshot(run)
+  }
+
+  /**
+   * The user's rejection of a staged plan, from the board.
+   * @param file - the run ledger the board selected.
+   * @returns the cancelled run snapshot.
+   */
+  async discard(file) {
+    const run = this.runs.get(file)
+    requireValue(run, 'Open the captain conversation of this run first')
+    await serial(run, () => {
+      requireValue(run.db.meta().mode === 'staged', 'This run is not waiting for approval')
+      run.db.setMode('cancelled')
+    })
     this._wake(run)
     return this._snapshot(run)
   }

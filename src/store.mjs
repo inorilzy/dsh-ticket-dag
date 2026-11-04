@@ -12,7 +12,8 @@ const STATUSES = [
   'CANCELLED',
 ]
 const STATES_SQL = STATUSES.map((s) => "'" + s + "'").join(', ')
-const MODES = new Set(['active', 'paused', 'cancelled'])
+// staged: created but waiting for the user's approval; nothing is dispatched.
+const MODES = new Set(['staged', 'active', 'paused', 'cancelled'])
 const EDITABLE = new Set(['sourceSha', 'landedSha', 'message', 'childId', 'path', 'branch', 'baseSha'])
 // claim, retry, intent and finish have additional invariants. Those transitions
 // are not available through the generic CAS.
@@ -96,7 +97,7 @@ function commandExists(registry, name) {
 
 // The resolved preset is stored with the ticket, so later profile edits cannot
 // change a run's instructions or model route. Empty fields are omitted.
-function agentSpec(registry, name) {
+export function agentSpec(registry, name) {
   if (!Object.hasOwn(registry, name)) throw new TypeError('unknown agent preset: ' + name)
   const preset = record(registry[name], 'agent preset ' + name)
   const spec = {}
@@ -191,7 +192,7 @@ const SCHEMA = `
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1), runId TEXT NOT NULL,
     repo TEXT NOT NULL, ref TEXT NOT NULL, baseSha TEXT NOT NULL,
     manifest TEXT NOT NULL, parentId TEXT NOT NULL, policyHash TEXT NOT NULL, tipSha TEXT NOT NULL,
-    mode TEXT NOT NULL CHECK(mode IN ('active', 'paused', 'cancelled')), diagnostic TEXT
+    mode TEXT NOT NULL CHECK(mode IN ('staged', 'active', 'paused', 'cancelled')), diagnostic TEXT
   );
   CREATE TABLE IF NOT EXISTS tickets (
     id TEXT PRIMARY KEY, definition TEXT NOT NULL, position INTEGER NOT NULL UNIQUE,
@@ -287,7 +288,8 @@ export class RunStore {
         .run(id)
   }
 
-  init({ runId, repo, ref, baseSha, manifest, parentId, policyHash }) {
+  init({ runId, repo, ref, baseSha, manifest, parentId, policyHash, mode = 'active' }) {
+    if (mode !== 'active' && mode !== 'staged') throw new TypeError('a run starts active or staged')
     safeId(runId, 'runId')
     text(repo?.root, 'repo.root')
     text(repo?.commonDir, 'repo.commonDir')
@@ -298,7 +300,7 @@ export class RunStore {
     return this.#transaction(() => {
       if (this.meta()) throw new Error('run already initialized')
       this.#db
-        .prepare("INSERT INTO run VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL)")
+        .prepare('INSERT INTO run VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)')
         .run(
           runId,
           JSON.stringify({ root: repo.root, commonDir: repo.commonDir }),
@@ -308,6 +310,7 @@ export class RunStore {
           parentId,
           policyHash,
           baseSha,
+          mode,
         )
       const insert = this.#db.prepare(
         "INSERT INTO tickets(id, definition, position, status) VALUES (?, ?, ?, 'PENDING')",
@@ -334,6 +337,9 @@ export class RunStore {
     return this.#transaction(() => {
       const run = this.meta()
       if (!run || run.mode === mode || run.mode === 'cancelled') return false
+      // Leaving staged other than by cancel requires approve().
+      if (run.mode === 'staged' && mode !== 'cancelled') return false
+      if (mode === 'staged') return false
       this.#db
         .prepare(
           "UPDATE run SET mode=?, diagnostic=CASE WHEN ?='active' THEN NULL ELSE diagnostic END WHERE singleton=1",
@@ -360,10 +366,44 @@ export class RunStore {
     text(message, 'diagnostic')
     return this.#transaction(() => {
       const run = this.meta()
-      if (!run || run.mode === 'cancelled' || (run.mode === 'paused' && run.diagnostic === message))
+      if (!run || run.mode === 'cancelled' || (run.mode !== 'active' && run.diagnostic === message))
         return false
-      this.#db.prepare("UPDATE run SET mode='paused',diagnostic=? WHERE singleton=1").run(message)
+      // A staged run keeps waiting for approval; it only records the diagnostic.
+      this.#db
+        .prepare("UPDATE run SET mode=CASE WHEN mode='staged' THEN 'staged' ELSE 'paused' END,diagnostic=? WHERE singleton=1")
+        .run(message)
       this.#event('run_blocked', null, message, { previousMode: run.mode }, true)
+      return true
+    })
+  }
+
+  /**
+   * Leave staged for active with the user's per-ticket choices. Each ticket
+   * definition and the stored manifest take the given agent/agentSpec in one
+   * transaction, before any ticket can be claimed.
+   * @param tickets - every ticket definition of the run, with its approved agent fields.
+   * @returns true when the run was staged and is now active.
+   */
+  approve(tickets) {
+    return this.#transaction(() => {
+      const run = this.meta()
+      const ids = run?.manifest.tickets.map((t) => t.id) ?? []
+      if (tickets.length !== ids.length || tickets.some((t, i) => t?.id !== ids[i]))
+        throw new TypeError('approval must list the run ticket set in order')
+      if (run.mode !== 'staged') return false
+      const approved = run.manifest.tickets.map((old, i) => {
+        const { agent, agentSpec, ...rest } = old
+        const next = { ...rest }
+        if (tickets[i].agent !== undefined) next.agent = safeId(tickets[i].agent, old.id + '.agent')
+        if (tickets[i].agentSpec !== undefined) next.agentSpec = record(tickets[i].agentSpec, old.id + '.agentSpec')
+        return next
+      })
+      const update = this.#db.prepare('UPDATE tickets SET definition=? WHERE id=?')
+      for (const t of approved) update.run(JSON.stringify(t), t.id)
+      this.#db
+        .prepare("UPDATE run SET manifest=?, mode='active', diagnostic=NULL WHERE singleton=1")
+        .run(JSON.stringify({ ...run.manifest, tickets: approved }))
+      this.#event('run_approved', null, 'Plan approved by the user; dispatch started', {}, true)
       return true
     })
   }

@@ -121,12 +121,24 @@ export class RunCatalog {
       if (detail)
         selected = {
           ...summary,
+          // The plan review offers the current presets; approval resolves them on the host.
+          ...(attached &&
+            data.mode === 'staged' && {
+              presets: Object.entries(coordinator.agents ?? {}).map(([id, p]) => ({
+                id,
+                description: p?.description ?? '',
+                provider: p?.provider ?? '',
+                model: p?.model ?? '',
+                reasoningEffort: p?.reasoningEffort ?? '',
+              })),
+            }),
           tickets: data.tickets.map((t) => ({
             id: t.id,
             title: t.title,
             status: t.status,
             agent: t.agent ?? null,
             model: t.model ?? null,
+            route: t.route ?? null,
             dependsOn: t.dependsOn,
             attempt: t.attempt,
             path: t.path,
@@ -234,6 +246,49 @@ export function mountModels(ctx, getLlm) {
     requestBody: 'buffered',
     async fetch() {
       return Response.json(await modelCatalog(getLlm()), { headers: noStore })
+    },
+  })
+}
+
+const approvalLimit = 256 * 1024
+
+// The user's decision on a staged plan. Like the dashboard read, the managed
+// dispatcher admits only the owner; the body names the run by its opaque key.
+export function mountApproval(ctx, catalog, coordinator) {
+  ctx.connection.fetch.register({
+    path: '/api/ticket-dag.approve',
+    methods: ['POST'],
+    requestBody: 'buffered',
+    async fetch(request) {
+      let body
+      try {
+        const raw = await request.text()
+        if (raw.length > approvalLimit) throw new Error('too large')
+        body = JSON.parse(raw)
+      } catch {
+        return new Response('Invalid approval request', { status: 400, headers: noStore })
+      }
+      const { key, action, choices } = body ?? {}
+      if (
+        typeof key !== 'string' ||
+        !/^[0-9a-f]{64}$/.test(key) ||
+        !['approve', 'discard'].includes(action) ||
+        (action === 'approve' && !Array.isArray(choices))
+      ) {
+        return new Response('Invalid approval request', { status: 400, headers: noStore })
+      }
+      const entry = catalog.entries().find((row) => row.key === key)
+      if (!entry) return new Response('Unknown run', { status: 404, headers: noStore })
+      if (!coordinator.runs.has(entry.file)) {
+        return new Response('Open the captain conversation of this run first', { status: 409, headers: noStore })
+      }
+      try {
+        const snapshot =
+          action === 'approve' ? await coordinator.approve(entry.file, choices) : await coordinator.discard(entry.file)
+        return Response.json(snapshot, { headers: noStore })
+      } catch (error) {
+        return new Response(displayDiagnostic(error?.message) || 'Approval failed', { status: 409, headers: noStore })
+      }
     },
   })
 }

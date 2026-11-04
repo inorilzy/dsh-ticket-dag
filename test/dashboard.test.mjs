@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
 import { pathToFileURL } from 'node:url'
-import { RunCatalog, mountDashboard, mountModels } from '../src/dashboard.mjs'
+import { RunCatalog, mountApproval, mountDashboard, mountModels } from '../src/dashboard.mjs'
 import { RunStore, normalizeManifest } from '../src/store.mjs'
 
 function addRun(root, name, catalog, at) {
@@ -131,6 +131,54 @@ test('dashboard URL accepts only one opaque key and only supplies a GET route', 
   assert.equal((await get('?key=' + 'a'.repeat(64))).status, 404)
   assert.equal((await get('?parent=session_01:abc-9')).status, 200)
   assert.deepEqual(parents, [null, null, 'session_01:abc-9'])
+})
+
+test('approval route approves or discards only an attached staged run named by its opaque key', async () => {
+  let route
+  const calls = []
+  const key = 'b'.repeat(64)
+  const catalog = { entries: () => [{ key, file: '/runs/a/state.sqlite' }] }
+  const coordinator = {
+    runs: new Map([['/runs/a/state.sqlite', {}]]),
+    async approve(file, choices) {
+      calls.push(['approve', file, choices])
+      return { mode: 'active' }
+    },
+    async discard(file) {
+      calls.push(['discard', file])
+      return { mode: 'cancelled' }
+    },
+  }
+  mountApproval({ connection: { fetch: { register: (r) => (route = r) } } }, catalog, coordinator)
+  assert.equal(route.path, '/api/ticket-dag.approve')
+  assert.deepEqual(route.methods, ['POST'])
+  const post = (body) =>
+    route.fetch(new Request('http://localhost' + route.path, { method: 'POST', body: JSON.stringify(body) }))
+  const choices = [{ id: 'A', agent: 'docs', provider: 'acme', model: 'fast-1', reasoningEffort: '' }]
+  const ok = await post({ key, action: 'approve', choices })
+  assert.equal(ok.status, 200)
+  assert.deepEqual(await ok.json(), { mode: 'active' })
+  assert.equal((await post({ key, action: 'discard' })).status, 200)
+  assert.deepEqual(calls, [
+    ['approve', '/runs/a/state.sqlite', choices],
+    ['discard', '/runs/a/state.sqlite'],
+  ])
+  assert.equal((await post({ key: 'c'.repeat(64), action: 'approve', choices })).status, 404)
+  assert.equal((await post({ key: '../x', action: 'approve', choices })).status, 400)
+  assert.equal((await post({ key, action: 'launch' })).status, 400)
+  assert.equal(
+    (await route.fetch(new Request('http://localhost' + route.path, { method: 'POST', body: '{' }))).status,
+    400,
+  )
+  coordinator.runs.clear()
+  assert.equal((await post({ key, action: 'approve', choices })).status, 409)
+  coordinator.runs.set('/runs/a/state.sqlite', {})
+  coordinator.approve = async () => {
+    throw Error('This run is not waiting for approval')
+  }
+  const refused = await post({ key, action: 'approve', choices })
+  assert.equal(refused.status, 409)
+  assert.match(await refused.text(), /not waiting for approval/)
 })
 
 test('model catalog route lists every provider, its models and efforts, and reports a failing provider', async () => {

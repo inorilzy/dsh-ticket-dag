@@ -4,7 +4,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { builtinAgents } from './agents.mjs'
 import { Coordinator } from './coordinator.mjs'
-import { RunCatalog, mountDashboard, mountModels } from './dashboard.mjs'
+import { RunCatalog, mountApproval, mountDashboard, mountModels } from './dashboard.mjs'
 
 export const name = 'dsh-ticket-dag'
 export const inject = [
@@ -35,6 +35,7 @@ export const Config = z.object({
     )
     .default(builtinAgents)
     .volatile(),
+  requireApproval: z.boolean().default(true).volatile(),
   maxWorkers: z.natural().min(1).max(32).default(16).volatile(),
   checkTimeoutMs: z.natural().min(1).max(2_147_483_647).default(120000).volatile(),
 })
@@ -94,6 +95,7 @@ export function apply(ctx, config = {}) {
   const settings = () => ({
     checks: setting(config.checks, {}),
     agents: setting(config.agents, builtinAgents),
+    requireApproval: setting(config.requireApproval, true),
     maxWorkers: setting(config.maxWorkers, 16),
     checkTimeoutMs: setting(config.checkTimeoutMs, 120000),
   })
@@ -196,6 +198,7 @@ export function apply(ctx, config = {}) {
   const coordinator = new Coordinator({ launch, notify, canRetry, rememberRun, ...settings() })
   ctx.inject?.(['connection'], (scope) => {
     mountDashboard(scope, catalog, coordinator)
+    mountApproval(scope, catalog, coordinator)
     mountModels(scope, () => ctx.get('llm'))
   })
   ctx.on('loader/volatile-update', () => coordinator.updateSettings(settings()))
@@ -300,7 +303,7 @@ export function apply(ctx, config = {}) {
 
   register(
     'run',
-    'Start the approved spec manifest and return its runId. Reusing a runId with the same manifest is idempotent. Only trusted host check IDs are supported. A ticket may set agent to a configured agent preset ID (for example implementer, test-writer or docs) to give its worker that role and model; omit it for the default worker.',
+    'Start the approved spec manifest and return its runId. Reusing a runId with the same manifest is idempotent. Only trusted host check IDs are supported. A ticket may set agent to a configured agent preset ID (for example implementer, test-writer or docs) to give its worker that role and model; omit it for the default worker. When the result mode is staged, nothing has started: the user reviews each ticket preset and model in the 工单进度 sidebar and approves or discards the plan there. Tell the user that and end the turn; you are notified once it is approved. dag_resume cannot start a staged run.',
     {
       manifest: { type: 'json', required: true, description: 'Ticket DAG manifest object or JSON string.' },
       runId: {

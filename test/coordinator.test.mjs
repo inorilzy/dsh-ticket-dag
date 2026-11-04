@@ -477,6 +477,88 @@ test(
 )
 
 test(
+  'with approval required a run waits staged; the user approval sets each ticket preset and model, then dispatch starts',
+  { timeout: 120000 },
+  async (t) => {
+    const cwd = await repo(t)
+    const jobs = []
+    const co = new Coordinator({
+      checks: noopChecks,
+      requireApproval: true,
+      agents: {
+        docs: { instructions: 'Docs only.', provider: 'acme', model: 'fast-1' },
+        impl: { instructions: 'Implement.' },
+      },
+      launch: async (job) => {
+        jobs.push(job)
+        return {
+          dispose: async () => {},
+          result: (async () => {
+            await commit(job)
+            return { ok: true }
+          })(),
+        }
+      },
+    })
+    const q = { cwd, parentId: 'captain', runId: 'staged' }
+    try {
+      const started = await co.start({
+        ...q,
+        manifest: { spec_id: 'staged', tickets: [{ ...ticket('A'), agent: 'docs' }, ticket('B', ['A'])] },
+      })
+      assert.equal(started.mode, 'staged')
+      await sleep(400)
+      assert.equal(jobs.length, 0, 'nothing is dispatched before approval')
+      await assert.rejects(co.resume(q), /approv/)
+      await co.pause(q)
+      assert.equal((await co.status(q)).mode, 'staged')
+      const [file] = co.runs.keys()
+      await assert.rejects(co.approve(file, [{ id: 'A', agent: 'ghost' }]), /unknown agent preset/)
+      await assert.rejects(co.approve(file, [{ id: 'A', agent: 'docs', provider: 'acme' }]), /without a model/)
+      const approved = await co.approve(file, [
+        { id: 'A', agent: 'docs', provider: 'acme', model: 'deep-2', reasoningEffort: 'high' },
+        { id: 'B', agent: 'impl', provider: '', model: '', reasoningEffort: '' },
+      ])
+      assert.equal(approved.mode, 'active')
+      await until(async () => (await co.status(q)).complete, 'approved run integrates', 60000)
+      const byId = Object.fromEntries(jobs.map((j) => [j.ticketId, j]))
+      assert.deepEqual(byId.A.agentOptions, { provider: 'acme', model: 'deep-2', reasoningEffort: 'high' })
+      assert.match(byId.A.prompt, /Role \(docs\): Docs only\./)
+      assert.equal(byId.B.agentOptions, undefined)
+      assert.match(byId.B.prompt, /Role \(impl\): Implement\./)
+      await assert.rejects(co.approve(file, []), /not waiting for approval/)
+    } finally {
+      await co.close()
+    }
+  },
+)
+
+test('a staged run can be discarded from the board without dispatching anything', { timeout: 60000 }, async (t) => {
+  const cwd = await repo(t)
+  let launched = 0
+  const co = new Coordinator({
+    checks: noopChecks,
+    requireApproval: true,
+    launch: async () => {
+      launched++
+      throw Error('unexpected launch')
+    },
+  })
+  const q = { cwd, parentId: 'captain', runId: 'discard' }
+  try {
+    await co.start({ ...q, manifest: { spec_id: 'discard', tickets: [ticket('A')] } })
+    const [file] = co.runs.keys()
+    const after = await co.discard(file)
+    assert.equal(after.mode, 'cancelled')
+    assert.equal(after.tickets[0].status, 'CANCELLED')
+    await sleep(300)
+    assert.equal(launched, 0)
+  } finally {
+    await co.close()
+  }
+})
+
+test(
   'status identifies a running worker and the exact cumulative check being executed',
   { timeout: 20000 },
   async (t) => {

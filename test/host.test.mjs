@@ -198,6 +198,8 @@ test('local child launch uses a worktree and caller-delivered completion, drains
 
 test('built-in agent presets are the default; profile presets replace them; a preset model reaches the child', async () => {
   assert.deepEqual(Object.keys(harness().api.agents), ['implementer', 'test-writer', 'docs'])
+  assert.equal(harness().api.requireApproval, true, 'runs wait for the user by default')
+  assert.equal(harness({ requireApproval: false }).api.requireApproval, false)
   const agents = { reviewer: { instructions: 'Review only.', model: 'fast-1', provider: 'acme' } }
   const h = harness({ agents })
   assert.deepEqual(h.api.agents, agents)
