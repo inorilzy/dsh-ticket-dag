@@ -275,6 +275,30 @@ test('cold history exposes each ticket agent preset and model route', (t) => {
   }
 })
 
+test('every snapshot mode carries the presets so the progress board can name members', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'dag-presets-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const catalog = new RunCatalog(join(root, 'profile'))
+  const { db, file } = addRun(root, 'repo', catalog, 1)
+  const agents = { docs: { name: '文档员', description: '文档', instructions: 'Docs.', provider: 'acme', model: 'fast-1' } }
+  const docs = { id: 'docs', name: '文档员', description: '文档', provider: 'acme', model: 'fast-1', reasoningEffort: '' }
+  try {
+    const cold = { maxWorkers: 16, runs: new Map(), agents }
+    const active = catalog.read(cold, null).selected
+    assert.equal(active.mode, 'active')
+    assert.deepEqual(active.presets, [docs])
+    const attached = {
+      ...cold,
+      runs: new Map([[file, {}]]),
+      peek: () => ({ mode: 'paused', complete: false, counts: {}, tickets: [] }),
+    }
+    assert.deepEqual(catalog.read(attached, null).selected.presets, [docs])
+    assert.deepEqual(catalog.read({ maxWorkers: 16, runs: new Map() }, null).selected.presets, [])
+  } finally {
+    db.close()
+  }
+})
+
 test(
   'the installed DSH dispatcher rejects a non-owner before serving any dashboard data',
   {
