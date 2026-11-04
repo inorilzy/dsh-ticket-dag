@@ -379,8 +379,10 @@ export class RunStore {
 
   /**
    * Leave staged for active with the user's per-ticket choices. Each ticket
-   * definition and the stored manifest take the given agent/agentSpec in one
-   * transaction, before any ticket can be claimed.
+   * definition row takes the given agent/agentSpec in one transaction, before
+   * any ticket can be claimed. The run manifest keeps the submitted plan, so
+   * dag_run with the original manifest stays idempotent; dispatch, snapshots
+   * and the board read the approved ticket definitions.
    * @param tickets - every ticket definition of the run, with its approved agent fields.
    * @returns true when the run was staged and is now active.
    */
@@ -400,9 +402,7 @@ export class RunStore {
       })
       const update = this.#db.prepare('UPDATE tickets SET definition=? WHERE id=?')
       for (const t of approved) update.run(JSON.stringify(t), t.id)
-      this.#db
-        .prepare("UPDATE run SET manifest=?, mode='active', diagnostic=NULL WHERE singleton=1")
-        .run(JSON.stringify({ ...run.manifest, tickets: approved }))
+      this.#db.prepare("UPDATE run SET mode='active', diagnostic=NULL WHERE singleton=1").run()
       this.#event('run_approved', null, 'Plan approved by the user; dispatch started', {}, true)
       return true
     })
