@@ -72,6 +72,10 @@ test('dashboard history survives restart, separates projects, and never attaches
     assert.equal(first.db.get('A').lease, job.lease)
     assert.equal(first.db.events().length, initialEvents)
     assert.deepEqual(new RunCatalog(join(root, 'other-profile')).read(cold, null).runs, [])
+    const routes = { 'captain-repo-1': { provider: 'magpie', model: 'auto/claude-opus-5-5', maxTokens: 9 } }
+    const withCaptain = restored.read(cold, keys.get('repo-1'), null, (id) => routes[id])
+    assert.deepEqual(withCaptain.selected.captain, { provider: 'magpie', model: 'auto/claude-opus-5-5' })
+    assert.equal(restored.read(cold, keys.get('repo-2'), null, (id) => routes[id]).selected.captain, null)
     const own = restored.read(cold, null, 'captain-repo-1')
     assert.deepEqual(own.runs.map((r) => r.repoName), ['repo-1'])
     assert.equal(own.selected.repoName, 'repo-1')

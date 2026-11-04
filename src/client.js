@@ -136,6 +136,12 @@ window.__ModuleLoader__.load({
 .dtd-preset-row {display:flex;flex-wrap:wrap;align-items:center;gap:.3rem .8rem}
 .dtd-panel label.dtd-check {display:flex;align-items:flex-start;gap:.6rem}.dtd-panel label.dtd-check input {width:auto;margin-top:.3rem}
 .dtd-check span {display:grid;gap:.15rem}
+.dtd-panel .dtd-ticket-head input[type=checkbox] {width:auto;margin:0}
+.dtd-avatar {position:relative;display:inline-flex;flex:none;border-radius:50%}
+.dtd-avatar-tag {position:absolute;right:-.25rem;bottom:-.2rem;min-width:1rem;padding:0 .18rem;border-radius:.4rem;font-size:.58rem;line-height:.9rem;font-weight:700;color:#fff;text-align:center;border:1px solid color-mix(in srgb,Canvas 60%,transparent)}
+.dtd-captain {display:flex;flex-direction:row;align-items:center;gap:.8rem}
+.dtd-captain-text {display:flex;flex-wrap:wrap;align-items:baseline;gap:.25rem .7rem}
+.dtd-bulk {gap:.6rem}
 [data-dag-plan] select {width:100%}
 .dtd-preset-row .dtd-actions {margin-inline-start:auto}
 .dtd-preset-meta {font-size:.83rem;background:color-mix(in srgb,currentColor 7%,transparent);border-radius:.35rem;padding:.1rem .45rem}
@@ -778,7 +784,10 @@ window.__ModuleLoader__.load({
     const chatButton = (ticket, open) =>
       open && ticket.childId && button('查看对话', () => open(ticket.childId), { title: '打开这个工单子会话的对话记录' })
 
-    function Ticket({ ticket, view, open }) {
+    // A ticket row knows its model as "provider/model"; the vendor match reads the whole string.
+    const ticketRoute = (ticket, captain) => (ticket.model ? { model: ticket.model } : captain)
+
+    function Ticket({ ticket, view, open, captain }) {
       const { id, title, status, dependsOn, attempt, retryAt, message } = ticket
       const info = [
         ['子会话', ticket.childId],
@@ -795,6 +804,7 @@ window.__ModuleLoader__.load({
           'div',
           { className: 'dtd-ticket-head', 'data-tone': view.tone },
           h('span', { className: 'dtd-dot' }),
+          h(Avatar, { route: ticketRoute(ticket, captain), size: 22 }),
           h('strong', null, id),
           title && title !== id && h('span', null, title),
           h('span', { className: 'dtd-badge ' + view.tone }, view.label),
@@ -893,7 +903,9 @@ window.__ModuleLoader__.load({
           ? h(
               'ul',
               { className: 'dtd-tickets', key: 'list' },
-              ...visible.map(({ ticket, view }) => h(Ticket, { key: ticket.id, ticket, view, open })),
+              ...visible.map(({ ticket, view }) =>
+                h(Ticket, { key: ticket.id, ticket, view, open, captain: run.captain }),
+              ),
             )
           : h('p', { className: 'dtd-hint', key: 'list' }, '当前没有符合筛选条件的工单。'))
       const mapFold = h(
@@ -910,10 +922,12 @@ window.__ModuleLoader__.load({
           pinned ? '已固定 ' + pinned + ' · 再次点击取消' : '从左到右：上游合入后解锁 · 点击查看详情',
         ),
       )
-      const mapBody = mapOpen && h(DependencyMap, { key: 'map', rows, pinned, setPinned, open })
+      const mapBody =
+        mapOpen && h(DependencyMap, { key: 'map', rows, pinned, setPinned, open, captain: run.captain })
       return h(
         'section',
         { className: 'dtd-section', 'aria-label': '运行详情' },
+        h(CaptainCard, { run }),
         h(
           'div',
           { className: 'dtd-card' },
@@ -1050,7 +1064,7 @@ window.__ModuleLoader__.load({
       return new Set([...up, ...down])
     }
 
-    function DependencyMap({ rows, pinned, setPinned, open }) {
+    function DependencyMap({ rows, pinned, setPinned, open, captain }) {
       if (!rows.length) return null
       const tickets = rows.map((r) => r.ticket)
       const layout = dagLayout(tickets)
@@ -1076,6 +1090,7 @@ window.__ModuleLoader__.load({
               ...layout.edges.map((e) =>
                 h('path', {
                   key: e.from + '>' + e.to,
+                  'data-dag-edge': e.from + '>' + e.to,
                   d: e.d,
                   'data-active': chain.has(e.from) && chain.has(e.to),
                 }),
@@ -1109,6 +1124,7 @@ window.__ModuleLoader__.load({
                   'span',
                   { className: 'dtd-node-head', 'data-tone': view.tone },
                   h('span', { className: 'dtd-dot' }),
+                  h(Avatar, { route: ticketRoute(ticket, captain), size: 16 }),
                   ticket.id,
                   h('small', null, ticket.agent || view.label),
                 ),
@@ -1187,6 +1203,65 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // Vendor of a model route, recognised from the provider and model names.
+    // Order matters: a routed name such as magpie/auto/claude-opus resolves by its model.
+    const vendors = [
+      ['deepseek', 'DeepSeek', /deepseek/, '#4d6bfe', 'DS'],
+      ['claude', 'Claude', /claude|anthropic/, '#d97757', 'C'],
+      ['gemini', 'Gemini', /gemini|google|vertex/, '#1a73e8', 'G'],
+      ['grok', 'Grok', /grok|\bxai\b|x-ai/, '#3a3a3c', 'X'],
+      ['gpt', 'GPT', /\bgpt|openai|chatgpt|\bo[134]\b/, '#10a37f', 'AI'],
+      ['qwen', 'Qwen', /qwen|tongyi|dashscope/, '#615ced', 'Q'],
+      ['kimi', 'Kimi', /kimi|moonshot/, '#16191d', 'K'],
+      ['glm', 'GLM', /glm|zhipu/, '#3b5bdb', 'GL'],
+    ]
+    const genericVendor = ['generic', '通用模型', null, '#6b7280', '?']
+    function vendorOf(provider, model) {
+      const name = ((model || '') + ' ' + (provider || '')).toLowerCase()
+      return (model && vendors.find(([, , pattern]) => pattern.test(name))) || genericVendor
+    }
+
+    // An original figure in the vendor colour with a short tag; not a vendor logo.
+    function Avatar({ route, size = 28 }) {
+      const [id, name, , color, tag] = vendorOf(route?.provider, route?.model)
+      return h(
+        'span',
+        { className: 'dtd-avatar', 'data-dag-avatar': id, title: name, style: { width: size, height: size } },
+        h(
+          'svg',
+          { viewBox: '0 0 32 32', width: size, height: size, 'aria-hidden': true },
+          h('circle', { cx: 16, cy: 16, r: 16, fill: color }),
+          h('circle', { cx: 16, cy: 12.5, r: 5.5, fill: '#fff', fillOpacity: 0.92 }),
+          h('path', { d: 'M6.5 27.5c1.3-5.8 5.1-8.8 9.5-8.8s8.2 3 9.5 8.8z', fill: '#fff', fillOpacity: 0.92 }),
+        ),
+        h('span', { className: 'dtd-avatar-tag', style: { background: color } }, tag),
+      )
+    }
+
+    // The captain is the conversation that called dag_run; it plans, submits and is notified.
+    function CaptainCard({ run }) {
+      const route = run.captain
+      return h(
+        'div',
+        { className: 'dtd-card dtd-captain', 'data-dag-captain': '' },
+        h(Avatar, { route, size: 36 }),
+        h(
+          'div',
+          { className: 'dtd-captain-text' },
+          h('strong', null, '队长'),
+          h('span', { className: 'dtd-hint' }, '当前对话 · 拆解 · 派发 · 汇总'),
+          h(
+            'span',
+            { className: 'dtd-preset-meta' },
+            route ? [route.provider, route.model].filter(Boolean).join('/') : '对话未打开，模型未知',
+          ),
+        ),
+      )
+    }
+
+    // A ticket on the host default runs on the captain's route.
+    const effectiveRoute = (route, captain) => (route?.model ? route : captain)
+
     // A staged run waits for the user. Every ticket shows its planned preset and
     // model; the user may change both, then approve (dispatch starts) or discard.
     function PlanReview({ run, refresh }) {
@@ -1196,6 +1271,9 @@ window.__ModuleLoader__.load({
       const [error, setError] = useState('')
       const [pinned, setPinned] = useState(null)
       const [confirmDiscard, setConfirmDiscard] = useState(false)
+      // Tickets selected for a bulk model change, and the model to apply to them.
+      const [checked, setChecked] = useState(() => new Set())
+      const [bulk, setBulk] = useState(() => ({ provider: '', model: '', reasoningEffort: '' }))
       useEffect(() => {
         const ctrl = new AbortController()
         fetch('api/ticket-dag.models', { signal: ctrl.signal, cache: 'no-store' })
@@ -1259,6 +1337,20 @@ window.__ModuleLoader__.load({
           action: 'approve',
           choices: run.tickets.map((t) => ({ id: t.id, ...current[t.id] })),
         })
+      const ids = run.tickets.map((t) => t.id)
+      const allChecked = ids.length > 0 && ids.every((id) => checked.has(id))
+      const toggle = (id) =>
+        setChecked((old) => {
+          const next = new Set(old)
+          if (!next.delete(id)) next.add(id)
+          return next
+        })
+      const applyBulk = () =>
+        setChoices((old) => {
+          const next = structuredClone(old ?? planned)
+          for (const id of checked) Object.assign(next[id], bulk)
+          return next
+        })
       return h(
         'section',
         { className: 'dtd-section', 'data-dag-review': '', 'aria-label': '执行前计划审查' },
@@ -1278,9 +1370,41 @@ window.__ModuleLoader__.load({
             '工单尚未派出。确认每张工单用哪个预设和模型，再点“确认并启动”。要修改工单内容，请回到对话告诉队长，再重新提交。',
           ),
         ),
+        h(CaptainCard, { run }),
         run.attached === false &&
           h('p', { className: 'dtd-alert', role: 'status' }, '这轮计划的队长对话当前未打开。请先打开发起它的对话，再在这里确认。'),
         catalog?.error && h('p', { className: 'dtd-alert', role: 'status' }, '模型列表暂不可用，仍可保留预设里的模型。'),
+        h(
+          'div',
+          { className: 'dtd-card dtd-bulk' },
+          h(
+            'label',
+            { className: 'dtd-check' },
+            h('input', {
+              type: 'checkbox',
+              'aria-label': '全选工单',
+              checked: allChecked,
+              disabled: busy,
+              onChange: (e) => setChecked(e.target.checked ? new Set(ids) : new Set()),
+            }),
+            h('span', null, h('strong', null, '全选'), h('small', null, '勾选工单后，给它们统一指定模型')),
+          ),
+          h(ModelPicker, {
+            agent: { id: '批量', ...bulk },
+            catalog: catalog?.error ? null : catalog,
+            modify: (fn) =>
+              setBulk((old) => {
+                const next = { ...old }
+                fn(next)
+                return next
+              }),
+          }),
+          h(
+            'div',
+            { className: 'dtd-actions' },
+            button('应用到选中的 ' + checked.size + ' 张工单', applyBulk, { disabled: busy || checked.size === 0 }),
+          ),
+        ),
         h(
           'ul',
           { className: 'dtd-tickets' },
@@ -1292,6 +1416,14 @@ window.__ModuleLoader__.load({
               h(
                 'div',
                 { className: 'dtd-ticket-head' },
+                h('input', {
+                  type: 'checkbox',
+                  'aria-label': '选择 ' + t.id,
+                  checked: checked.has(t.id),
+                  disabled: busy,
+                  onChange: () => toggle(t.id),
+                }),
+                h(Avatar, { route: effectiveRoute(c, run.captain), size: 24 }),
                 h('strong', null, t.id),
                 t.title && t.title !== t.id && h('span', null, t.title),
                 h('span', { className: 'dtd-hint' }, t.dependsOn.length ? '等待 ' + t.dependsOn.join('、') : '无依赖'),

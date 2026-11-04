@@ -44,15 +44,21 @@ function loadHost(seeds, { expanded = false, config = { status: 'loading' } } = 
     clearTimeout: () => {},
     AbortController,
     URLSearchParams,
+    structuredClone,
   })
   const queue = [...seeds]
+  // Every state update is recorded so a test can inspect what an interaction would set.
+  const sets = []
   const react = {
     createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat() }),
-    useState: (init) => [queue.length ? queue.shift() : typeof init === 'function' ? init() : init, () => {}],
+    useState: (init) => [
+      queue.length ? queue.shift() : typeof init === 'function' ? init() : init,
+      (value) => sets.push(value),
+    ],
     useRef: (current) => ({ current }),
     useEffect: (fn) => void fn(),
   }
-  const host = { tabs: [], opened: [], slots: {}, urls, posts, injected: [], namespaces: [], saved: [], sessions: [] }
+  const host = { tabs: [], opened: [], slots: {}, urls, posts, sets, injected: [], namespaces: [], saved: [], sessions: [] }
   const slots = {
     inject: (_, fn) => fn(),
     register: (meta, component) => (host.slots[meta.name] = { meta, component }),
@@ -185,7 +191,7 @@ test('dependency map lays tickets out left to right by depth with one edge per d
   assert.equal(nodes.A.props['data-tone'], 'done')
   assert.equal(nodes.C.props['data-tone'], 'work')
   assert.equal(nodes.B.props['data-tone'], 'wait')
-  assert.equal(findAll(map, (n) => n.type === 'path').length, 2)
+  assert.equal(findAll(map, (n) => n.props['data-dag-edge'] !== undefined).length, 2)
 })
 
 test('ticket detail defaults to the most urgent ticket and names its neighbours', () => {
@@ -216,7 +222,7 @@ test('focusing a ticket highlights its whole upstream and downstream chain and d
     findAll(map, (n) => n.props['data-dag-node'] !== undefined).map((n) => [n.props['data-dag-node'], n.props['data-dim']]),
   )
   assert.deepEqual(dim, { A: false, B: false, C: false, X: true })
-  const active = findAll(map, (n) => n.type === 'path').map((p) => p.props['data-active'])
+  const active = findAll(map, (n) => n.props['data-dag-edge'] !== undefined).map((p) => p.props['data-active'])
   assert.deepEqual(active, [true, true])
 })
 
@@ -430,6 +436,107 @@ test('a staged run shows the plan review: per-ticket preset and model, then appr
     ],
   ])
   assert.ok(find(review, (n) => n.type === 'button' && text(n) === '放弃本次计划'))
+})
+
+function stagedRun(tickets) {
+  return {
+    key: 'k'.repeat(64),
+    runId: 'plan',
+    parentId: 'session-captain',
+    mode: 'staged',
+    attached: true,
+    total: tickets.length,
+    counts: { PENDING: tickets.length },
+    captain: { provider: 'magpie', model: 'auto/claude-opus-5-5' },
+    presets: [],
+    tickets: tickets.map(([id, provider, model]) => ({
+      id,
+      title: id,
+      status: 'PENDING',
+      dependsOn: [],
+      attempt: 0,
+      agent: null,
+      route: { provider, model, reasoningEffort: '' },
+    })),
+  }
+}
+
+test('the board shows the captain and a vendor avatar per ticket, generic when unknown', () => {
+  const selected = stagedRun([
+    ['A', 'deepseek-official', 'deepseek-v4-pro'],
+    ['B', '', ''],
+    ['C', 'xai', 'grok-4'],
+    ['D', 'google', 'gemini-2.5-pro'],
+    ['E', 'openai', 'gpt-5'],
+    ['F', 'local', 'llama-3'],
+  ])
+  const host = loadHost([{ runs: [selected], selected }, selected.key])
+  const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  const captain = find(pane, (n) => n.props['data-dag-captain'] !== undefined)
+  assert.match(text(captain), /队长/)
+  assert.match(text(captain), /当前对话/)
+  assert.match(text(captain), /magpie\/auto\/claude-opus-5-5/)
+  assert.equal(find(captain, (n) => n.props['data-dag-avatar'] !== undefined).props['data-dag-avatar'], 'claude')
+  const vendor = (id) =>
+    find(find(pane, (n) => n.props['data-dag-plan'] === id), (n) => n.props['data-dag-avatar'] !== undefined).props[
+      'data-dag-avatar'
+    ]
+  assert.deepEqual(
+    ['A', 'B', 'C', 'D', 'E', 'F'].map(vendor),
+    ['deepseek', 'claude', 'grok', 'gemini', 'gpt', 'generic'],
+    'a ticket on the host default inherits the captain model',
+  )
+})
+
+test('the progress board also shows the captain, and avatars on ticket rows and map nodes', () => {
+  const selected = {
+    ...stagedRun([]),
+    mode: 'active',
+    total: 2,
+    counts: { RUNNING: 1, PENDING: 1 },
+    tickets: [
+      { id: 'A', title: 'A', status: 'RUNNING', dependsOn: [], attempt: 1, agent: 'docs', model: 'xai/grok-4', livePhase: { stage: 'agent' } },
+      { id: 'B', title: 'B', status: 'PENDING', dependsOn: ['A'], attempt: 0, agent: null, model: null },
+    ],
+  }
+  const host = loadHost([{ runs: [selected], selected }, selected.key])
+  const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  assert.ok(find(pane, (n) => n.props['data-dag-captain'] !== undefined))
+  const avatar = (node) => find(node, (n) => n.props['data-dag-avatar'] !== undefined)?.props['data-dag-avatar']
+  assert.equal(avatar(find(pane, (n) => n.props['data-dag-ticket'] === 'A')), 'grok')
+  assert.equal(avatar(find(pane, (n) => n.props['data-dag-ticket'] === 'B')), 'claude')
+  assert.equal(avatar(find(pane, (n) => n.props['data-dag-node'] === 'A')), 'grok')
+})
+
+test('plan review: select all or some tickets and apply one model to them at once', () => {
+  const selected = stagedRun([
+    ['A', '', ''],
+    ['B', 'acme', 'fast-1'],
+    ['C', '', ''],
+  ])
+  const bulk = { provider: 'acme', model: 'deep-2', reasoningEffort: 'high' }
+  // Dashboard: data, selectedKey, error, lastRead; PlanReview: choices, catalog, busy,
+  // error, pinned, confirmDiscard, checked, bulk route.
+  const seeds = [{ runs: [selected], selected }, selected.key, '', null, null, null, false, '', null, false]
+  const host = loadHost([...seeds, new Set(['A', 'C']), bulk])
+  const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  const all = find(pane, (n) => n.props['aria-label'] === '全选工单')
+  assert.equal(all.props.type, 'checkbox')
+  assert.equal(all.props.checked, false)
+  assert.equal(find(pane, (n) => n.props['aria-label'] === '选择 A').props.checked, true)
+  assert.equal(find(pane, (n) => n.props['aria-label'] === '选择 B').props.checked, false)
+  assert.ok(find(pane, (n) => n.props['aria-label'] === '批量 的模型'))
+
+  host.sets.length = 0
+  find(pane, (n) => n.type === 'button' && text(n) === '应用到选中的 2 张工单').props.onClick()
+  const next = host.sets.find((v) => typeof v === 'function')(null)
+  assert.deepEqual(next.A, { agent: '', ...bulk })
+  assert.deepEqual(next.C, { agent: '', ...bulk })
+  assert.deepEqual(next.B, { agent: '', provider: 'acme', model: 'fast-1', reasoningEffort: '' })
+
+  host.sets.length = 0
+  all.props.onChange({ target: { checked: true } })
+  assert.deepEqual([...host.sets[0]], ['A', 'B', 'C'])
 })
 
 test('settings carry the approval switch, on by default', () => {

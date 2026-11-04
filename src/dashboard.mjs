@@ -80,8 +80,9 @@ export class RunCatalog {
     return [...known.values()].sort((a, b) => b.createdAt - a.createdAt || a.key.localeCompare(b.key))
   }
 
-  // parent limits the view to runs started by that captain session.
-  read(coordinator, key, parent = null) {
+  // parent limits the view to runs started by that captain session. captainOf
+  // returns a loaded captain's model route; unloaded captains show none.
+  read(coordinator, key, parent = null, captainOf = () => undefined) {
     const known = this.entries().filter((entry) => parent === null || entry.parentId === parent)
     if (key && !known.some((entry) => entry.key === key)) return null
     const selectedKey = key ?? known[0]?.key
@@ -118,9 +119,11 @@ export class RunCatalog {
         maxWorkers: data.maxWorkers ?? null,
         diagnostic: displayDiagnostic(data.diagnostic),
       }
+      const route = detail ? captainOf(entry.parentId) : undefined
       if (detail)
         selected = {
           ...summary,
+          captain: route?.model ? { provider: route.provider ?? '', model: route.model } : null,
           // The plan review offers the current presets; approval resolves them on the host.
           ...(attached &&
             data.mode === 'staged' && {
@@ -295,7 +298,7 @@ export function mountApproval(ctx, catalog, coordinator) {
 
 // The managed Connection exact-route dispatcher rejects non-owner Peers before
 // invoking this handler, including in Desktop's transport. No public web route.
-export function mountDashboard(ctx, catalog, coordinator) {
+export function mountDashboard(ctx, catalog, coordinator, captainOf) {
   ctx.connection.fetch.register({
     path: route,
     methods: ['GET'],
@@ -314,7 +317,7 @@ export function mountDashboard(ctx, catalog, coordinator) {
         return new Response('Invalid run key', { status: 400, headers: noStore })
       }
       try {
-        const view = catalog.read(coordinator, key, parent)
+        const view = catalog.read(coordinator, key, parent, captainOf)
         return view
           ? Response.json(view, { headers: noStore })
           : new Response('Unknown run', { status: 404, headers: noStore })

@@ -197,7 +197,8 @@ export function apply(ctx, config = {}) {
   }
   const coordinator = new Coordinator({ launch, notify, canRetry, rememberRun, ...settings() })
   ctx.inject?.(['connection'], (scope) => {
-    mountDashboard(scope, catalog, coordinator)
+    // A ticket without its own model inherits the captain's route, so the board shows it.
+    mountDashboard(scope, catalog, coordinator, (parentId) => ctx.agents.get(parentId)?.options)
     mountApproval(scope, catalog, coordinator)
     mountModels(scope, () => ctx.get('llm'))
   })
