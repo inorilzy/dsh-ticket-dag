@@ -36,6 +36,7 @@ window.__ModuleLoader__.load({
         provider: '',
         model: '',
         reasoningEffort: '',
+        maxConcurrent: 0,
       },
       'test-writer': {
         description: '测试编写者：只补测试与测试夹具',
@@ -44,6 +45,7 @@ window.__ModuleLoader__.load({
         provider: '',
         model: '',
         reasoningEffort: '',
+        maxConcurrent: 0,
       },
       docs: {
         description: '文档编写者：只改文档与注释',
@@ -52,12 +54,14 @@ window.__ModuleLoader__.load({
         provider: '',
         model: '',
         reasoningEffort: '',
+        maxConcurrent: 0,
       },
     }
     const agentFields = ['description', 'instructions', 'provider', 'model', 'reasoningEffort']
     const agentRow = (id, preset) => ({
       id,
       ...Object.fromEntries(agentFields.map((f) => [f, preset?.[f] ?? ''])),
+      maxConcurrent: String(preset?.maxConcurrent ?? 0),
     })
 
     const styles = `
@@ -151,7 +155,10 @@ window.__ModuleLoader__.load({
       for (const [i, { id, ...preset }] of rows.entries()) {
         if (!validId(id)) throw new Error('第 ' + (i + 1) + ' 个预设 Agent 的 ID 无效。请使用以字母或数字开头的短标识，例如 test-writer。')
         if (Object.hasOwn(agents, id)) throw new Error('预设 Agent ID 重复：' + id)
-        agents[id] = preset
+        const cap = Number(preset.maxConcurrent)
+        if (!/^\d+$/.test(preset.maxConcurrent) || cap > 32)
+          throw new Error(id + ' 的同时运行上限须为 0 到 32 之间的整数，0 表示不单独限制。')
+        agents[id] = { ...preset, maxConcurrent: cap }
       }
       return agents
     }
@@ -406,10 +413,31 @@ window.__ModuleLoader__.load({
           h('small', null, '会写进使用该预设的工单提示词。'),
         ),
         h(ModelPicker, { agent, catalog, modify }),
+        h(
+          'label',
+          null,
+          h('span', null, '同时运行上限'),
+          h('input', {
+            'aria-label': (agent.id || '未命名') + ' 的同时运行上限',
+            type: 'number',
+            min: 0,
+            max: 32,
+            step: 1,
+            value: agent.maxConcurrent,
+            onChange: (e) =>
+              modify((a) => {
+                a.maxConcurrent = e.target.value
+              }),
+          }),
+          h('small', null, '用这个预设的工单最多同时跑几个。0 表示不单独限制，只受最大 Agent 数量约束。修改后立即用于后续派工。'),
+        ),
       )
     }
 
-    function Editor({ form }) {
+    // scope 'agents' is the plugin-page Agent preset view: the overall agent
+    // limit and the presets only. Hidden fields are never written.
+    function Editor({ form, scope = 'all' }) {
+      const agentsOnly = scope === 'agents'
       const [edit, setEdit] = useState(null)
       const [notice, setNotice] = useState(null)
       const [busy, setBusy] = useState(false)
@@ -469,11 +497,13 @@ window.__ModuleLoader__.load({
         h(
           'section',
           { className: 'dtd-section' },
-          h('h3', null, '工单调度配置'),
+          h('h3', null, agentsOnly ? 'Agent 预设' : '工单调度配置'),
           h(
             'p',
             { className: 'dtd-hint' },
-            '这些设置保存在当前 DSH profile 中。每轮任务仍可在工单清单里指定更低的并发数。',
+            agentsOnly
+              ? '设置最多能同时创建几个 Agent、有哪些预设、每个预设用什么模型和最多同时跑几个。保存在当前 DSH profile 中；验收命令在插件详情的“配置”里设置。'
+              : '这些设置保存在当前 DSH profile 中。每轮任务仍可在工单清单里指定更低的并发数。',
           ),
         ),
         !writable && h('p', { className: 'dtd-alert', role: 'status' }, '当前配置只读。'),
@@ -490,15 +520,18 @@ window.__ModuleLoader__.load({
             'div',
             { className: 'dtd-grid' },
             numeric(
-              '最大并发工单数',
+              agentsOnly ? '最大 Agent 数量' : '最大并发工单数',
               draft.maxWorkers,
               (v) =>
                 change((d) => {
                   d.maxWorkers = v
                 }),
-              '可设 1–32。实际并发还受 DSH 子智能体上限限制。',
+              agentsOnly
+                ? '所有运行合计最多同时创建几个工单 Agent，可设 1–32。实际还受 DSH 子智能体上限限制。'
+                : '可设 1–32。实际并发还受 DSH 子智能体上限限制。',
               32,
             ),
+            !agentsOnly &&
             numeric(
               '验收超时（毫秒）',
               draft.checkTimeoutMs,
@@ -556,6 +589,7 @@ window.__ModuleLoader__.load({
               }),
             ),
           ),
+          !agentsOnly &&
           h(
             'section',
             { className: 'dtd-section' },
@@ -1283,8 +1317,8 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function Panel({ view, form }) {
-      if (view === 'summary') return '并发工单、验收超时与验收命令。'
+    function Panel({ view, form, scope }) {
+      if (view === 'summary') return '并发工单、预设 Agent、验收超时与验收命令。'
       if (!form || form.state.status !== 'ready' || !form.state.value || form.state.revision === undefined) {
         return h(
           'p',
@@ -1292,25 +1326,43 @@ window.__ModuleLoader__.load({
           form?.state.status === 'loading' ? '正在读取插件配置…' : '宿主配置暂不可用，请确认插件已启用。',
         )
       }
-      return h(Editor, { form })
+      return h(Editor, { form, scope })
+    }
+
+    // Plugin-page Agent preset view. It reads and writes the same settings
+    // namespace as the row configuration page through the host's config form.
+    function AgentsPage({ readConfig, watchConfig, saveConfig }) {
+      const [state, setState] = useState(readConfig)
+      useEffect(() => watchConfig(() => setState(readConfig())), [])
+      return h(Panel, { view: 'page', scope: 'agents', form: { state, mutate: saveConfig } })
     }
 
     return {
       inject: ['slots'],
       apply(ctx) {
-        ctx.effect(() =>
-          ctx.slots.inject('plugins.tab', () =>
-            ctx.slots.register(
-              { name: 'plugins.tab', id: 'ticket-dag-progress', order: 60, label: () => '工单进度' },
-              Dashboard,
+        // The Agent preset page needs the settings service; hosts without it
+        // keep the row configuration page only.
+        ctx.inject?.(['configForms'], (scope) => {
+          const form = scope.configForms.get('dsh-ticket-dag')
+          const face = () => ({
+            readConfig: () => form.getSnapshot(),
+            watchConfig: (listener) => form.subscribe(listener),
+            saveConfig: (ops, revision) => form.mutate(ops, revision),
+          })
+          scope.effect(() =>
+            scope.slots.inject('plugins.tab', () =>
+              scope.slots.register(
+                { name: 'plugins.tab', id: 'ticket-dag-agents', order: 60, label: () => 'Agent 预设', inject: face },
+                AgentsPage,
+              ),
             ),
-          ),
-        )
-        ctx.effect(() =>
-          ctx.slots.inject('plugins.bundle.config', () =>
-            ctx.slots.register({ name: 'plugins.bundle.config', key: 'dsh-ticket-dag' }, Dashboard),
-          ),
-        )
+          )
+          scope.effect(() =>
+            scope.slots.inject('plugins.bundle.config', () =>
+              scope.slots.register({ name: 'plugins.bundle.config', key: 'dsh-ticket-dag', inject: face }, AgentsPage),
+            ),
+          )
+        })
         ctx.effect(() =>
           ctx.slots.inject('plugins.row.config', () =>
             ctx.slots.register({ name: 'plugins.row.config', key: 'dsh-ticket-dag#dsh-ticket-dag' }, Panel),

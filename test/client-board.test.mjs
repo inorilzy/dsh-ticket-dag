@@ -24,11 +24,11 @@ function loadSlots(seeds) {
   })
   return slots
 }
-const loadBoard = (seeds) => loadSlots(seeds)['plugins.tab']
+const loadBoard = (seeds) => loadHost(seeds).slots['sidebar.right.pane.tab'].component
 
-// Loads the entry with the conversation right-sidebar services present. Effects
-// run immediately and fetch only records the URL it was asked for.
-function loadHost(seeds, { expanded = false } = {}) {
+// Loads the entry with the conversation right-sidebar and settings services
+// present. Effects run immediately and fetch only records the URL it was asked for.
+function loadHost(seeds, { expanded = false, config = { status: 'loading' } } = {}) {
   let definition
   const source = readFileSync(resolve(import.meta.dirname, '..', 'src', 'client.js'), 'utf8')
   const urls = []
@@ -47,7 +47,7 @@ function loadHost(seeds, { expanded = false } = {}) {
     useRef: (current) => ({ current }),
     useEffect: (fn) => void fn(),
   }
-  const host = { tabs: [], opened: [], slots: {}, urls, injected: [] }
+  const host = { tabs: [], opened: [], slots: {}, urls, injected: [], namespaces: [], saved: [] }
   const slots = {
     inject: (_, fn) => fn(),
     register: (meta, component) => (host.slots[meta.name] = { meta, component }),
@@ -62,6 +62,16 @@ function loadHost(seeds, { expanded = false } = {}) {
         slots,
         sidebarRightTabs: { register: (definition) => (host.tabs.push(definition), () => {}) },
         sidebarRight: { openTab: (kind) => host.opened.push(kind), isExpanded: () => expanded },
+        configForms: {
+          get: (ns) => (
+            host.namespaces.push(ns),
+            {
+              getSnapshot: () => config,
+              subscribe: () => () => {},
+              mutate: async (ops, revision) => (host.saved.push([ops, revision]), true),
+            }
+          ),
+        },
       })
     },
   })
@@ -304,7 +314,10 @@ test('without saved presets the config page starts from the built-in presets', a
 
 test('each conversation gets a right-sidebar tab that reads only its own runs', () => {
   const host = loadHost([])
-  assert.deepEqual(host.injected.map((names) => [...names]), [['sidebarRight', 'sidebarRightTabs']])
+  assert.deepEqual(
+    host.injected.map((names) => [...names]),
+    [['configForms'], ['sidebarRight', 'sidebarRightTabs']],
+  )
   assert.deepEqual(
     host.tabs.map((t) => [t.id, t.kind, t.title()]),
     [['dsh-ticket-dag/progress', 'ticket-dag', '工单进度']],
@@ -328,6 +341,41 @@ test('the conversation header shows 查看工单 only when this conversation has
   assert.equal(text(entry), '查看工单')
   entry.props.onClick()
   assert.deepEqual(host.opened, ['ticket-dag'])
+})
+
+test('the plugin page tab is the Agent preset page: max agents, presets, per-preset limit and model', () => {
+  const config = {
+    status: 'ready',
+    revision: 3,
+    writable: true,
+    value: {
+      maxWorkers: 6,
+      checkTimeoutMs: 120000,
+      checks: { unit: [['node', '--test']] },
+      agents: { docs: { instructions: 'Docs.', provider: '', model: '', reasoningEffort: '', maxConcurrent: 2 } },
+    },
+  }
+  const host = loadHost([], { config })
+  assert.equal(host.slots['plugins.tab'].meta.label(), 'Agent 预设')
+  assert.deepEqual([...host.namespaces], ['dsh-ticket-dag'])
+  const page = host.renderSlot('plugins.tab', {})
+  const input = (label) => find(page, (n) => n.props['aria-label'] === label)
+  assert.equal(input('最大 Agent 数量').props.value, '6')
+  assert.equal(input('docs 的同时运行上限').props.value, '2')
+  assert.ok(input('docs 的模型'))
+  assert.equal(input('验收超时（毫秒）'), undefined)
+  assert.equal(find(page, (n) => n.type === 'h3' && text(n) === '验收命令'), undefined)
+  assert.ok(host.urls.includes('api/ticket-dag.models'))
+
+  const loading = loadHost([]).renderSlot('plugins.tab', {})
+  assert.match(text(loading), /正在读取插件配置/)
+})
+
+test('the full settings form also edits each preset limit', () => {
+  const root = editorFor({ agents: { docs: { instructions: 'x', maxConcurrent: 3 } } }, catalog)
+  const field = find(root, (n) => n.props['aria-label'] === 'docs 的同时运行上限')
+  assert.equal(field.props.value, '3')
+  assert.ok(find(root, (n) => n.props['aria-label'] === '最大并发工单数'))
 })
 
 test('a dependency cycle in a damaged ledger still renders every ticket', () => {

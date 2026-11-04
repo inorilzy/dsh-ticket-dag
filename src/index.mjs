@@ -30,6 +30,7 @@ export const Config = z.object({
         provider: z.string().default(''),
         model: z.string().default(''),
         reasoningEffort: z.string().default(''),
+        maxConcurrent: z.natural().max(32).default(0),
       }),
     )
     .default(builtinAgents)

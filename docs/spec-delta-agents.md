@@ -4,7 +4,7 @@
 
 ## 配置
 
-`agents`：`{ [id]: { description, instructions, provider, model, reasoningEffort } }`，字段均为字符串，默认值为 `src/agents.mjs` 的 `implementer`、`test-writer`、`docs`。profile 保存后以保存值为准，不与内置值合并。空的 `provider`、`model`、`reasoningEffort` 表示使用宿主默认。
+`agents`：`{ [id]: { description, instructions, provider, model, reasoningEffort, maxConcurrent } }`，`maxConcurrent` 为 0–32 的整数（0 表示不单独限制），其余字段为字符串，默认值为 `src/agents.mjs` 的 `implementer`、`test-writer`、`docs`。profile 保存后以保存值为准，不与内置值合并。空的 `provider`、`model`、`reasoningEffort` 表示使用宿主默认。
 
 ## 清单
 
@@ -20,6 +20,11 @@
 
 - `agentSpec.instructions` 以 `Role (<id>): <instructions>` 一段写入 worker 提示词，位于工单标题之后、`prompt` 之前。
 - `agentSpec.model` 非空时，`launch` 收到 `agentOptions: { provider?, model, reasoningEffort? }`，宿主适配器把它放进 `startActivation` 的 `request.agentOptions`；否则不传该字段。
+- 派工时，若工单的 `agent` 在当前（实时）配置中有 `maxConcurrent > 0`，且该协调器所有运行中使用这个预设的在途 worker 数已达上限，就跳过这张工单、继续检查后面的就绪工单。上限不冻结进清单；配置更新会唤醒所有运行重新派工，已在运行的 worker 不受影响。预设从配置中删除后只剩全局与单轮上限。
+
+## 插件页
+
+`plugins.tab` 注册为「Agent 预设」页（替代原来的全部运行总览），`plugins.bundle.config` 显示同一页面。页面通过客户端 `configForms.get('dsh-ticket-dag')` 读写配置，只编辑 `maxWorkers`（显示为“最大 Agent 数量”）与 `agents`。完整配置仍在 `plugins.row.config`。运行看板只在对话右侧栏。
 
 ## 看板与路由
 

@@ -418,6 +418,65 @@ test(
 )
 
 test(
+  'a preset concurrency cap holds back only that preset; raising it in settings admits more at once',
+  { timeout: 120000 },
+  async (t) => {
+    const cwd = await repo(t)
+    const holds = new Map(['D1', 'D2', 'D3', 'P'].map((id) => [id, gate()]))
+    const running = new Set()
+    const started = []
+    let peakDocs = 0
+    const docs = { instructions: 'Docs.', maxConcurrent: 1 }
+    const co = new Coordinator({
+      checks: noopChecks,
+      maxWorkers: 8,
+      agents: { docs },
+      launch: async (job) => {
+        started.push(job.ticketId)
+        running.add(job.ticketId)
+        peakDocs = Math.max(peakDocs, [...running].filter((id) => id.startsWith('D')).length)
+        return {
+          dispose: async () => {},
+          result: (async () => {
+            await holds.get(job.ticketId).wait
+            await commit(job)
+            running.delete(job.ticketId)
+            return { ok: true }
+          })(),
+        }
+      },
+    })
+    const q = { cwd, parentId: 'captain', runId: 'preset-cap' }
+    const docTicket = (id) => ({ ...ticket(id), agent: 'docs' })
+    try {
+      await co.start({
+        ...q,
+        manifest: { spec_id: 'cap', tickets: [docTicket('D1'), docTicket('D2'), docTicket('D3'), ticket('P')] },
+      })
+      await until(() => started.length === 2, 'one docs ticket and the plain ticket start', 60000)
+      assert.deepEqual([...started].sort(), ['D1', 'P'])
+      await sleep(300)
+      assert.equal(started.length, 2, 'the other docs tickets wait for the cap')
+      co.updateSettings({
+        checks: noopChecks,
+        maxWorkers: 8,
+        checkTimeoutMs: 20000,
+        agents: { docs: { ...docs, maxConcurrent: 2 } },
+      })
+      await until(() => started.includes('D2'), 'raised cap admits a second docs ticket', 60000)
+      assert.equal(started.includes('D3'), false)
+      assert.equal(peakDocs, 2)
+      for (const item of holds.values()) item.release()
+      await until(async () => (await co.status(q)).complete, 'all integrate', 60000)
+      assert.equal(peakDocs, 2)
+    } finally {
+      for (const item of holds.values()) item.release()
+      await co.close()
+    }
+  },
+)
+
+test(
   'status identifies a running worker and the exact cumulative check being executed',
   { timeout: 20000 },
   async (t) => {

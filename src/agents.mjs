@@ -10,6 +10,7 @@ export const builtinAgents = {
     provider: '',
     model: '',
     reasoningEffort: '',
+    maxConcurrent: 0,
   },
   'test-writer': {
     description: '测试编写者：只补测试与测试夹具',
@@ -18,6 +19,7 @@ export const builtinAgents = {
     provider: '',
     model: '',
     reasoningEffort: '',
+    maxConcurrent: 0,
   },
   docs: {
     description: '文档编写者：只改文档与注释',
@@ -26,5 +28,6 @@ export const builtinAgents = {
     provider: '',
     model: '',
     reasoningEffort: '',
+    maxConcurrent: 0,
   },
 }

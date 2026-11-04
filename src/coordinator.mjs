@@ -163,7 +163,16 @@ export class Coordinator {
     this.runs = new Map()
     this.opening = new Map()
     this.activeCount = 0
+    // Running workers per agent preset ID, across every run this coordinator owns.
+    this.activeByAgent = new Map()
     this.stopping = false
+  }
+
+  // The cap is read from the live settings, like maxWorkers; 0 or a removed
+  // preset leaves only the global and per-run limits.
+  _presetFull(agent) {
+    const cap = agent ? Number(this.agents[agent]?.maxConcurrent) || 0 : 0
+    return cap > 0 && (this.activeByAgent.get(agent) ?? 0) >= cap
   }
 
   updateSettings({ checks, agents = this.agents, maxWorkers, checkTimeoutMs }) {
@@ -683,6 +692,8 @@ export class Coordinator {
     }
     for (const old of ready) {
       if (this.stopping || this.activeCount >= this.maxWorkers || run.work.size >= run.limit) break
+      // A full preset holds back only its own tickets; later ready tickets may still start.
+      if (this._presetFull(old.agent)) continue
       const wait = Math.max(old.retryAt ?? 0, run.capacityUntil)
       if (wait > Date.now()) {
         this._later(run, wait)
@@ -699,6 +710,7 @@ export class Coordinator {
       const key = keyOf(old.id) + isolatedSuffix,
         childId = randomUUID()
       if (this.stopping || this.activeCount >= this.maxWorkers || run.work.size >= run.limit) break
+      if (this._presetFull(old.agent)) continue
       const row = run.db.claim(old.id, {
         baseSha: base,
         childId,
@@ -709,10 +721,12 @@ export class Coordinator {
       const job = { ctrl: new AbortController(), handle: null, quiet: false, phase: { stage: 'worktree' } }
       run.work.set(row.id, job)
       this.activeCount++
+      if (row.agent) this.activeByAgent.set(row.agent, (this.activeByAgent.get(row.agent) ?? 0) + 1)
       job.promise = this._execute(run, { ...row, message: old.message }, job)
         .catch((err) => this._failed(run, row, job, err))
         .finally(() => {
           this.activeCount--
+          if (row.agent) this.activeByAgent.set(row.agent, this.activeByAgent.get(row.agent) - 1)
           run.work.delete(row.id)
           for (const other of this.runs.values()) this._wake(other)
         })
