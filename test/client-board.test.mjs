@@ -263,6 +263,41 @@ test('only a working ticket spins; the others show a still icon in their state c
   for (const part of ['进行中 2', '等待 2']) assert.ok(legend.includes(part), legend)
 })
 
+test('the progress board keeps only useful text: one summary block, one-line tickets, no poll notes', () => {
+  const tickets = [
+    { id: 'A', title: '实现问候函数', status: 'INTEGRATED', attempt: 1 },
+    { id: 'T', title: '补测试', status: 'RUNNING', dependsOn: ['A'], attempt: 1, livePhase: { stage: 'agent' } },
+    { id: 'R', title: '重试过的', status: 'RUNNING', attempt: 2, livePhase: { stage: 'agent' } },
+    { id: 'D', title: '写文档', status: 'PENDING', dependsOn: ['T'], attempt: 0 },
+  ]
+  const root = boardFor(tickets)
+  const all = text(root)
+  // 1, 2: no poll note and no manual refresh button.
+  assert.doesNotMatch(all, /秒检查|刷新进度/)
+  // 3: the captain card, run card and progress merge into one block that names the captain once.
+  const blocks = findAll(root, (n) => n.props.className === 'dtd-block').map((n) => n.props['aria-label'])
+  assert.deepEqual(blocks.slice(0, 1), ['运行概况'])
+  assert.ok(!blocks.includes('总进度') && !blocks.includes('运行') && !blocks.includes('队长'), blocks.join())
+  assert.equal(all.match(/队长/g)?.length ?? 0, 1)
+  assert.doesNotMatch(all, /队长会话 · 派工与集成|已集成 1 \/ 4 张工单/)
+  const summary = find(root, (n) => n.props['aria-label'] === '运行概况')
+  assert.ok(find(summary, (n) => n.props['data-dag-bar'] !== undefined))
+  assert.ok(find(summary, (n) => n.props['data-dag-captain'] !== undefined))
+  // 4: a short map hint.
+  assert.match(text(find(root, (n) => n.props['aria-label'] === '依赖图')), /点击节点查看详情/)
+  assert.doesNotMatch(all, /上游合入后解锁/)
+  // 5: the detail card drops the stage sentence; attempts show only after a retry.
+  const detail = text(find(root, (n) => n.props['data-dag-detail'] !== undefined))
+  assert.doesNotMatch(detail, /子会话执行中|执行尝试 1/)
+  // 6, 7: ticket rows are one line, with no square, no upstream, attempt or stage lines.
+  const row = (id) => find(root, (n) => n.props['data-dag-ticket'] === id)
+  for (const id of ['A', 'T', 'D']) {
+    assert.equal(find(row(id), (n) => n.props.className === 'dtd-dot'), undefined, id)
+    assert.doesNotMatch(text(row(id)), /上游：|执行尝试|子会话执行中|等待集成/, id)
+  }
+  assert.match(text(row('R')), /第 2 次尝试/, 'a retried ticket still says so')
+})
+
 test('overall progress shows one segment and one legend entry per state group', () => {
   const root = boardFor(sample)
   const bar = find(root, (n) => n.props['data-dag-bar'] !== undefined)
@@ -463,7 +498,7 @@ test('clicking a node selects it: the detail card and the lit chain follow the s
   // The hint names the selection and how to clear it.
   const fold = find(chosen.root, (n) => n.props['aria-label'] === '依赖图')
   assert.match(text(fold), /已选中 Y · 再次点击取消/)
-  assert.match(text(find(root, (n) => n.props['aria-label'] === '依赖图')), /点击节点选中/)
+  assert.match(text(find(root, (n) => n.props['aria-label'] === '依赖图')), /点击节点查看详情/)
   assert.ok(cssFor(root, '.dtd-node[data-selected=true]').length, 'a selected node has its own outline')
 })
 
@@ -579,7 +614,7 @@ test('the progress board names members everywhere instead of preset IDs, in revi
     ]
   assert.ok(colour('A') && colour('T') && colour('A') !== colour('T'), 'each member has its own colour')
   const block = (label) => find(pane, (n) => n.props['aria-label'] === label)
-  for (const label of ['总进度', '工单列表', '依赖图']) assert.match(block(label).props.className, /dtd-block/, label)
+  for (const label of ['运行概况', '工单列表', '依赖图']) assert.match(block(label).props.className, /dtd-block/, label)
   assert.ok(find(block('工单列表'), (n) => n.props['aria-label'] === '筛选工单'))
 })
 
@@ -764,13 +799,14 @@ test('plan review: named members with their tasks and model, compact task list, 
   assert.match(text(review), /执行前计划审查/)
   assert.match(text(review), /待确认/)
   assert.match(text(review), /3 名成员 · 5 项任务 · 4 条依赖/)
-  for (const step of ['审查计划', '确认模型', '开始执行']) assert.match(text(review), new RegExp(step))
+  for (const step of ['审查计划', '确认模型', '开始执行']) assert.doesNotMatch(text(review), new RegExp(step))
   // The captain is the first row of the member list, without a checkbox or model picker.
   const block = find(review, (n) => n.props['aria-label'] === '成员与模型')
   assert.equal(findAll(review, (n) => n.props['data-dag-captain'] !== undefined).length, 1)
   const captainRow = find(block, (n) => n.props['data-dag-captain'] !== undefined)
   assert.ok(captainRow, 'the captain row sits in the member list')
-  assert.match(text(captainRow), /队长.*当前对话.*claude-opus-5-5/)
+  assert.match(text(captainRow), /队长.*claude-opus-5-5/)
+  assert.doesNotMatch(text(captainRow), /当前对话/)
   assert.equal(find(captainRow, (n) => n.type === 'input' || n.type === 'select'), undefined, 'the captain model is fixed')
 
   const members = findAll(review, (n) => n.props['data-dag-member'] !== undefined)
@@ -778,7 +814,7 @@ test('plan review: named members with their tasks and model, compact task list, 
   assert.match(text(members[0]), /实现者/)
   // Owned tasks have their own column, outside the name cell.
   const ownedCell = find(members[0], (n) => n.props['data-dag-member-tasks'] !== undefined)
-  assert.equal(text(ownedCell), '负责 A、C、B')
+  assert.equal(text(ownedCell), 'A C B', 'the column header already says 负责任务')
   assert.doesNotMatch(text(find(members[0], (n) => n.props.className === 'dtd-member-name')), /负责/)
   assert.match(text(find(block, (n) => n.props.className === 'dtd-member-head')), /成员.*负责任务.*模型.*推理强度/)
   assert.doesNotMatch(text(members[0]), /implementer/, 'members show their name, not the preset ID')
@@ -790,8 +826,8 @@ test('plan review: named members with their tasks and model, compact task list, 
 
   const tasks = findAll(review, (n) => n.props['data-dag-task'] !== undefined)
   assert.deepEqual(tasks.map((t) => t.props['data-dag-task']), ['A', 'C', 'T', 'B', 'D'])
-  assert.match(text(tasks[0]), /定义接口.*实现者 · 可开始/)
-  assert.match(text(tasks[2]), /编写测试.*测试员 · 等待 C/)
+  assert.match(text(tasks[0]), /定义接口.*实现者/)
+  assert.doesNotMatch(text(tasks[2]), /等待|可开始/, 'dependencies are left to the map')
   assert.equal(field('A 的负责人'), undefined, 'task rows stay collapsed')
 
   const node = find(review, (n) => n.props['data-dag-node'] === 'A')
@@ -1477,8 +1513,7 @@ test('status is not told by colour alone: current step, node labels and focusabl
   const plan = node(review, 'T')
   assert.equal(plan.props.tabIndex, 0)
   assert.match(plan.props['aria-label'], /T.*测试员.*编写测试.*等待依赖/)
-  const wizard = findAll(find(review, (n) => n.props['aria-label'] === '审查步骤'), (n) => n.type === 'li')
-  assert.deepEqual(wizard.map((li) => li.props['aria-current']), ['step', undefined, undefined])
+  assert.equal(find(review, (n) => n.props['aria-label'] === '审查步骤'), undefined, 'the decorative wizard is gone')
 })
 
 test('a dependency cycle in a damaged ledger still renders every ticket', () => {

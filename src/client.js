@@ -105,7 +105,7 @@ window.__ModuleLoader__.load({
 .dtd-dashboard {--dtd-work:var(--dsw-alias-state-business-primary,#4c8df6);--dtd-wait:var(--dsw-alias-state-warn-primary,#e5a03a);--dtd-done:var(--dsw-alias-state-success-primary,#3fb27f);--dtd-blocked:var(--dsw-alias-state-error-primary,#e5534b);--dtd-pending:var(--dsw-alias-text-secondary,#8b9099);--dtd-idle:color-mix(in srgb,currentColor 38%,transparent);--dtd-line:var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent));--dtd-card:color-mix(in srgb,currentColor 4%,transparent)}
 .dtd-sr {position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
 .dtd-card {border:1px solid var(--dtd-line);border-radius:.75rem;background:var(--dtd-card);padding:.8rem .95rem;display:grid;gap:.3rem}
-.dtd-run-head {display:flex;align-items:baseline;gap:.6rem;flex-wrap:wrap}.dtd-run-head strong {font-size:1.02rem}.dtd-run-head .dtd-badge {margin-inline-start:auto}
+.dtd-run-head {display:flex;align-items:baseline;gap:.6rem;flex-wrap:wrap}[aria-label=运行概况] .dtd-run-head .dtd-badge {margin-inline-start:0}.dtd-summary-captain {display:inline-flex;align-items:center;gap:.4rem;margin-inline-start:auto;font-weight:600}.dtd-run-head strong {font-size:1.02rem}.dtd-run-head .dtd-badge {margin-inline-start:auto}
 .dtd-bar {display:flex;gap:3px;height:.4rem}.dtd-bar span {border-radius:99px;min-width:.4rem;background:var(--dtd-idle)}
 .dtd-legend {display:flex;flex-wrap:wrap;gap:.25rem .9rem;font-size:.8rem}.dtd-legend span {display:inline-flex;align-items:center;gap:.3rem}
 .dtd-dot {display:inline-block;flex:none;width:.5rem;height:.5rem;border-radius:2px;background:var(--dtd-idle)}
@@ -155,8 +155,6 @@ window.__ModuleLoader__.load({
 .dtd-avatar-tag {position:absolute;right:-.25rem;bottom:-.2rem;min-width:1rem;padding:0 .18rem;border-radius:.4rem;font-size:.58rem;line-height:.9rem;font-weight:700;color:#fff;text-align:center;border:1px solid color-mix(in srgb,Canvas 60%,transparent)}
 .dtd-block {border:1px solid var(--dtd-line);border-radius:.8rem;background:var(--dtd-card);padding:.85rem .95rem;display:grid;gap:.55rem;min-width:0}
 .dtd-panel .dtd-block > h4,.dtd-member-head h4 {font-size:1.05rem;font-weight:700}
-.dtd-captain {display:flex;align-items:center;gap:.7rem;border:1px solid var(--dtd-line);border-radius:.6rem;padding:.55rem .75rem;background:color-mix(in srgb,currentColor 3%,transparent)}
-.dtd-captain-model {margin-inline-start:auto;opacity:.8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dtd-review {gap:1rem}
 .dtd-review-head {display:grid;gap:.35rem}
 .dtd-run-name {margin:0;font-weight:600;overflow-wrap:anywhere}
@@ -164,14 +162,6 @@ window.__ModuleLoader__.load({
 .dtd-review-title {display:flex;align-items:center;justify-content:space-between;gap:.6rem}
 .dtd-panel .dtd-review-title h3 {font-size:1.4rem;font-weight:700}
 .dtd-pill {border:1px solid var(--dtd-wait);color:var(--dtd-wait);border-radius:99px;padding:.1rem .75rem;font-size:.85rem;white-space:nowrap}
-.dtd-wizard {display:flex;align-items:center;list-style:none;margin:.35rem 0 0;padding:0;gap:.5rem}
-.dtd-wizard li {display:flex;align-items:center;gap:.45rem;white-space:nowrap;font-size:.92rem;opacity:.72}
-.dtd-wizard li:not(:last-child) {flex:1}
-.dtd-wizard li:not(:last-child)::after {content:'';flex:1;height:1px;min-width:1rem;background:color-mix(in srgb,currentColor 30%,transparent)}
-.dtd-wizard li span {display:inline-grid;place-items:center;width:1.55rem;height:1.55rem;border-radius:50%;background:color-mix(in srgb,currentColor 18%,transparent);font-size:.82rem;font-weight:600}
-.dtd-wizard [data-state=current] {opacity:1;color:var(--dtd-work);font-weight:600}
-.dtd-wizard [data-state=current] span {background:var(--dtd-work);color:#fff}
-.dtd-wizard [data-state=done] {opacity:1}.dtd-wizard [data-state=done] span {background:var(--dtd-done);color:#fff}
 .dtd-member-head,.dtd-member {display:grid;grid-template-columns:1.1rem 2rem minmax(0,1fr) minmax(0,auto) 7.5rem 6rem;align-items:center;gap:.5rem}
 .dtd-member-tasks {justify-self:start;max-width:100%;padding:.12rem .5rem;border-radius:.35rem;background:color-mix(in srgb,currentColor 10%,transparent);font-size:.8rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dtd-member-captain-model {grid-column:5 / 7;font-size:.84rem;opacity:.8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -887,24 +877,15 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'dtd-ticket-head', 'data-tone': view.tone },
-          h('span', { className: 'dtd-dot' }),
           h(Avatar, { route: ticketRoute(ticket, captain), size: 22 }),
           h('span', { className: 'dtd-chip' }, id),
           title && title !== id && h('span', { className: 'dtd-task-title' }, title),
           appendedTag(ticket),
+          attempt > 1 && h('span', { className: 'dtd-hint' }, '第 ' + attempt + ' 次尝试'),
           memberTag(member),
           h('span', { className: 'dtd-badge ' + view.tone }, view.label),
           chatButton(ticket, open),
         ),
-        view.stage && h('p', { className: 'dtd-phase' }, view.stage),
-        h(
-          'p',
-          { className: 'dtd-hint' },
-          '上游：' + (dependsOn.length ? dependsOn.join('、') : '无') + '　执行尝试：' + (attempt ?? 0),
-        ),
-        status === 'PENDING' &&
-          view.missing.length > 0 &&
-          h('p', { className: 'dtd-phase' }, '等待集成：' + view.missing.join('、')),
         status === 'PENDING' &&
           retryAt > Date.now() &&
           h('p', { className: 'dtd-phase' }, '下次可重试：' + new Date(retryAt).toLocaleTimeString('zh-CN')),
@@ -1008,9 +989,7 @@ window.__ModuleLoader__.load({
         h(
           'span',
           { className: 'dtd-hint' },
-          run.tickets.some((t) => t.id === selected)
-            ? '已选中 ' + selected + ' · 再次点击取消'
-            : '从左到右：上游合入后解锁 · 点击节点选中，下方显示详情',
+          run.tickets.some((t) => t.id === selected) ? '已选中 ' + selected + ' · 再次点击取消' : '点击节点查看详情',
         ),
       )
       const mapBody =
@@ -1038,35 +1017,25 @@ window.__ModuleLoader__.load({
         mapFold,
         mapBody,
       )
+      // One summary block: state, captain model, then the overall progress bar and legend.
       return h(
         'section',
         { className: 'dtd-section dtd-progress', 'aria-label': '运行详情' },
-        h(CaptainCard, { run }),
         h(
           'section',
-          { className: 'dtd-block', 'aria-label': '运行' },
+          { className: 'dtd-block', 'aria-label': '运行概况' },
           h(
             'div',
             { className: 'dtd-run-head' },
-            h('strong', null, run.runId),
-            h('span', { className: 'dtd-hint' }, '队长会话 · 派工与集成'),
             h('span', { className: 'dtd-badge ' + (attention ? 'blocked' : 'neutral') }, runMode(run)),
+            h(
+              'span',
+              { className: 'dtd-summary-captain', 'data-dag-captain': '' },
+              h(Avatar, { route: run.captain, size: 22, tag: false }),
+              '队长 ',
+              h('span', { className: 'dtd-hint' }, routeName(run.captain) || '模型未知'),
+            ),
           ),
-          h(
-            'p',
-            { className: 'dtd-hint' },
-            [run.repoName, run.specId, run.integrationRef].filter(Boolean).join(' · '),
-          ),
-          h('p', null, '已集成 ', h('strong', null, complete + ' / ' + run.total), ' 张工单'),
-          cleanupSummary(run.tickets) &&
-            h('p', { className: 'dtd-hint', 'data-dag-cleanup': '' }, cleanupSummary(run.tickets)),
-          run.attached === false &&
-            h('p', { className: 'dtd-hint' }, '持久记录 · 当前宿主未接管，本页显示最近记录的工单状态。'),
-        ),
-        h(
-          'section',
-          { className: 'dtd-block', 'aria-label': '总进度' },
-          h('h4', null, '总进度'),
           h('progress', {
             className: 'dtd-sr',
             max: run.total || 1,
@@ -1096,6 +1065,10 @@ window.__ModuleLoader__.load({
                 ),
               ),
           ),
+          cleanupSummary(run.tickets) &&
+            h('p', { className: 'dtd-hint', 'data-dag-cleanup': '' }, cleanupSummary(run.tickets)),
+          run.attached === false &&
+            h('p', { className: 'dtd-hint' }, '持久记录 · 当前宿主未接管，本页显示最近记录的工单状态。'),
         ),
         attention > 0 &&
           h(
@@ -1459,13 +1432,11 @@ window.__ModuleLoader__.load({
             ),
           ),
         ),
-        view.stage && h('p', { className: 'dtd-phase' }, view.stage),
         h(
           'p',
           { className: 'dtd-hint' },
           (downstream.length ? '解锁 ' + downstream.join('、') : '无下游工单') +
-            ' · 执行尝试 ' +
-            (ticket.attempt ?? 0),
+            (ticket.attempt > 1 ? ' · 第 ' + ticket.attempt + ' 次尝试' : ''),
         ),
         ticket.message && ticket.status === 'NEEDS_ATTENTION' && h('p', { className: 'dtd-alert' }, ticket.message),
         chat && h('div', { className: 'dtd-actions' }, chat),
@@ -1611,23 +1582,6 @@ window.__ModuleLoader__.load({
       if (!route?.model) return ''
       const known = catalog?.providers?.find((p) => p.id === route.provider)?.models.find((m) => m.id === route.model)
       return known?.name ?? route.model.split('/').pop()
-    }
-
-    // The captain is the conversation that called dag_run; it plans, submits and is notified.
-    function CaptainCard({ run, catalog }) {
-      const route = run.captain
-      return h(
-        'section',
-        { className: 'dtd-block', 'data-dag-captain': '' },
-        h('h4', null, '队长'),
-        h(
-          'div',
-          { className: 'dtd-captain' },
-          h(Avatar, { route, size: 30, tag: false }),
-          h('span', null, '队长 · 当前对话'),
-          h('span', { className: 'dtd-captain-model' }, routeName(route, catalog) || '对话未打开，模型未知'),
-        ),
-      )
     }
 
     // Plan-review member colours, assigned by a stable member order.
@@ -1808,7 +1762,6 @@ window.__ModuleLoader__.load({
           action: 'approve',
           choices: run.tickets.map((t) => ({ id: t.id, agent: currentOwners[t.id], ...routeOf(currentOwners[t.id]) })),
         })
-      const step = changed ? 1 : 0
       const blocked = busy || run.attached === false
       return h(
         'section',
@@ -1827,22 +1780,6 @@ window.__ModuleLoader__.load({
             'p',
             { className: 'dtd-hint' },
             memberIds.length + ' 名成员 · ' + run.tickets.length + ' 项任务 · ' + edges + ' 条依赖',
-          ),
-          h(
-            'ol',
-            { className: 'dtd-wizard', 'aria-label': '审查步骤' },
-            ...['审查计划', '确认模型', '开始执行'].map((label, i) =>
-              h(
-                'li',
-                {
-                  key: label,
-                  'data-state': i === step ? 'current' : i < step ? 'done' : 'todo',
-                  'aria-current': i === step ? 'step' : undefined,
-                },
-                h('span', null, i + 1),
-                label,
-              ),
-            ),
           ),
         ),
         run.attached === false &&
@@ -1873,7 +1810,7 @@ window.__ModuleLoader__.load({
             { key: 'captain', className: 'dtd-member', 'data-dag-captain': '' },
             h('span', null),
             h(Avatar, { route: run.captain, size: 34, tag: false }),
-            h('span', { className: 'dtd-member-name' }, h('strong', null, '队长'), h('small', null, '当前对话')),
+            h('span', { className: 'dtd-member-name' }, h('strong', null, '队长')),
             h('span', { className: 'dtd-member-tasks' }, '拆解 · 派发 · 汇总'),
             h(
               'span',
@@ -1894,7 +1831,7 @@ window.__ModuleLoader__.load({
               }),
               h(Avatar, { route: routeOf(id), captain: run.captain, color: colorOf(id), size: 34 }),
               h('span', { className: 'dtd-member-name' }, h('strong', null, nameOf(id))),
-              h('span', { className: 'dtd-member-tasks', 'data-dag-member-tasks': '' }, '负责 ' + owned(id).join('、')),
+              h('span', { className: 'dtd-member-tasks', 'data-dag-member-tasks': '' }, owned(id).join(' ')),
               h(ModelPicker, {
                 agent: { id, ...routeOf(id) },
                 label: nameOf(id),
@@ -1943,11 +1880,7 @@ window.__ModuleLoader__.load({
                   h('span', { className: 'dtd-chip' }, t.id),
                   h('span', { className: 'dtd-task-title' }, t.title || t.id),
                   appendedTag(t),
-                  h(
-                    'span',
-                    { className: 'dtd-hint' },
-                    nameOf(owner) + ' · ' + (t.dependsOn.length ? '等待 ' + t.dependsOn.join('、') : '可开始'),
-                  ),
+                  h('span', { className: 'dtd-hint' }, nameOf(owner)),
                   h('span', { className: 'dtd-chevron', 'aria-hidden': true }, '›'),
                 ),
                 open &&
@@ -2167,18 +2100,6 @@ window.__ModuleLoader__.load({
             selected
               ? h('h3', { className: 'dtd-run-name', 'data-dag-run-title': '' }, '工单 · ' + selected.runId)
               : h('h3', null, '运行进度'),
-            button('刷新进度', () => {
-              void refresh.current?.()
-            }),
-          ),
-        !reviewing &&
-          h(
-            'p',
-            { className: 'dtd-hint' },
-            selected?.complete || selected?.mode === 'cancelled'
-              ? '运行已结束，每 ' + settledPollMs / 1000 + ' 秒检查一次。'
-              : '每 ' + tabPollMs / 1000 + ' 秒检查运行状态。',
-            lastRead && ' 最近更新 ' + lastRead.toLocaleTimeString('zh-CN'),
           ),
         error && h('p', { className: 'dtd-alert', role: 'status' }, data ? '数据可能已过期。' + error : error),
         !error && !data && h('p', { role: 'status' }, '正在读取运行进度…'),
