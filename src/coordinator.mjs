@@ -3,7 +3,7 @@ import { access, lstat, mkdir, readFile, readdir, writeFile } from 'node:fs/prom
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import * as git from './git.mjs'
-import { agentSpec, normalizeManifest, RunStore } from './store.mjs'
+import { agentSpec, normalizeAppend, normalizeManifest, RunStore } from './store.mjs'
 
 const hash = (text) => createHash('sha256').update(text).digest('hex')
 const message = (err) => String(err?.message ?? err).slice(-3500)
@@ -32,6 +32,7 @@ function safeId(id) {
   )
   return id
 }
+// A manifest or a dag_add batch: anything with tickets.
 function policyHash(manifest, checks) {
   return hash(
     JSON.stringify(
@@ -47,11 +48,15 @@ function copyChecks(manifest, registry) {
   }
   return Object.freeze(copy)
 }
+// Every ticket a run will verify: the submitted manifest plus each dag_add batch.
+function runTickets(db, meta = db.meta()) {
+  return { tickets: [...meta.manifest.tickets, ...db.appended().flatMap((b) => b.tickets)] }
+}
 // Digest of the ledger fields that decide dispatch and acceptance. plan covers
 // the run row and submitted manifest; approval covers the per-ticket
-// definitions (approved presets, verify IDs) and dependency edges.
+// definitions (approved presets, verify IDs), dependency edges and append records.
 function ledgerDigest(db) {
-  const { run, tickets, dependencies } = db.integrity()
+  const { run, tickets, dependencies, appended } = db.integrity()
   return {
     mode: run.mode,
     plan: hash(
@@ -61,6 +66,7 @@ function ledgerDigest(db) {
       JSON.stringify([
         tickets.map((t) => [t.id, t.position, t.definition]),
         dependencies.map((d) => [d.ticketId, d.upstream]),
+        appended.map((a) => [a.ticketId, a.batch, a.definition, a.policyHash, a.createdAt]),
       ]),
     ),
   }
@@ -157,6 +163,8 @@ export class Coordinator {
     checks = {},
     agents = {},
     requireApproval = false,
+    autoCleanup = true,
+    maxAppendedTickets = 20,
     maxWorkers = 16,
     checkTimeoutMs = 120000,
     retryDelayMs = 1500,
@@ -175,6 +183,8 @@ export class Coordinator {
       checks,
       agents,
       requireApproval,
+      autoCleanup,
+      maxAppendedTickets,
       maxWorkers,
       checkTimeoutMs,
       retryDelayMs,
@@ -195,7 +205,15 @@ export class Coordinator {
     return cap > 0 && (this.activeByAgent.get(agent) ?? 0) >= cap
   }
 
-  updateSettings({ checks, agents = this.agents, requireApproval = this.requireApproval, maxWorkers, checkTimeoutMs }) {
+  updateSettings({
+    checks,
+    agents = this.agents,
+    requireApproval = this.requireApproval,
+    autoCleanup = this.autoCleanup,
+    maxAppendedTickets = this.maxAppendedTickets,
+    maxWorkers,
+    checkTimeoutMs,
+  }) {
     requireValue(
       Number.isInteger(maxWorkers) && maxWorkers >= 1 && maxWorkers <= 32,
       'Host maxWorkers must be 1..32',
@@ -204,9 +222,18 @@ export class Coordinator {
       Number.isInteger(checkTimeoutMs) && checkTimeoutMs >= 1 && checkTimeoutMs <= 2_147_483_647,
       'Invalid check timeout',
     )
+    requireValue(Number.isInteger(maxAppendedTickets) && maxAppendedTickets >= 0, 'Invalid maxAppendedTickets')
     // Already-open runs retain their immutable verification command and agent
     // preset snapshots. A running worker or a verification process keeps its handle.
-    Object.assign(this, { checks, agents, requireApproval, maxWorkers, checkTimeoutMs })
+    Object.assign(this, {
+      checks,
+      agents,
+      requireApproval,
+      autoCleanup,
+      maxAppendedTickets,
+      maxWorkers,
+      checkTimeoutMs,
+    })
     for (const run of this.runs.values()) this._wake(run)
   }
 
@@ -320,7 +347,7 @@ export class Coordinator {
         owner,
         file,
         root,
-        checks: copyChecks(meta.manifest, seed?.checks ?? this.checks),
+        checks: copyChecks(runTickets(db, meta), seed?.checks ?? this.checks),
         limit: meta.manifest.maxWorkers,
         serial: Promise.resolve(),
         pump: null,
@@ -445,7 +472,8 @@ export class Coordinator {
   _checkPolicy(run) {
     const m = run.db.meta()
     requireValue(
-      policyHash(m.manifest, run.checks) === m.policyHash,
+      policyHash(m.manifest, run.checks) === m.policyHash &&
+        run.db.appended().every((b) => policyHash(b, run.checks) === b.policyHash),
       'Restore the trusted verification commands originally used by this run',
     )
   }
@@ -525,6 +553,7 @@ export class Coordinator {
   _snapshot(run) {
     const m = run.db.meta(),
       tickets = run.db.tickets()
+    const appendedAt = new Map(run.db.appended().flatMap((b) => b.tickets.map((t) => [t.id, b.createdAt])))
     const counts = Object.create(null)
     for (const t of tickets) counts[t.status] = (counts[t.status] ?? 0) + 1
     return {
@@ -536,6 +565,10 @@ export class Coordinator {
       verifiedSha: m.tipSha,
       maxWorkers: Math.min(this.maxWorkers, run.limit),
       counts,
+      cleanup: {
+        cleaned: tickets.filter((t) => t.cleanup === 'cleaned').length,
+        skipped: tickets.filter((t) => t.cleanup === 'skipped').length,
+      },
       diagnostic: run.haltError || m.diagnostic || null,
       tickets: tickets.map(
         ({
@@ -555,6 +588,8 @@ export class Coordinator {
           retryAt,
           agent,
           agentSpec,
+          cleanup,
+          cleanupReason,
         }) => ({
           id,
           title,
@@ -583,6 +618,10 @@ export class Coordinator {
           message,
           autoRetries,
           retryAt,
+          cleanup: cleanup ?? null,
+          cleanupReason: cleanupReason ?? null,
+          appended: appendedAt.has(id),
+          appendedAt: appendedAt.get(id) ?? null,
         }),
       ),
       pendingNotifications: run.db.pendingNotifications().length,
@@ -691,6 +730,111 @@ export class Coordinator {
   }
 
   /**
+   * The captain's dag_cleanup: remove the recorded worktree and branch of every
+   * integrated ticket of a run, including an ended one. Cleaned tickets stay
+   * cleaned; skipped ones are tried again.
+   * @returns the run snapshot with one { id, status, reason } result per ticket.
+   */
+  async cleanup(q) {
+    const run = await this._open(q)
+    const results = await serial(run, () => this._cleanup(run, true))
+    return { ...this._snapshot(run), results }
+  }
+
+  /**
+   * The captain's dag_add: append tickets to a run without another approval.
+   * Each ticket follows the dag_run rules; a preset the user already approved
+   * for a member of this run keeps the user's route, any other resolves from
+   * the current settings. A staged run takes them into the plan under review.
+   * @returns the run snapshot; an identical repeated batch changes nothing.
+   */
+  async add(q) {
+    const run = await this._open(q)
+    await serial(run, () => {
+      requireValue(run.db.meta().mode !== 'cancelled', 'A cancelled run cannot take more tickets; start a new run')
+      this._checkLedger(run)
+      // Frozen commands win over the current settings for check IDs the run already uses.
+      const tickets = normalizeAppend(q.tickets, { ...this.checks, ...run.checks }, this.agents)
+      const approval = run.db.events().find((e) => e.type === 'run_approved')
+      if (approval) {
+        const late = new Set(
+          run.db
+            .appended()
+            .filter((b) => b.createdAt > approval.createdAt)
+            .flatMap((b) => b.tickets.map((t) => t.id)),
+        )
+        const approved = run.db.tickets().filter((t) => !late.has(t.id))
+        for (const t of tickets) {
+          const chosen = t.agent && approved.find((a) => a.agent === t.agent)
+          if (!chosen) continue
+          const spec = t.agentSpec.instructions ? { instructions: t.agentSpec.instructions } : {}
+          for (const field of ['provider', 'model', 'reasoningEffort'])
+            if (chosen.agentSpec?.[field]) spec[field] = chosen.agentSpec[field]
+          t.agentSpec = spec
+        }
+      }
+      const checks = Object.freeze({ ...copyChecks({ tickets }, this.checks), ...run.checks })
+      const result = run.db.append(tickets, {
+        policyHash: policyHash({ tickets }, checks),
+        limit: this.maxAppendedTickets,
+      })
+      if (!result.added) return
+      run.checks = checks
+      // The ledger now holds this append; it is the new trusted state.
+      const after = ledgerDigest(run.db)
+      run.trust = { ...run.trust, plan: after.plan, approval: after.approval }
+    })
+    this._wake(run)
+    return this._snapshot(run)
+  }
+
+  // Due once every ticket is integrated and the completion notice reached the captain.
+  _cleanupDue(run, rows) {
+    if (!this.autoCleanup || !rows.length || !rows.every((t) => t.status === 'INTEGRATED')) return false
+    if (!rows.some((t) => !t.cleanup) || run.db.pendingNotifications().length) return false
+    return run.db.events().some((e) => e.type === 'run_completed')
+  }
+
+  // Only the ledger's own path and branch of an INTEGRATED ticket in a run
+  // that was not cancelled; git.cleanupWorktree refuses anything else.
+  async _cleanup(run, manual) {
+    const m = run.db.meta()
+    const results = []
+    for (const t of run.db.tickets()) {
+      if (m.mode === 'cancelled') {
+        results.push({ id: t.id, status: 'skipped', reason: 'run cancelled' })
+        continue
+      }
+      if (t.status !== 'INTEGRATED') {
+        results.push({ id: t.id, status: 'skipped', reason: 'ticket is ' + t.status })
+        continue
+      }
+      if (t.cleanup === 'cleaned' || (t.cleanup && !manual) || this.stopping) {
+        results.push({ id: t.id, status: t.cleanup ?? 'skipped', reason: t.cleanupReason ?? undefined })
+        continue
+      }
+      let result
+      if (!t.path || !t.branch) result = { status: 'skipped', reason: 'no recorded worktree' }
+      else {
+        try {
+          result = await git.cleanupWorktree(m.repo, {
+            path: t.path,
+            branch: t.branch,
+            target: m.ref,
+            baseRef: m.manifest.baseRef,
+            root: run.root,
+          })
+        } catch (err) {
+          result = { status: 'skipped', reason: 'refused: ' + message(err) }
+        }
+      }
+      run.db.recordCleanup(t.id, result.status, result.reason ?? null)
+      results.push({ id: t.id, ...result })
+    }
+    return results
+  }
+
+  /**
    * The user's approval of a staged run, from the board. Each choice names a
    * ticket and its preset (empty for none) plus provider/model/reasoningEffort;
    * tickets without a choice keep their planned preset. Presets resolve from
@@ -709,7 +853,7 @@ export class Coordinator {
       requireValue(Array.isArray(choices), 'choices must be an array')
       this._checkLedger(run)
       const byId = new Map(choices.map((c) => [c?.id, c]))
-      const tickets = m.manifest.tickets.map((t) => {
+      const tickets = run.db.plan().map((t) => {
         const c = byId.get(t.id)
         if (!c) return t
         const { agent, agentSpec: frozen, ...rest } = t
@@ -794,11 +938,15 @@ export class Coordinator {
     if (run.notifier || !run.db.pendingNotifications().length) return
     run.notifier = (async () => {
       const m = run.db.meta()
+      let delivered = false
       for (const e of run.db.pendingNotifications()) {
         if (this.stopping) break
         if (!(await this.notify({ parentId: m.parentId, eventId: e.eventId, text: eventText(m, e) }))) break
         run.db.ackNotification(e.eventId)
+        delivered = true
       }
+      // A delivered completion notice can make worktree cleanup due.
+      if (delivered && !this.stopping) this._wake(run)
     })()
       .catch(() => {})
       .finally(() => {
@@ -815,6 +963,10 @@ export class Coordinator {
     if (run.db.intents().length) await this._reconcile(run)
     const rows = run.db.tickets(),
       byId = new Map(rows.map((t) => [t.id, t]))
+    if (this._cleanupDue(run, rows)) {
+      await this._cleanup(run, false)
+      return
+    }
     const submitted = rows.find((t) => t.status === 'SUBMITTED')
     const ready = rows.filter(
       (t) => t.status === 'PENDING' && t.dependsOn.every((d) => byId.get(d)?.status === 'INTEGRATED'),

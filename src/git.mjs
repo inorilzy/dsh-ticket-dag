@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process'
 import { lstat, mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
-import { delimiter, dirname, extname, isAbsolute, join, resolve } from 'node:path'
+import { basename, delimiter, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
 const exec = promisify(execFile)
@@ -442,6 +442,99 @@ export async function publishCandidate(repo, ref, oldTip, candidateSha) {
     /* safe to retain */
   }
   return candidate
+}
+
+// Comparable form of a checkout path: canonical when it exists, case-folded on Windows.
+// A missing path takes the canonical form of its nearest existing ancestor.
+async function pathKey(path) {
+  let full = resolve(path)
+  const rest = []
+  for (;;) {
+    try {
+      full = join(await realpath(full), ...rest)
+      break
+    } catch (err) {
+      if (err.code !== 'ENOENT' || dirname(full) === full) throw err
+      rest.unshift(basename(full))
+      full = dirname(full)
+    }
+  }
+  return process.platform === 'win32' ? full.toLowerCase() : full
+}
+
+function inside(root, path) {
+  const rest = relative(root, path)
+  return rest !== '' && !rest.startsWith('..') && !isAbsolute(rest)
+}
+
+async function worktreeList(repo) {
+  const entries = []
+  for (const record of (await git(repo, 'worktree', 'list', '--porcelain', '-z')).split('\0\0')) {
+    const fields = record.split('\0').filter(Boolean)
+    const path = fields.find((f) => f.startsWith('worktree '))?.slice('worktree '.length)
+    if (!path) continue
+    const branch = fields.find((f) => f.startsWith('branch '))?.slice('branch '.length) ?? null
+    entries.push({ key: await pathKey(path), branch })
+  }
+  return entries
+}
+
+/** The local branch a base ref names: a branch itself, HEAD's branch, or none for a commit ID. */
+async function baseBranch(repo, baseRef) {
+  if (typeof baseRef !== 'string' || !baseRef || oidPattern.test(baseRef)) return null
+  if (baseRef === 'HEAD') return optionalGit(repo, 'symbolic-ref', '--quiet', 'HEAD')
+  return 'refs/heads/' + baseRef.replace(/^refs\/heads\//, '')
+}
+
+/**
+ * Remove one integrated ticket's recorded worktree and branch. Refuses (throws)
+ * a protected branch, a path outside the plugin worktree root, the main
+ * worktree, or a branch checked out elsewhere. Skips (with a reason) work not
+ * merged into the integration branch or a worktree with local changes. Never
+ * forces: git worktree remove, then git branch -d against the integration
+ * branch as its upstream, then git worktree prune. Repeating it is harmless.
+ */
+export async function cleanupWorktree(repo, { path, branch, target, baseRef, root }) {
+  await checkedRef(repo, target, targetPattern)
+  const ref = 'refs/heads/' + String(branch ?? '').replace(/^refs\/heads\//, '')
+  const protectedRefs = [target, await baseBranch(repo, baseRef)].filter(Boolean)
+  verify(!protectedRefs.includes(ref), 'Refusing to delete protected branch: ' + ref)
+  const name = await ticketBranch(repo, branch)
+  const wt = checkoutPath(path)
+  verify(typeof root === 'string' && isAbsolute(root), 'The plugin worktree root must be absolute')
+  const key = await pathKey(wt)
+  verify(inside(await pathKey(root), key), 'Refusing a path outside the plugin worktree root: ' + wt)
+  const worktrees = await worktreeList(repo)
+  verify(
+    key !== worktrees[0]?.key && key !== (await pathKey(rootOf(repo))),
+    'Refusing to remove the main worktree: ' + wt,
+  )
+  const own = worktrees.find((w) => w.key === key)
+  verify(!own || own.branch === ref, 'Worktree has another branch checked out: ' + wt)
+  verify(
+    !worktrees.some((w) => w.key !== key && w.branch === ref),
+    'Ticket branch is checked out in another worktree: ' + ref,
+  )
+  const hasBranch = await localRefExists(repo, ref)
+  if (!own && (await exists(wt))) return { status: 'skipped', reason: 'path is not a registered worktree: ' + wt }
+  if (!own && !hasBranch) {
+    await git(repo, 'worktree', 'prune')
+    return { status: 'cleaned' }
+  }
+  if (hasBranch && !(await isAncestor(repo, await resolveRef(repo, ref), await resolveRef(repo, target))))
+    return { status: 'skipped', reason: 'ticket branch is not merged into ' + target }
+  if (own) {
+    if (await git(wt, 'status', '--porcelain'))
+      return { status: 'skipped', reason: 'worktree has uncommitted changes: ' + wt }
+    await git(repo, 'worktree', 'remove', '--', wt)
+  }
+  if (hasBranch) {
+    // -d checks a branch against its upstream; the integration branch is the one it merged into.
+    await git(repo, 'branch', '--set-upstream-to=' + target.replace(/^refs\/heads\//, ''), name)
+    await git(repo, 'branch', '-d', name)
+  }
+  await git(repo, 'worktree', 'prune')
+  return { status: 'cleaned' }
 }
 
 const isWindows = process.platform === 'win32'

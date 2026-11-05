@@ -34,10 +34,11 @@ function harness(extra = {}) {
     roster = new Map(),
     logs = new Map(),
     tools = new Map(),
-    events = new Map()
+    events = new Map(),
+    sections = []
   let cleanup, api
   const controller = {}
-  for (const action of ['start', 'attach', 'status', 'pause', 'resume', 'retry', 'cancel', 'close']) {
+  for (const action of ['start', 'attach', 'status', 'pause', 'resume', 'retry', 'cancel', 'cleanup', 'add', 'close']) {
     controller[action] = async (request) => {
       calls.push([action, request])
       return { action }
@@ -73,7 +74,9 @@ function harness(extra = {}) {
       },
     },
     systemPrompt: {
-      section() {},
+      section(section) {
+        sections.push(section)
+      },
       getSectionOrder() {
         return 1
       },
@@ -109,6 +112,7 @@ function harness(extra = {}) {
     events,
     calls,
     tools,
+    sections,
     checks,
     invoke,
     controller,
@@ -116,13 +120,13 @@ function harness(extra = {}) {
   }
 }
 
-test('six captain tools bind identity and trusted checks, existing and new root sessions auto-attach', async () => {
+test('eight captain tools bind identity and trusted checks, existing and new root sessions auto-attach', async () => {
   const h = harness()
   await afterPublication()
   assert.deepEqual(h.calls, [['attach', { cwd: '/repo', parentId: 'root' }]])
   assert.deepEqual(
     [...h.tools.keys()],
-    ['dag_run', 'dag_status', 'dag_pause', 'dag_resume', 'dag_retry', 'dag_cancel'],
+    ['dag_run', 'dag_status', 'dag_pause', 'dag_resume', 'dag_retry', 'dag_cancel', 'dag_cleanup', 'dag_add'],
   )
   await h.invoke('dag_run', {
     manifest: '{"specId":"x"}',
@@ -144,6 +148,19 @@ test('six captain tools bind identity and trusted checks, existing and new root 
   assert.deepEqual(h.calls.at(-1)[1], { cwd: '/repo', parentId: 'root', runId: 'r', id: 'A' })
   await h.invoke('dag_retry', { runId: 'r', id: 'A', isolated: true })
   assert.equal(h.calls.at(-1)[1].isolated, true)
+  await h.close()
+})
+
+test('dag_cleanup is a captain-only run tool and autoCleanup defaults on', async () => {
+  const h = harness()
+  assert.deepEqual(h.tools.get('dag_cleanup').parameters, { runId: h.tools.get('dag_status').parameters.runId })
+  assert.equal(h.api.autoCleanup, true)
+  assert.equal(harness({ autoCleanup: false }).api.autoCleanup, false)
+  await h.invoke('dag_cleanup', { runId: 'old-run', cwd: '/etc' })
+  assert.deepEqual(h.calls.at(-1), ['cleanup', { cwd: '/repo', parentId: 'root', runId: 'old-run' }])
+  const before = h.calls.length
+  await assert.rejects(h.invoke('dag_cleanup', { runId: 'old-run' }, h.child), /top-level/)
+  assert.equal(h.calls.length, before)
   await h.close()
 })
 
@@ -298,5 +315,26 @@ test('DSH step and tool guards fence the retired child even after cd, ordinary D
     events: [{ type: 'subagent/descriptor', data: { label: 'normal child' } }],
   })
   assert.equal(await h.events.get('agent/pre-step')({ agent: plain }, () => true), true)
+  await h.close()
+})
+
+test('dag_add is a captain-only tool that appends tickets; its cap defaults to 20 and the captain is told about it', async () => {
+  const h = harness()
+  assert.equal(h.api.maxAppendedTickets, 20)
+  assert.equal(harness({ maxAppendedTickets: 5 }).api.maxAppendedTickets, 5)
+  const tool = h.tools.get('dag_add')
+  assert.deepEqual(Object.keys(tool.parameters), ['runId', 'tickets'])
+  assert.equal(tool.parameters.runId.required, true)
+  assert.equal(tool.parameters.tickets.required, true)
+  assert.match(tool.description, /approval/)
+  await h.invoke('dag_add', { runId: 'r', tickets: '[{"id":"X"}]', cwd: '/etc', parentId: 'forged' })
+  assert.deepEqual(h.calls.at(-1), ['add', { cwd: '/repo', parentId: 'root', runId: 'r', tickets: [{ id: 'X' }] }])
+  await h.invoke('dag_add', { runId: 'r', tickets: [{ id: 'Y' }] })
+  assert.deepEqual(h.calls.at(-1)[1].tickets, [{ id: 'Y' }])
+  const before = h.calls.length
+  await assert.rejects(h.invoke('dag_add', { runId: 'r', tickets: [] }, h.child), /top-level/)
+  assert.equal(h.calls.length, before)
+  assert.match(h.tools.get('dag_run').description, /dag_add/)
+  assert.match(h.sections.map((s) => s.text).join('\n'), /dag_add.*approval/)
   await h.close()
 })

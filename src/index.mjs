@@ -37,6 +37,8 @@ export const Config = z.object({
     .default(builtinAgents)
     .volatile(),
   requireApproval: z.boolean().default(true).volatile(),
+  autoCleanup: z.boolean().default(true).volatile(),
+  maxAppendedTickets: z.natural().default(20).volatile(),
   maxWorkers: z.natural().min(1).max(32).default(16).volatile(),
   checkTimeoutMs: z.natural().min(1).max(2_147_483_647).default(120000).volatile(),
 })
@@ -48,6 +50,10 @@ const runTools = [
   ['resume', 'Reconcile the run and resume scheduling eligible tickets.'],
   ['retry', 'Retry a specific ticket after resolving its reported blocker.'],
   ['cancel', 'Cancel the run and stop its owned workers.'],
+  [
+    'cleanup',
+    'Remove the recorded worktrees and branches of the integrated tickets in a run, including an ended one, and return each ticket result. Unmerged or dirty worktrees are skipped with a reason; repeating it is harmless.',
+  ],
 ]
 const sourceKind = 'dsh-ticket-dag'
 const detailLimit = 4096
@@ -97,6 +103,8 @@ export function apply(ctx, config = {}) {
     checks: setting(config.checks, {}),
     agents: setting(config.agents, builtinAgents),
     requireApproval: setting(config.requireApproval, true),
+    autoCleanup: setting(config.autoCleanup, true),
+    maxAppendedTickets: setting(config.maxAppendedTickets, 20),
     maxWorkers: setting(config.maxWorkers, 16),
     checkTimeoutMs: setting(config.checkTimeoutMs, 120000),
   })
@@ -293,6 +301,8 @@ export function apply(ctx, config = {}) {
             const manifest = typeof args.manifest === 'string' ? JSON.parse(args.manifest) : args.manifest
             return JSON.parse(JSON.stringify(await coordinator.start({ ...request, manifest })))
           }
+          if (method === 'add')
+            request.tickets = typeof args.tickets === 'string' ? JSON.parse(args.tickets) : args.tickets
           if (method === 'retry') {
             request.id = args.id
             if (args.isolated !== undefined) request.isolated = args.isolated
@@ -305,7 +315,7 @@ export function apply(ctx, config = {}) {
 
   register(
     'run',
-    'Start the approved spec manifest and return its runId. Reusing a runId with the same manifest is idempotent. Only trusted host check IDs are supported. A ticket may set agent to a configured agent preset ID (for example implementer, test-writer or docs) to give its worker that role and model; omit it for the default worker. When the result mode is staged, nothing has started: the user reviews each ticket preset and model in the 「工单 · <runId>」 tab of the conversation right sidebar and approves or discards the plan there. Tell the user that and end the turn; you are notified once it is approved. dag_resume cannot start a staged run.',
+    'Start the approved spec manifest and return its runId. Reusing a runId with the same manifest is idempotent. Only trusted host check IDs are supported. A ticket may set agent to a configured agent preset ID (for example implementer, test-writer or docs) to give its worker that role and model; omit it for the default worker. When the result mode is staged, nothing has started: the user reviews each ticket preset and model in the 「工单 · <runId>」 tab of the conversation right sidebar and approves or discards the plan there. Tell the user that and end the turn; you are notified once it is approved. dag_resume cannot start a staged run. To add work to this run later, use dag_add instead of a new dag_run.',
     {
       manifest: { type: 'json', required: true, description: 'Ticket DAG manifest object or JSON string.' },
       runId: {
@@ -331,10 +341,22 @@ export function apply(ctx, config = {}) {
         : { runId },
     )
   }
+  register(
+    'add',
+    'Append tickets to an existing run; existing tickets cannot be changed or removed. Each ticket follows the dag_run manifest ticket rules (id, title, prompt, depends_on, verify with trusted check IDs, optional agent); depends_on may name tickets already in the run or in this batch. Appended tickets need no user approval and are dispatched at once, but must still pass their verification checks; a run still waiting for approval takes them into the plan under review. An agent preset already approved in this run keeps the model the user chose. Repeating an identical batch is harmless. A cancelled run refuses, and a run takes at most the configured number of appended tickets; beyond that start a new run.',
+    {
+      runId,
+      tickets: {
+        type: 'json',
+        required: true,
+        description: 'Array of ticket objects in the dag_run manifest format, or a JSON string of it.',
+      },
+    },
+  )
   ctx.systemPrompt.section({
     name: 'tool:dsh-ticket-dag',
     order: ctx.systemPrompt.getSectionOrder('TOOL_WORKFLOW'),
-    text: 'Only the top-level captain may use dag_* tools. Run an approved ticket DAG with dag_run. Keep its runId. After starting, end the current turn when only waiting remains. The host schedules work and notifies you. Use dag_status for inspection, dag_resume after a host restart, and dag_retry only after addressing the specified ticket blocker. Workers complete their own assignment and leave orchestration to the captain.',
+    text: 'Only the top-level captain may use dag_* tools. Run an approved ticket DAG with dag_run. Keep its runId. After starting, end the current turn when only waiting remains. The host schedules work and notifies you. Use dag_status for inspection, dag_resume after a host restart, and dag_retry only after addressing the specified ticket blocker. dag_cleanup removes the worktrees and branches of integrated tickets in a run. dag_add appends tickets to a run: they need no user approval but must still pass their verification checks. Workers complete their own assignment and leave orchestration to the captain.',
   })
   ctx.effect(
     () => async () => {
