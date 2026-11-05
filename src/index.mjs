@@ -37,6 +37,7 @@ export const Config = z.object({
     .default(builtinAgents)
     .volatile(),
   requireApproval: z.boolean().default(true).volatile(),
+  autoCleanup: z.boolean().default(true).volatile(),
   maxWorkers: z.natural().min(1).max(32).default(16).volatile(),
   checkTimeoutMs: z.natural().min(1).max(2_147_483_647).default(120000).volatile(),
 })
@@ -48,6 +49,10 @@ const runTools = [
   ['resume', 'Reconcile the run and resume scheduling eligible tickets.'],
   ['retry', 'Retry a specific ticket after resolving its reported blocker.'],
   ['cancel', 'Cancel the run and stop its owned workers.'],
+  [
+    'cleanup',
+    'Remove the recorded worktrees and branches of the integrated tickets in a run, including an ended one, and return each ticket result. Unmerged or dirty worktrees are skipped with a reason; repeating it is harmless.',
+  ],
 ]
 const sourceKind = 'dsh-ticket-dag'
 const detailLimit = 4096
@@ -97,6 +102,7 @@ export function apply(ctx, config = {}) {
     checks: setting(config.checks, {}),
     agents: setting(config.agents, builtinAgents),
     requireApproval: setting(config.requireApproval, true),
+    autoCleanup: setting(config.autoCleanup, true),
     maxWorkers: setting(config.maxWorkers, 16),
     checkTimeoutMs: setting(config.checkTimeoutMs, 120000),
   })
@@ -334,7 +340,7 @@ export function apply(ctx, config = {}) {
   ctx.systemPrompt.section({
     name: 'tool:dsh-ticket-dag',
     order: ctx.systemPrompt.getSectionOrder('TOOL_WORKFLOW'),
-    text: 'Only the top-level captain may use dag_* tools. Run an approved ticket DAG with dag_run. Keep its runId. After starting, end the current turn when only waiting remains. The host schedules work and notifies you. Use dag_status for inspection, dag_resume after a host restart, and dag_retry only after addressing the specified ticket blocker. Workers complete their own assignment and leave orchestration to the captain.',
+    text: 'Only the top-level captain may use dag_* tools. Run an approved ticket DAG with dag_run. Keep its runId. After starting, end the current turn when only waiting remains. The host schedules work and notifies you. Use dag_status for inspection, dag_resume after a host restart, and dag_retry only after addressing the specified ticket blocker. dag_cleanup removes the worktrees and branches of integrated tickets in a run. Workers complete their own assignment and leave orchestration to the captain.',
   })
   ctx.effect(
     () => async () => {

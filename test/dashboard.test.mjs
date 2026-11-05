@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
 import { pathToFileURL } from 'node:url'
+import { DatabaseSync } from 'node:sqlite'
 import { RunCatalog, mountApproval, mountDashboard, mountModels } from '../src/dashboard.mjs'
 import { RunStore, normalizeManifest } from '../src/store.mjs'
 
@@ -369,6 +370,39 @@ test('cold history exposes each ticket agent preset and model route', (t) => {
     )
   } finally {
     db.close()
+  }
+})
+
+test('cold history reads cleanup results, and a ledger from before cleanup as not cleaned', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'dag-cleanup-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const catalog = new RunCatalog(join(root, 'profile'))
+  const cold = { maxWorkers: 16, runs: new Map() }
+  const fresh = addRun(root, 'fresh', catalog, 2)
+  const old = addRun(root, 'old', catalog, 1)
+  try {
+    const a = fresh.db.claim('A', { childId: 'child', path: '/fixture/A', branch: 'ticket/same/A', baseSha: 'start' })
+    fresh.db.move('A', a.lease, 'RUNNING', 'SUBMITTED', { sourceSha: 'source' })
+    fresh.db.intent('A', a.lease, { oldTip: 'start', sourceSha: 'source', candidateSha: 'landed' })
+    fresh.db.finish('A', a.lease, 'landed')
+    fresh.db.recordCleanup('A', 'skipped', 'not merged')
+    const [freshKey, oldKey] = catalog.read(cold, null).runs.map((r) => r.key)
+    const rows = catalog.read(cold, freshKey).selected.tickets
+    assert.deepEqual(rows.map((r) => [r.id, r.cleanup, r.cleanupReason]), [
+      ['A', 'skipped', 'not merged'],
+      ['B', null, null],
+    ])
+    old.db.close()
+    const legacy = new DatabaseSync(old.file)
+    legacy.exec('ALTER TABLE tickets DROP COLUMN cleanupReason; ALTER TABLE tickets DROP COLUMN cleanup')
+    legacy.close()
+    const legacyRows = catalog.read(cold, oldKey).selected.tickets
+    assert.deepEqual(legacyRows.map((r) => [r.id, r.cleanup, r.cleanupReason]), [
+      ['A', null, null],
+      ['B', null, null],
+    ])
+  } finally {
+    fresh.db.close()
   }
 })
 

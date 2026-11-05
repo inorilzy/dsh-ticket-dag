@@ -296,6 +296,7 @@ test('ticket detail shows a stage stepper and node tooltips name the live stage'
       ['merge', 'current'],
       ['verify', 'todo'],
       ['publish', 'todo'],
+      ['cleanup', 'todo'],
     ],
   )
   const node = find(root, (n) => n.props['data-dag-node'] === 'A')
@@ -307,8 +308,33 @@ test('integrated and waiting tickets show a fully done or untouched stepper', ()
     const root = boardFor([{ id: 'A', status, dependsOn: [] }])
     return findAll(root, (n) => n.props['data-dag-step'] !== undefined).map((s) => s.props['data-state'])
   }
-  assert.deepEqual(states('INTEGRATED'), Array(7).fill('done'))
-  assert.deepEqual(states('PENDING'), Array(7).fill('todo'))
+  assert.deepEqual(states('INTEGRATED'), [...Array(7).fill('done'), 'todo'])
+  assert.deepEqual(states('PENDING'), Array(8).fill('todo'))
+})
+
+test('the stepper ends with a cleanup step and the run overview counts cleaned and skipped tickets', () => {
+  const root = boardFor([
+    { id: 'A', status: 'INTEGRATED', cleanup: 'cleaned' },
+    { id: 'B', status: 'INTEGRATED', cleanup: 'skipped', cleanupReason: 'worktree has uncommitted changes' },
+    { id: 'C', status: 'INTEGRATED', cleanup: null },
+  ])
+  const stepsOf = (id) =>
+    findAll(
+      find(root, (n) => n.props['data-dag-detail'] === id) ?? root,
+      (n) => n.props['data-dag-step'] !== undefined,
+    )
+  const last = stepsOf('A').at(-1)
+  assert.equal(last.props['data-dag-step'], 'cleanup')
+  assert.equal(text(last), '清理')
+  assert.equal(last.props['data-state'], 'done')
+  const overview = text(find(root, (n) => n.props['data-dag-cleanup'] !== undefined))
+  assert.match(overview, /已清理 1 张 \/ 跳过 1 张（B：worktree has uncommitted changes）/)
+  const skipped = boardFor([{ id: 'B', status: 'INTEGRATED', cleanup: 'skipped', cleanupReason: 'not merged' }])
+  const step = findAll(skipped, (n) => n.props['data-dag-step'] === 'cleanup')[0]
+  assert.equal(step.props['data-state'], 'skipped')
+  assert.match(step.props.title, /not merged/)
+  // A run that has not cleaned anything yet shows no cleanup summary.
+  assert.equal(find(boardFor(sample), (n) => n.props['data-dag-cleanup'] !== undefined), undefined)
 })
 
 test('nodes and the detail card name the ticket member and its model', () => {
@@ -1038,7 +1064,7 @@ test('status is not told by colour alone: current step, node labels and focusabl
   const steps = findAll(root, (n) => n.props['data-dag-step'] !== undefined)
   assert.deepEqual(
     steps.map((s) => s.props['aria-current']),
-    [undefined, undefined, undefined, undefined, 'step', undefined, undefined],
+    [undefined, undefined, undefined, undefined, 'step', undefined, undefined, undefined],
   )
   const node = (tree, id) => find(tree, (n) => n.props['data-dag-node'] === id)
   assert.match(node(root, 'A').props['aria-label'], /执行中/)
