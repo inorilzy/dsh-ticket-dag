@@ -1,6 +1,6 @@
 {
   "name": "dsh-ticket-dag",
-  "version": "0.10.2",
+  "version": "0.10.3",
   "description": "Local Git worktrees and a dependency-aware rolling ticket scheduler for DeepSeek Harness",
   "type": "module",
   "main": "./src/index.mjs",
