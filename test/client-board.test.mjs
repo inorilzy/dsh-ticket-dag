@@ -926,6 +926,66 @@ test('a recognised vendor avatar shows that vendor icon and no abbreviation tag;
   assert.deepEqual(tags(unknown).map(text), ['?'])
 })
 
+// Dashboard: data, selectedKey, error, lastRead. RunProgress: filter, listOpen, mapOpen,
+// hovered. DependencyMap: the measured width of the map area (null before layout).
+function mapFor(tickets, width = null) {
+  const selected = {
+    key: 'k'.repeat(64),
+    runId: 'fit',
+    mode: 'active',
+    complete: false,
+    total: tickets.length,
+    counts: { PENDING: tickets.length },
+    tickets: tickets.map((t) => ({ dependsOn: [], attempt: 0, status: 'PENDING', ...t })),
+  }
+  const Dashboard = loadBoard([{ runs: [selected], selected }, selected.key, '', null, 'all', true, true, null, width])
+  return find(render({ type: Dashboard, props: {}, children: [] }), (n) => n.props['data-dag-map'] !== undefined)
+}
+const nodeBox = (map, id) => find(map, (n) => n.props['data-dag-node'] === id).props.style
+
+test('map nodes widen to fill a wider panel, within limits, and keep the base size before measuring', () => {
+  const plan = [
+    { id: 'A', title: '实现问候函数' },
+    { id: 'C', title: '实现输入清理' },
+    { id: 'B', title: '组合上游函数', dependsOn: ['A', 'C'] },
+  ]
+  const base = nodeBox(mapFor(plan), 'A').width
+  const wide = mapFor(plan, 900)
+  const canvas = find(wide, (n) => n.props.className === 'dtd-canvas').props.style
+  assert.ok(nodeBox(wide, 'A').width > base, 'two columns in 900px get wider cards')
+  assert.ok(nodeBox(wide, 'A').width <= 320, 'cards stop growing at a readable width')
+  assert.ok(canvas.width <= 900, 'the map fits the measured width')
+  assert.equal(nodeBox(mapFor(plan, 300), 'A').width, base, 'a narrow panel keeps the base card and scrolls')
+  assert.equal(nodeBox(wide, 'A').left, 0)
+  assert.equal(nodeBox(wide, 'B').left, nodeBox(wide, 'A').width + (canvas.width - 2 * nodeBox(wide, 'A').width))
+})
+
+test('the board uses the full sidebar width and tighter spacing than settings pages', () => {
+  const root = boardFor(sample)
+  const rules = cssFor(root, '.dtd-panel.dtd-dashboard').join(';')
+  assert.match(rules, /max-width:none/)
+  assert.match(rules, /gap:\.8rem/)
+})
+
+test('map cards grow taller for long titles, and title text grows with wider cards', () => {
+  const short = mapFor([{ id: 'A', title: '短标题' }])
+  const long = mapFor([{ id: 'A', title: '把运行进度看板的依赖图改成按面板宽度自适应，并让长标题完整显示出来' }])
+  assert.ok(nodeBox(long, 'A').height > nodeBox(short, 'A').height)
+  const size = (map) => parseFloat(find(map, (n) => n.props['data-dag-node'] === 'A').props.style.fontSize)
+  assert.ok(size(mapFor([{ id: 'A', title: '短标题' }], 900)) > size(short))
+})
+
+test('map nodes drop the coloured square: the status icon and a larger model icon remain', () => {
+  const map = mapFor([
+    { id: 'A', title: 'A1', status: 'INTEGRATED', model: 'magpie/group/deepseek' },
+    { id: 'B', title: 'B1', dependsOn: ['A'] },
+  ])
+  const node = find(map, (n) => n.props['data-dag-node'] === 'A')
+  assert.equal(find(node, (n) => n.props.className === 'dtd-dot'), undefined)
+  assert.ok(find(node, (n) => n.type === 'svg' && /dtd-status/.test(n.props.className ?? '')))
+  assert.ok(find(node, (n) => n.props['data-dag-avatar'] === 'deepseek').props.style.width >= 22)
+})
+
 test('edge styles apply only to the edge layer, so avatar icons inside map nodes keep their fill', () => {
   const root = boardFor([{ id: 'A', status: 'RUNNING', model: 'magpie/group/deepseek' }])
   const map = find(root, (n) => n.props['data-dag-map'] !== undefined)

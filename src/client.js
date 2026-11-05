@@ -69,6 +69,7 @@ window.__ModuleLoader__.load({
 
     const styles = `
 .dtd-panel {display:grid;gap:1.2rem;max-width:50rem;color:inherit;font:inherit;line-height:1.5}
+.dtd-panel.dtd-dashboard {max-width:none;gap:.8rem}
 .dtd-panel * {box-sizing:border-box}
 .dtd-panel select {background:Canvas;color:CanvasText;font:inherit;border:1px solid color-mix(in srgb,currentColor 30%,transparent);border-radius:.4rem;padding:.4rem;min-width:0;max-width:100%}
 .dtd-dashboard {margin:1rem 0;overflow-wrap:anywhere}
@@ -124,9 +125,9 @@ window.__ModuleLoader__.load({
 .dtd-edges path {fill:none;stroke:color-mix(in srgb,currentColor 30%,transparent);stroke-width:1.3}
 .dtd-edges path[data-active=true] {stroke:var(--dtd-work);stroke-width:1.8}
 .dtd-panel .dtd-node {position:absolute;display:grid;align-content:start;gap:.2rem;text-align:start;border:1px solid var(--dtd-line);border-radius:.6rem;background:var(--dsw-alias-bg-layer-1,Canvas);padding:.45rem .6rem;overflow:hidden}
-.dtd-node-head {display:flex;align-items:center;gap:.4rem;font-weight:600;font-size:.84rem}
-.dtd-node-head small {margin-inline-start:auto;font-weight:400;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.dtd-node-title {font-size:.84rem;line-height:1.35;opacity:.86;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.dtd-node-head {display:flex;align-items:center;gap:.45rem;font-weight:600;font-size:1em}
+.dtd-node-head small {margin-inline-start:auto;font-weight:400;font-size:.88em;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dtd-node-title {font-size:1em;line-height:1.35;opacity:.86;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
 .dtd-node[data-tone=work] {border-color:color-mix(in srgb,var(--dtd-work) 60%,transparent)}
 .dtd-node[data-tone=blocked] {border-color:color-mix(in srgb,var(--dtd-blocked) 70%,transparent)}
 .dtd-node[data-dim=true] {opacity:.42}.dtd-edges path[data-active=false] {opacity:.45}
@@ -138,7 +139,7 @@ window.__ModuleLoader__.load({
 .dtd-spin {flex:none;box-sizing:border-box;width:.75rem;height:.75rem;border-radius:50%;border:2px solid color-mix(in srgb,var(--dtd-work) 25%,transparent);border-top-color:var(--dtd-work);animation:dtd-rotate .8s linear infinite}
 .dtd-status {flex:none;width:.8rem;height:.8rem;fill:none;stroke:var(--dtd-idle);stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .dtd-status[data-tone=wait] {stroke:var(--dtd-wait)}.dtd-progress .dtd-status[data-tone=wait] {stroke:var(--dtd-pending)}.dtd-status[data-tone=done] {stroke:var(--dtd-done)}.dtd-status[data-tone=blocked] {stroke:var(--dtd-blocked)}
-.dtd-canvas .dtd-status {position:static;inset:auto;pointer-events:none}.dtd-canvas .dtd-status path {stroke:inherit;stroke-width:inherit;opacity:1}
+.dtd-canvas .dtd-status {position:static;inset:auto;pointer-events:none;width:1em;height:1em}.dtd-canvas .dtd-spin {width:.9em;height:.9em}.dtd-canvas .dtd-status path {stroke:inherit;stroke-width:inherit;opacity:1}
 @keyframes dtd-rotate {to {transform:rotate(360deg)}}
 @keyframes dtd-sweep {from {background-position:-70% 0,0 0} to {background-position:170% 0,0 0}}
 @media (prefers-reduced-motion:reduce) {.dtd-spin,.dtd-steps [data-state=current] {animation:none}}
@@ -191,8 +192,8 @@ window.__ModuleLoader__.load({
 .dtd-chevron {opacity:.6;font-size:1.15rem;line-height:1;transition:transform .15s}.dtd-task-row[aria-expanded=true] .dtd-chevron {transform:rotate(90deg)}
 .dtd-task-edit {padding:.1rem .15rem .75rem 2.5rem}.dtd-task-edit select {width:100%}
 .dtd-panel .dtd-node.dtd-node-compact {padding:.55rem .7rem;border-radius:.6rem;gap:.3rem;background:color-mix(in srgb,currentColor 4%,var(--dsw-alias-bg-layer-1,Canvas))}
-.dtd-node-compact .dtd-node-head small {font-family:ui-monospace,monospace;font-size:.76rem}
-.dtd-node-compact .dtd-node-title {font-size:.9rem;opacity:.8}
+.dtd-node-compact .dtd-node-head small {font-size:.88em}
+.dtd-node-compact .dtd-node-title {opacity:.8}
 .dtd-panel .dtd-progress .dtd-node.dtd-node-compact[data-tone=wait] {border-color:color-mix(in srgb,var(--dtd-pending) 75%,transparent)}
 .dtd-actionbar {position:sticky;bottom:0;z-index:2;display:grid;grid-template-columns:1fr 1fr auto;gap:.6rem;padding:.8rem 0 .2rem;background:var(--dsw-alias-bg-layer-1,Canvas);border-top:1px solid var(--dtd-line)}
 .dtd-panel .dtd-actionbar button {padding:.6rem .9rem;font-weight:600;border-radius:.55rem}
@@ -1113,6 +1114,21 @@ window.__ModuleLoader__.load({
     // Three columns fit a ~480px sidebar; deeper plans scroll sideways.
     const compactNode = { width: 136, height: 76, gapX: 26, gapY: 14 }
 
+    // Card size for the measured map width: cards widen to share it, up to a
+    // readable maximum; text scales with the card; long titles add lines (up to 4).
+    // Before measuring, or when the panel is too narrow, the base card is used and the map scrolls.
+    function fitNode(base, tickets, available) {
+      const columns = Math.max(0, ...depthMap(tickets).values()) + 1
+      const share = available ? (available - (columns - 1) * base.gapX) / columns : 0
+      const width = Math.round(Math.min(320, Math.max(base.width, share)))
+      const font = Math.round(Math.min(16, Math.max(13.5, width * 0.068)) * 10) / 10
+      // CJK characters are about one em wide, others a little over half.
+      const textWidth = (s) => [...s].reduce((n, c) => n + (c.charCodeAt(0) > 0x2e7f ? 1 : 0.56), 0) * font
+      const longest = Math.max(0, ...tickets.map((t) => (t.title && t.title !== t.id ? textWidth(t.title) : 0)))
+      const lines = Math.min(4, Math.max(1, Math.ceil(longest / (width - 26))))
+      return { ...base, width, font, height: Math.max(base.height, Math.round(48 + font * 1.35 * lines)) }
+    }
+
     function dagLayout(tickets, node = fullNode) {
       const depth = depthMap(tickets)
       const rowsUsed = []
@@ -1165,9 +1181,21 @@ window.__ModuleLoader__.load({
     // Each node card names its ID, owner and task; ownerOf(ticket) returns the
     // owner's { name, color }. compact (plan review) has no focus or detail card.
     function DependencyMap({ rows, hovered, setHovered, open, captain, compact = false, ownerOf }) {
+      // The map area's width, measured after layout and on every resize.
+      const [available, setAvailable] = useState(null)
+      const frame = useRef(null)
+      useEffect(() => {
+        const el = frame.current
+        if (!el || typeof ResizeObserver === 'undefined') return
+        const measure = () => setAvailable(Math.floor(el.clientWidth))
+        measure()
+        const watch = new ResizeObserver(measure)
+        watch.observe(el)
+        return () => watch.disconnect()
+      }, [])
       if (!rows.length) return null
       const tickets = rows.map((r) => r.ticket)
-      const node = compact ? compactNode : fullNode
+      const node = fitNode(compact ? compactNode : fullNode, tickets, available)
       const layout = dagLayout(tickets, node)
       if (compact) {
         // Nothing has started in a plan, so waiting tasks stay plain grey. Hover
@@ -1175,7 +1203,7 @@ window.__ModuleLoader__.load({
         const lit = hovered && tickets.some((t) => t.id === hovered) ? chainOf(hovered, tickets) : null
         return h(
           'div',
-          { className: 'dtd-graph', 'data-dag-map': '' },
+          { className: 'dtd-graph', 'data-dag-map': '', ref: frame },
           h(
             'div',
             { className: 'dtd-canvas', style: { width: layout.width, height: layout.height } },
@@ -1213,12 +1241,11 @@ window.__ModuleLoader__.load({
                     .filter(Boolean)
                     .join(' · '),
                   title: [ticket.id, owner.name, ticket.title].filter(Boolean).join(' · '),
-                  style: { left: x, top: y, width: node.width, height: node.height },
+                  style: { left: x, top: y, width: node.width, height: node.height, fontSize: node.font + 'px' },
                 },
                 h(
                   'span',
                   { className: 'dtd-node-head', 'data-tone': view.tone === 'wait' ? 'neutral' : view.tone },
-                  h('span', { className: 'dtd-dot' }),
                   ticket.id,
                   h('small', { 'data-dag-color': owner.color, style: { color: owner.color } }, owner.name),
                 ),
@@ -1242,7 +1269,7 @@ window.__ModuleLoader__.load({
         { className: 'dtd-section', 'data-dag-map': '' },
         h(
           'div',
-          { className: 'dtd-graph' },
+          { className: 'dtd-graph', ref: frame },
           h(
             'div',
             { className: 'dtd-canvas', style: { width: layout.width, height: layout.height } },
@@ -1282,7 +1309,7 @@ window.__ModuleLoader__.load({
                   'data-dim': chain ? !chain.has(ticket.id) : false,
                   'aria-label': summary,
                   title: summary,
-                  style: { left: x, top: y, width: node.width, height: node.height },
+                  style: { left: x, top: y, width: node.width, height: node.height, fontSize: node.font + 'px' },
                   // Pointer and keyboard focus both light up the chain and drive the detail card.
                   onMouseEnter: () => setHovered(ticket.id),
                   onMouseLeave: () => setHovered(null),
@@ -1292,8 +1319,7 @@ window.__ModuleLoader__.load({
                 h(
                   'span',
                   { className: 'dtd-node-head', 'data-tone': view.tone },
-                  h('span', { className: 'dtd-dot' }),
-                  h(Avatar, { route: ticketRoute(ticket, captain), size: 16 }),
+                  h(Avatar, { route: ticketRoute(ticket, captain), size: Math.round(node.font * 1.6) }),
                   ticket.id,
                   h(StatusIcon, { tone: view.tone }),
                   // An unassigned ticket keeps its state here instead of a placeholder owner.
