@@ -134,6 +134,7 @@ window.__ModuleLoader__.load({
 .dtd-steps li {flex:1;min-width:0;text-align:center;padding-top:.3rem;border-top:3px solid var(--dtd-idle);opacity:.7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dtd-steps [data-state=done] {border-color:var(--dtd-done);opacity:1}
 .dtd-steps [data-state=current] {border-color:var(--dtd-work);opacity:1;font-weight:600}
+.dtd-steps [data-state=skipped] {border-color:var(--dtd-blocked);opacity:1}
 .dtd-detail .dtd-run-head strong {font-size:.96rem}
 .dtd-panel .dtd-preset:not(.dtd-rule) {border:1px solid color-mix(in srgb,currentColor 16%,transparent);border-radius:.55rem;padding:.5rem .75rem}
 .dtd-preset-row {display:flex;flex-wrap:wrap;align-items:center;gap:.3rem .8rem}
@@ -188,6 +189,7 @@ window.__ModuleLoader__.load({
 .dtd-preset-row .dtd-actions {margin-inline-start:auto}
 .dtd-preset-meta {font-size:.83rem;background:color-mix(in srgb,currentColor 7%,transparent);border-radius:.35rem;padding:.1rem .45rem}
 .dtd-owner {font-size:.84rem;font-weight:600;white-space:nowrap}
+.dtd-appended {font-size:.76rem;padding:0 .35rem;border-radius:.3rem;border:1px solid currentColor;opacity:.75;white-space:nowrap;cursor:help}
 .dtd-run-card {border:1px solid var(--dtd-line);border-radius:.75rem;background:var(--dtd-card);padding:.7rem .9rem;display:grid;gap:.55rem;margin:.4rem 0;line-height:1.5}
 .dtd-run-card-head {display:flex;align-items:center;gap:.6rem;min-width:0}
 .dtd-run-card-title {font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -798,6 +800,7 @@ window.__ModuleLoader__.load({
       merge: '候选工作树试合并',
       verify: '正在验收',
       publish: '推进集成分支',
+      cleanup: '清理工作树与分支',
     }
 
     function ticketView(ticket, byId, mode) {
@@ -839,6 +842,19 @@ window.__ModuleLoader__.load({
     const memberTag = (member) =>
       h('span', { className: 'dtd-owner', 'data-dag-color': member.color, style: { color: member.color } }, member.name)
 
+    // A ticket the captain added with dag_add after the run started; hover shows when.
+    const appendedTag = (ticket) =>
+      ticket.appended &&
+      h(
+        'span',
+        {
+          className: 'dtd-appended',
+          'data-dag-appended': '',
+          title: '追加于 ' + new Date(ticket.appendedAt).toLocaleString('zh-CN'),
+        },
+        '追加',
+      )
+
     function Ticket({ ticket, view, open, captain, member }) {
       const { id, title, status, dependsOn, attempt, retryAt, message } = ticket
       const info = [
@@ -859,6 +875,7 @@ window.__ModuleLoader__.load({
           h(Avatar, { route: ticketRoute(ticket, captain), size: 22 }),
           h('span', { className: 'dtd-chip' }, id),
           title && title !== id && h('span', { className: 'dtd-task-title' }, title),
+          appendedTag(ticket),
           memberTag(member),
           h('span', { className: 'dtd-badge ' + view.tone }, view.label),
           chatButton(ticket, open),
@@ -1010,6 +1027,8 @@ window.__ModuleLoader__.load({
             [run.repoName, run.specId, run.integrationRef].filter(Boolean).join(' · '),
           ),
           h('p', null, '已集成 ', h('strong', null, complete + ' / ' + run.total), ' 张工单'),
+          cleanupSummary(run.tickets) &&
+            h('p', { className: 'dtd-hint', 'data-dag-cleanup': '' }, cleanupSummary(run.tickets)),
           run.attached === false &&
             h('p', { className: 'dtd-hint' }, '持久记录 · 当前宿主未接管，本页显示最近记录的工单状态。'),
         ),
@@ -1268,18 +1287,39 @@ window.__ModuleLoader__.load({
       merge: '试合并',
       verify: '验收',
       publish: '集成',
+      cleanup: '清理',
     }
 
     // Live phase is only known for attached in-flight tickets; otherwise the
-    // stepper is either fully done (integrated) or untouched.
+    // stepper is either done up to integration or untouched. The last step
+    // follows the ticket's recorded worktree cleanup.
     function stepStates(ticket) {
       const order = Object.keys(stages)
       const live = ['RUNNING', 'SUBMITTED', 'PUBLISHING'].includes(ticket.status)
       const current = live ? order.indexOf(ticket.livePhase?.stage) : -1
       return order.map((stage, i) => [
         stage,
-        ticket.status === 'INTEGRATED' || i < current ? 'done' : i === current ? 'current' : 'todo',
+        stage === 'cleanup'
+          ? ticket.cleanup === 'cleaned'
+            ? 'done'
+            : ticket.cleanup === 'skipped'
+              ? 'skipped'
+              : 'todo'
+          : ticket.status === 'INTEGRATED' || i < current
+            ? 'done'
+            : i === current
+              ? 'current'
+              : 'todo',
       ])
+    }
+
+    // "已清理 N 张 / 跳过 M 张（原因）", or null before any cleanup result.
+    function cleanupSummary(tickets) {
+      const cleaned = tickets.filter((t) => t.cleanup === 'cleaned').length
+      const skipped = tickets.filter((t) => t.cleanup === 'skipped')
+      if (!cleaned && !skipped.length) return null
+      const reasons = skipped.map((t) => t.id + '：' + (t.cleanupReason || '未说明')).join('；')
+      return '已清理 ' + cleaned + ' 张 / 跳过 ' + skipped.length + ' 张' + (reasons ? '（' + reasons + '）' : '')
     }
 
     function TicketDetail({ ticket, view, tickets, open, member }) {
@@ -1314,7 +1354,10 @@ window.__ModuleLoader__.load({
                 'data-dag-step': stage,
                 'data-state': state,
                 'aria-current': state === 'current' ? 'step' : undefined,
-                title: stages[stage],
+                title:
+                  stage === 'cleanup' && state === 'skipped'
+                    ? stages[stage] + ' · 已跳过：' + (ticket.cleanupReason || '未说明')
+                    : stages[stage],
               },
               stepLabels[stage],
             ),
@@ -1705,6 +1748,7 @@ window.__ModuleLoader__.load({
                   },
                   h('span', { className: 'dtd-chip' }, t.id),
                   h('span', { className: 'dtd-task-title' }, t.title || t.id),
+                  appendedTag(t),
                   h(
                     'span',
                     { className: 'dtd-hint' },

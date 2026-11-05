@@ -111,22 +111,11 @@ export function agentSpec(registry, name) {
   return spec
 }
 
-/** Accept the spec author's snake_case or the stored camelCase representation. */
-export function normalizeManifest(input, checkRegistry = {}, agentRegistry = {}) {
-  record(input, 'manifest')
-  record(checkRegistry, 'checkRegistry')
-  record(agentRegistry, 'agentRegistry')
-  const specId = safeId(input.specId ?? input.spec_id, 'specId')
-  const baseRef = gitRef(input.baseRef ?? input.base_ref ?? 'main')
-  const maxWorkers = input.maxWorkers ?? input.max_workers ?? 16
-  if (!Number.isInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 32)
-    throw new RangeError('maxWorkers must be an integer between 1 and 32')
-  if (!Array.isArray(input.tickets) || !input.tickets.length)
-    throw new TypeError('tickets must be a non-empty array')
-  const externalInputs = strings(input.externalInputs ?? input.external_inputs, 'externalInputs')
-  const byId = new Map()
+// Each ticket's own fields; IDs must differ case-insensitively within the list.
+function normalizeTickets(list, checkRegistry, agentRegistry) {
+  if (!Array.isArray(list) || !list.length) throw new TypeError('tickets must be a non-empty array')
   const filesystemNames = new Set()
-  const tickets = input.tickets.map((raw) => {
+  return list.map((raw) => {
     record(raw, 'ticket')
     const id = safeId(raw.id, 'ticket ID')
     if (filesystemNames.has(id.toLowerCase()))
@@ -152,9 +141,14 @@ export function normalizeManifest(input, checkRegistry = {}, agentRegistry = {})
       ticket.agent = safeId(raw.agent, id + '.agent')
       ticket.agentSpec = agentSpec(agentRegistry, ticket.agent)
     }
-    byId.set(id, ticket)
     return ticket
   })
+}
+
+// Dependencies must name listed tickets without a cycle, and every consumed
+// artifact must come from a transitive dependency or an external input.
+function checkGraph(tickets, externalInputs) {
+  const byId = new Map(tickets.map((t) => [t.id, t]))
   const downstream = new Map(tickets.map((t) => [t.id, []]))
   const remaining = new Map(tickets.map((t) => [t.id, t.dependsOn.length]))
   for (const ticket of tickets) {
@@ -184,7 +178,34 @@ export function normalizeManifest(input, checkRegistry = {}, agentRegistry = {})
     }
   }
   if (ready.length !== tickets.length) throw new TypeError('ticket dependency cycle')
+}
+
+/** Accept the spec author's snake_case or the stored camelCase representation. */
+export function normalizeManifest(input, checkRegistry = {}, agentRegistry = {}) {
+  record(input, 'manifest')
+  record(checkRegistry, 'checkRegistry')
+  record(agentRegistry, 'agentRegistry')
+  const specId = safeId(input.specId ?? input.spec_id, 'specId')
+  const baseRef = gitRef(input.baseRef ?? input.base_ref ?? 'main')
+  const maxWorkers = input.maxWorkers ?? input.max_workers ?? 16
+  if (!Number.isInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 32)
+    throw new RangeError('maxWorkers must be an integer between 1 and 32')
+  if (!Array.isArray(input.tickets) || !input.tickets.length)
+    throw new TypeError('tickets must be a non-empty array')
+  const externalInputs = strings(input.externalInputs ?? input.external_inputs, 'externalInputs')
+  const tickets = normalizeTickets(input.tickets, checkRegistry, agentRegistry)
+  checkGraph(tickets, externalInputs)
   return { specId, baseRef, maxWorkers, tickets, ...(externalInputs.length ? { externalInputs } : {}) }
+}
+
+/**
+ * The tickets of one dag_add batch, by the manifest's per-ticket rules. Their
+ * dependencies are checked against the run by RunStore.append.
+ */
+export function normalizeAppend(input, checkRegistry = {}, agentRegistry = {}) {
+  record(checkRegistry, 'checkRegistry')
+  record(agentRegistry, 'agentRegistry')
+  return normalizeTickets(input, checkRegistry, agentRegistry)
 }
 
 const SCHEMA = `
@@ -198,7 +219,8 @@ const SCHEMA = `
     id TEXT PRIMARY KEY, definition TEXT NOT NULL, position INTEGER NOT NULL UNIQUE,
     status TEXT NOT NULL CHECK(status IN (${STATES_SQL})), attempt INTEGER NOT NULL DEFAULT 0,
     lease TEXT, baseSha TEXT, sourceSha TEXT, landedSha TEXT, childId TEXT, path TEXT, branch TEXT, message TEXT,
-    retryAt INTEGER NOT NULL DEFAULT 0 CHECK(retryAt >= 0), autoRetries INTEGER NOT NULL DEFAULT 0 CHECK(autoRetries >= 0)
+    retryAt INTEGER NOT NULL DEFAULT 0 CHECK(retryAt >= 0), autoRetries INTEGER NOT NULL DEFAULT 0 CHECK(autoRetries >= 0),
+    cleanup TEXT CHECK(cleanup IN ('cleaned', 'skipped')), cleanupReason TEXT
   );
   CREATE TABLE IF NOT EXISTS dependencies (
     ticketId TEXT NOT NULL REFERENCES tickets(id), upstream TEXT NOT NULL REFERENCES tickets(id),
@@ -218,6 +240,10 @@ const SCHEMA = `
   );
   CREATE TABLE IF NOT EXISTS outbox (
     eventId TEXT PRIMARY KEY REFERENCES events(id), parentId TEXT NOT NULL, acknowledgedAt INTEGER
+  );
+  CREATE TABLE IF NOT EXISTS appended (
+    ticketId TEXT PRIMARY KEY REFERENCES tickets(id), batch INTEGER NOT NULL CHECK(batch >= 1),
+    definition TEXT NOT NULL, policyHash TEXT NOT NULL, createdAt INTEGER NOT NULL
   );
 `
 
@@ -251,6 +277,11 @@ export class RunStore {
         'PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;',
       )
       this.#db.exec(SCHEMA)
+      // Ledgers from before worktree cleanup lack its columns: NULL reads as not cleaned.
+      const columns = new Set(this.#db.prepare('PRAGMA table_info(tickets)').all().map((c) => c.name))
+      if (!columns.has('cleanup'))
+        this.#db.exec("ALTER TABLE tickets ADD COLUMN cleanup TEXT CHECK(cleanup IN ('cleaned', 'skipped'))")
+      if (!columns.has('cleanupReason')) this.#db.exec('ALTER TABLE tickets ADD COLUMN cleanupReason TEXT')
     } catch (error) {
       this.#db.close()
       throw error
@@ -397,11 +428,12 @@ export class RunStore {
   approve(tickets) {
     return this.#transaction(() => {
       const run = this.meta()
-      const ids = run?.manifest.tickets.map((t) => t.id) ?? []
+      const plan = run ? this.plan() : []
+      const ids = plan.map((t) => t.id)
       if (tickets.length !== ids.length || tickets.some((t, i) => t?.id !== ids[i]))
         throw new TypeError('approval must list the run ticket set in order')
       if (run.mode !== 'staged') return false
-      const approved = run.manifest.tickets.map((old, i) => {
+      const approved = plan.map((old, i) => {
         const { agent, agentSpec, ...rest } = old
         const next = { ...rest }
         if (tickets[i].agent !== undefined) next.agent = safeId(tickets[i].agent, old.id + '.agent')
@@ -417,9 +449,97 @@ export class RunStore {
   }
 
   /**
+   * Append one dag_add batch. The run manifest is left as submitted; the batch
+   * is recorded beside it. Only additions: an ID already in the run is refused,
+   * except that repeating an earlier batch exactly returns its result.
+   * @param tickets - normalizeAppend output; dependencies may name run or batch tickets.
+   * @param options.policyHash - digest of the batch's frozen verification commands.
+   * @param options.limit - the most tickets a run may take through appends.
+   * @returns { batch, appendedAt, tickets: ids, added } where added is false for a repeat.
+   */
+  append(tickets, { policyHash, limit = Infinity } = {}) {
+    if (!Array.isArray(tickets) || !tickets.length) throw new TypeError('tickets must be a non-empty array')
+    text(policyHash, 'policyHash')
+    if (limit !== Infinity && (!Number.isInteger(limit) || limit < 0))
+      throw new TypeError('limit must be a nonnegative integer')
+    // Presets resolve to a route at append time; the request is the ticket without it.
+    const request = ({ agentSpec, ...rest }) => JSON.stringify(rest)
+    return this.#transaction(() => {
+      const run = this.meta()
+      if (!run) throw new Error('run is not initialized')
+      if (run.mode === 'cancelled') throw new Error('A cancelled run cannot take more tickets; start a new run')
+      const batches = this.appended()
+      const same = batches.find(
+        (b) => b.tickets.length === tickets.length && b.tickets.every((t, i) => request(t) === request(tickets[i])),
+      )
+      if (same)
+        return { batch: same.batch, appendedAt: same.createdAt, tickets: same.tickets.map((t) => t.id), added: false }
+      const existing = this.tickets()
+      const appendedIds = new Set(batches.flatMap((b) => b.tickets.map((t) => t.id)))
+      const known = new Map(existing.map((t) => [t.id.toLowerCase(), t.id]))
+      for (const t of tickets) {
+        const old = known.get(t.id.toLowerCase())
+        if (old === t.id && appendedIds.has(t.id))
+          throw new TypeError(t.id + ' was already appended with a different definition')
+        if (old) throw new TypeError('duplicate ticket ID (case-insensitive): ' + t.id)
+      }
+      const count = batches.reduce((n, b) => n + b.tickets.length, 0)
+      if (count + tickets.length > limit)
+        throw new RangeError(
+          'Appending ' +
+            tickets.length +
+            ' tickets would exceed maxAppendedTickets (' +
+            limit +
+            ', ' +
+            count +
+            ' already appended) for this run; start a new run with dag_run',
+        )
+      checkGraph([...existing, ...tickets], run.manifest.externalInputs ?? [])
+      const batch = (batches.at(-1)?.batch ?? 0) + 1
+      const createdAt = Date.now()
+      const start = this.#db.prepare('SELECT COALESCE(MAX(position), -1) + 1 AS n FROM tickets').get().n
+      const insert = this.#db.prepare(
+        "INSERT INTO tickets(id, definition, position, status) VALUES (?, ?, ?, 'PENDING')",
+      )
+      const edge = this.#db.prepare('INSERT INTO dependencies(ticketId, upstream) VALUES (?, ?)')
+      const note = this.#db.prepare('INSERT INTO appended VALUES (?, ?, ?, ?, ?)')
+      tickets.forEach((t, i) => {
+        insert.run(t.id, JSON.stringify(t), start + i)
+        note.run(t.id, batch, JSON.stringify(t), policyHash, createdAt)
+      })
+      for (const t of tickets) for (const upstream of t.dependsOn) edge.run(t.id, upstream)
+      const ids = tickets.map((t) => t.id)
+      this.#event('tickets_appended', null, 'Appended ' + ids.join(', '), { batch, tickets: ids })
+      return { batch, appendedAt: createdAt, tickets: ids, added: true }
+    })
+  }
+
+  /** Each dag_add batch in order: { batch, createdAt, policyHash, tickets: definitions }. */
+  appended() {
+    const batches = []
+    for (const row of this.#db
+      .prepare('SELECT ticketId,batch,definition,policyHash,createdAt FROM appended ORDER BY batch,rowid')
+      .all()) {
+      let last = batches.at(-1)
+      if (last?.batch !== row.batch) {
+        last = { batch: row.batch, createdAt: row.createdAt, policyHash: row.policyHash, tickets: [] }
+        batches.push(last)
+      }
+      last.tickets.push(JSON.parse(row.definition))
+    }
+    return batches
+  }
+
+  /** The submitted plan: the manifest tickets, then each appended ticket as appended. */
+  plan() {
+    return [...this.meta().manifest.tickets, ...this.appended().flatMap((b) => b.tickets)]
+  }
+
+  /**
    * The raw ledger fields that decide what may run and how it is accepted:
-   * the run row (including mode), every ticket definition and the dependency
-   * edges. The coordinator pins a digest of them against outside edits.
+   * the run row (including mode), every ticket definition, the dependency
+   * edges and the append records. The coordinator pins a digest of them
+   * against outside edits.
    */
   integrity() {
     return {
@@ -428,6 +548,9 @@ export class RunStore {
         .get(),
       tickets: this.#db.prepare('SELECT id,position,definition FROM tickets ORDER BY position').all(),
       dependencies: this.#db.prepare('SELECT ticketId,upstream FROM dependencies ORDER BY ticketId,upstream').all(),
+      appended: this.#db
+        .prepare('SELECT ticketId,batch,definition,policyHash,createdAt FROM appended ORDER BY batch,rowid')
+        .all(),
     }
   }
 
@@ -661,6 +784,32 @@ export class RunStore {
           .run(id)
         this.#event('retry_requested', ticket, 'Ticket retry requested', { oldLease: ticket.lease })
       }
+      return true
+    })
+  }
+
+  /**
+   * Record one integrated ticket's worktree cleanup.
+   * @param status - 'cleaned' or 'skipped'; a cleaned ticket is never reopened.
+   * @param reason - why it was skipped.
+   * @returns true when the ticket's record changed.
+   */
+  recordCleanup(id, status, reason = null) {
+    if (status !== 'cleaned' && status !== 'skipped') throw new TypeError('invalid cleanup status: ' + status)
+    if (reason !== null) text(reason, 'cleanup reason')
+    return this.#transaction(() => {
+      const changed = this.#db
+        .prepare(
+          `UPDATE tickets SET cleanup=?, cleanupReason=? WHERE id=? AND status='INTEGRATED'
+          AND cleanup IS NOT 'cleaned'`,
+        )
+        .run(status, status === 'cleaned' ? null : reason, id)
+      if (changed.changes !== 1) return false
+      const ticket = this.get(id)
+      this.#event('cleanup_' + status, ticket, reason ?? id + ' worktree and branch removed', {
+        path: ticket.path,
+        branch: ticket.branch,
+      })
       return true
     })
   }

@@ -153,6 +153,10 @@ export class RunCatalog {
             retryAt: t.retryAt,
             message: displayDiagnostic(t.message),
             livePhase: t.livePhase ?? null,
+            cleanup: t.cleanup ?? null,
+            cleanupReason: displayDiagnostic(t.cleanupReason),
+            appended: t.appended ?? false,
+            appendedAt: t.appendedAt ?? null,
           })),
         }
       return summary
@@ -188,11 +192,20 @@ function readLedger(file, entry, detail, globalLimit) {
       complete: total > 0 && counts.INTEGRATED === total,
     }
     if (detail) {
+      // A ledger from before worktree cleanup has no cleanup columns: not cleaned.
+      const columns = new Set(db.prepare('PRAGMA table_info(tickets)').all().map((c) => c.name))
+      const cleanup = columns.has('cleanup') && columns.has('cleanupReason')
+        ? 'cleanup,cleanupReason'
+        : 'NULL AS cleanup,NULL AS cleanupReason'
+      // A ledger from before dag_add has no appended table: nothing was appended.
+      const appended = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='appended'").get()
+        ? new Map(db.prepare('SELECT ticketId,createdAt FROM appended').all().map((r) => [r.ticketId, r.createdAt]))
+        : new Map()
       result.tickets = db
         .prepare(
           `SELECT id,json_extract(definition,'$.title') AS title,
         json_extract(definition,'$.dependsOn') AS deps,status,attempt,baseSha,sourceSha,landedSha,
-        path,branch,childId,message,autoRetries,retryAt,json_extract(definition,'$.agent') AS agent,
+        path,branch,childId,message,autoRetries,retryAt,${cleanup},json_extract(definition,'$.agent') AS agent,
         json_extract(definition,'$.agentSpec.provider') AS provider,
         json_extract(definition,'$.agentSpec.model') AS modelId FROM tickets ORDER BY position`,
         )
@@ -202,6 +215,8 @@ function readLedger(file, entry, detail, globalLimit) {
           dependsOn: JSON.parse(deps),
           model: modelId ? [provider, modelId].filter(Boolean).join('/') : null,
           livePhase: null,
+          appended: appended.has(row.id),
+          appendedAt: appended.get(row.id) ?? null,
         }))
     }
     return result

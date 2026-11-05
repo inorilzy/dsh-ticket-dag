@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os'
 import { spawn } from 'node:child_process'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { RunStore, normalizeManifest } from '../src/store.mjs'
+import { DatabaseSync } from 'node:sqlite'
+import { RunStore, normalizeAppend, normalizeManifest } from '../src/store.mjs'
 
 const checks = {
   unit: [['node', '--test']],
@@ -237,6 +238,36 @@ test('publish intent survives restart, commits exactly one completion notice and
       [done.id],
     )
     assert.equal(db.ackNotification(done.id), true)
+  } finally {
+    db.close()
+  }
+})
+
+test('cleanup results persist only for integrated tickets; a ledger from before cleanup reads as not cleaned', (t) => {
+  const file = tempDb(t)
+  let db = new RunStore(file)
+  try {
+    init(db, manifest([ticket('A'), ticket('B')]))
+    const a = db.claim('A', assignment('A'))
+    submit(db, a, 'source')
+    publish(db, a, 'start', 'source', 'landed')
+    db.close()
+    // The ledger layout of earlier releases has no cleanup columns.
+    const old = new DatabaseSync(file)
+    old.exec('ALTER TABLE tickets DROP COLUMN cleanupReason; ALTER TABLE tickets DROP COLUMN cleanup')
+    old.close()
+    db = new RunStore(file)
+    assert.equal(db.get('A').cleanup, null)
+    assert.equal(db.get('A').cleanupReason, null)
+    assert.equal(db.recordCleanup('B', 'cleaned'), false)
+    assert.equal(db.recordCleanup('A', 'skipped', 'worktree has uncommitted changes'), true)
+    assert.deepEqual([db.get('A').cleanup, db.get('A').cleanupReason], ['skipped', 'worktree has uncommitted changes'])
+    assert.equal(db.recordCleanup('A', 'cleaned'), true)
+    // A cleaned ticket stays cleaned.
+    assert.equal(db.recordCleanup('A', 'skipped', 'late'), false)
+    assert.deepEqual([db.get('A').cleanup, db.get('A').cleanupReason], ['cleaned', null])
+    assert.throws(() => db.recordCleanup('A', 'gone'), /cleanup status/)
+    assert.equal(db.get('B').cleanup, null)
   } finally {
     db.close()
   }
@@ -587,6 +618,101 @@ test('isolated retry durably retires every old directory, branch and child acros
     assert.notEqual(active.lease, first.lease)
     assert.notEqual(active.lease, second.lease)
     assert.equal(db.events().filter((e) => e.type === 'isolated_retry_requested').length, 2)
+  } finally {
+    db.close()
+  }
+})
+
+test('appended tickets follow the manifest rules, may depend on run or batch tickets, and leave the manifest unchanged', (t) => {
+  const file = tempDb(t)
+  let db = new RunStore(file)
+  try {
+    const spec = manifest([ticket('A'), ticket('B', ['A'])])
+    init(db, spec)
+    db.close()
+    // A ledger from before dag_add has no appended table.
+    const old = new DatabaseSync(file)
+    old.exec('DROP TABLE appended')
+    old.close()
+    db = new RunStore(file)
+    assert.deepEqual(db.appended(), [])
+    const add = (tickets, limit = 20) => db.append(normalizeAppend(tickets, checks), { policyHash: 'append-hash', limit })
+    assert.throws(() => normalizeAppend([], checks), /non-empty/)
+    assert.throws(() => normalizeAppend([{ ...ticket('C'), verify: [] }], checks), /verification check/)
+    assert.throws(() => normalizeAppend([{ ...ticket('C'), verify: ['arbitrary'] }], checks), /unknown verification/)
+    assert.throws(() => normalizeAppend([ticket('../C')], checks), /safe ID/)
+    assert.throws(() => normalizeAppend([{ ...ticket('C'), title: ' ' }], checks), /title/)
+    assert.throws(() => normalizeAppend([{ ...ticket('C'), agent: 'ghost' }], checks, {}), /unknown agent preset: ghost/)
+    assert.throws(() => normalizeAppend([ticket('C'), ticket('c')], checks), /duplicate/)
+    assert.throws(() => add([ticket('a')]), /duplicate/)
+    assert.throws(() => add([ticket('C', ['Z'])]), /unknown dependency/)
+    assert.throws(() => add([ticket('C', ['D']), ticket('D', ['C'])]), /cycle/)
+    assert.deepEqual(db.appended(), [], 'a refused batch leaves nothing behind')
+    const first = add([ticket('C', ['B']), ticket('D', ['C', 'A'])])
+    assert.equal(first.added, true)
+    assert.equal(first.batch, 1)
+    assert.deepEqual(first.tickets, ['C', 'D'])
+    assert.equal(typeof first.appendedAt, 'number')
+    assert.deepEqual(
+      db.tickets().map((r) => [r.id, r.status]),
+      [
+        ['A', 'PENDING'],
+        ['B', 'PENDING'],
+        ['C', 'PENDING'],
+        ['D', 'PENDING'],
+      ],
+    )
+    assert.deepEqual(db.get('D').dependsOn, ['C', 'A'])
+    // Repeating the identical batch returns the existing result.
+    assert.deepEqual(add([ticket('C', ['B']), ticket('D', ['C', 'A'])]), { ...first, added: false })
+    assert.throws(() => add([{ ...ticket('C', ['B']), title: 'Other' }]), /different definition/)
+    assert.throws(() => add([ticket('E'), ticket('F')], 3), /maxAppendedTickets.*new run/)
+    assert.equal(db.get('E'), null)
+    const second = add([ticket('E')], 3)
+    assert.equal(second.batch, 2)
+    assert.equal(JSON.stringify(db.meta().manifest), JSON.stringify(spec))
+    db.close()
+    db = new RunStore(file)
+    assert.equal(JSON.stringify(db.meta().manifest), JSON.stringify(spec))
+    assert.deepEqual(
+      db.appended().map((b) => [b.batch, b.tickets.map((x) => x.id), typeof b.createdAt, b.policyHash]),
+      [
+        [1, ['C', 'D'], 'number', 'append-hash'],
+        [2, ['E'], 'number', 'append-hash'],
+      ],
+    )
+    assert.deepEqual(db.plan().map((x) => x.id), ['A', 'B', 'C', 'D', 'E'])
+    assert.equal(db.events().filter((e) => e.type === 'tickets_appended').length, 2)
+    assert.equal(db.setMode('cancelled'), true)
+    assert.throws(() => add([ticket('G')]), /cancelled/)
+  } finally {
+    db.close()
+  }
+})
+
+test('tickets appended to a staged run join the plan the user approves', (t) => {
+  const db = new RunStore(tempDb(t))
+  try {
+    const spec = manifest([ticket('A')])
+    db.init({
+      runId: 'run-1',
+      repo: { root: '/work', commonDir: '/work/.git' },
+      ref: 'refs/heads/integration/run-1',
+      baseSha: 'start',
+      parentId: 'parent',
+      policyHash: 'checks-hash',
+      manifest: spec,
+      mode: 'staged',
+    })
+    db.append(normalizeAppend([ticket('B', ['A'])], checks), { policyHash: 'append-hash' })
+    assert.equal(db.meta().mode, 'staged')
+    assert.equal(db.claim('B', assignment('B')), null)
+    assert.throws(() => db.approve(spec.tickets), /ticket set/)
+    const plan = db.plan()
+    assert.equal(db.approve([plan[0], { ...plan[1], agent: 'docs', agentSpec: { model: 'fast-1' } }]), true)
+    assert.equal(db.meta().mode, 'active')
+    assert.deepEqual(db.get('B').agentSpec, { model: 'fast-1' })
+    assert.equal(JSON.stringify(db.meta().manifest), JSON.stringify(spec))
   } finally {
     db.close()
   }

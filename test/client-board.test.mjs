@@ -296,6 +296,7 @@ test('ticket detail shows a stage stepper and node tooltips name the live stage'
       ['merge', 'current'],
       ['verify', 'todo'],
       ['publish', 'todo'],
+      ['cleanup', 'todo'],
     ],
   )
   const node = find(root, (n) => n.props['data-dag-node'] === 'A')
@@ -307,8 +308,33 @@ test('integrated and waiting tickets show a fully done or untouched stepper', ()
     const root = boardFor([{ id: 'A', status, dependsOn: [] }])
     return findAll(root, (n) => n.props['data-dag-step'] !== undefined).map((s) => s.props['data-state'])
   }
-  assert.deepEqual(states('INTEGRATED'), Array(7).fill('done'))
-  assert.deepEqual(states('PENDING'), Array(7).fill('todo'))
+  assert.deepEqual(states('INTEGRATED'), [...Array(7).fill('done'), 'todo'])
+  assert.deepEqual(states('PENDING'), Array(8).fill('todo'))
+})
+
+test('the stepper ends with a cleanup step and the run overview counts cleaned and skipped tickets', () => {
+  const root = boardFor([
+    { id: 'A', status: 'INTEGRATED', cleanup: 'cleaned' },
+    { id: 'B', status: 'INTEGRATED', cleanup: 'skipped', cleanupReason: 'worktree has uncommitted changes' },
+    { id: 'C', status: 'INTEGRATED', cleanup: null },
+  ])
+  const stepsOf = (id) =>
+    findAll(
+      find(root, (n) => n.props['data-dag-detail'] === id) ?? root,
+      (n) => n.props['data-dag-step'] !== undefined,
+    )
+  const last = stepsOf('A').at(-1)
+  assert.equal(last.props['data-dag-step'], 'cleanup')
+  assert.equal(text(last), '清理')
+  assert.equal(last.props['data-state'], 'done')
+  const overview = text(find(root, (n) => n.props['data-dag-cleanup'] !== undefined))
+  assert.match(overview, /已清理 1 张 \/ 跳过 1 张（B：worktree has uncommitted changes）/)
+  const skipped = boardFor([{ id: 'B', status: 'INTEGRATED', cleanup: 'skipped', cleanupReason: 'not merged' }])
+  const step = findAll(skipped, (n) => n.props['data-dag-step'] === 'cleanup')[0]
+  assert.equal(step.props['data-state'], 'skipped')
+  assert.match(step.props.title, /not merged/)
+  // A run that has not cleaned anything yet shows no cleanup summary.
+  assert.equal(find(boardFor(sample), (n) => n.props['data-dag-cleanup'] !== undefined), undefined)
 })
 
 test('nodes and the detail card name the ticket member and its model', () => {
@@ -1038,7 +1064,7 @@ test('status is not told by colour alone: current step, node labels and focusabl
   const steps = findAll(root, (n) => n.props['data-dag-step'] !== undefined)
   assert.deepEqual(
     steps.map((s) => s.props['aria-current']),
-    [undefined, undefined, undefined, undefined, 'step', undefined, undefined],
+    [undefined, undefined, undefined, undefined, 'step', undefined, undefined, undefined],
   )
   const node = (tree, id) => find(tree, (n) => n.props['data-dag-node'] === id)
   assert.match(node(root, 'A').props['aria-label'], /执行中/)
@@ -1061,4 +1087,25 @@ test('a dependency cycle in a damaged ledger still renders every ticket', () => 
     { id: 'Y', status: 'PENDING', dependsOn: ['X'] },
   ])
   assert.equal(findAll(root, (n) => n.props['data-dag-node'] !== undefined).length, 2)
+})
+
+test('appended tickets carry a 追加 tag with their time on hover, on the board and in the plan review', () => {
+  const at = Date.UTC(2026, 10, 4, 12, 30)
+  const root = boardFor([
+    { id: 'A', status: 'INTEGRATED', appended: false, appendedAt: null },
+    { id: 'B', status: 'PENDING', dependsOn: ['A'], appended: true, appendedAt: at },
+  ])
+  const tagOf = (node) => find(node, (n) => n.props['data-dag-appended'] !== undefined)
+  const row = (id) => find(root, (n) => n.props['data-dag-ticket'] === id)
+  assert.equal(tagOf(row('A')), undefined)
+  const tag = tagOf(row('B'))
+  assert.equal(text(tag), '追加')
+  assert.equal(tag.props.title, '追加于 ' + new Date(at).toLocaleString('zh-CN'))
+  const selected = reviewRun()
+  selected.tickets[4] = { ...selected.tickets[4], appended: true, appendedAt: at }
+  const host = loadHost([{ runs: [selected], selected }, selected.key])
+  const review = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  const tasks = findAll(review, (n) => n.props['data-dag-task'] !== undefined)
+  assert.deepEqual(tasks.map((t) => Boolean(tagOf(t))), [false, false, false, false, true])
+  assert.equal(tagOf(tasks[4]).props.title, tag.props.title)
 })
