@@ -188,6 +188,13 @@ window.__ModuleLoader__.load({
 .dtd-preset-row .dtd-actions {margin-inline-start:auto}
 .dtd-preset-meta {font-size:.83rem;background:color-mix(in srgb,currentColor 7%,transparent);border-radius:.35rem;padding:.1rem .45rem}
 .dtd-owner {font-size:.84rem;font-weight:600;white-space:nowrap}
+.dtd-run-card {border:1px solid var(--dtd-line);border-radius:.75rem;background:var(--dtd-card);padding:.7rem .9rem;display:grid;gap:.55rem;margin:.4rem 0;line-height:1.5}
+.dtd-run-card-head {display:flex;align-items:center;gap:.6rem;min-width:0}
+.dtd-run-card-title {font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dtd-run-card-meta {margin-inline-start:auto;font-size:.83rem;opacity:.72;white-space:nowrap}
+.dtd-run-card button {font:inherit;font-size:.83rem;font-weight:600;color:inherit;background:color-mix(in srgb,currentColor 10%,transparent);border:1px solid var(--dtd-line);border-radius:.45rem;padding:.2rem .6rem;cursor:pointer;white-space:nowrap}
+.dtd-run-card-members {display:flex;flex-wrap:wrap;gap:.45rem}
+.dtd-run-card-member {display:inline-flex;align-items:center;gap:.35rem;font-size:.85rem;border-radius:999px;padding:.15rem .6rem .15rem .2rem;background:color-mix(in srgb,currentColor 8%,transparent)}
 .dtd-ticket-head .dtd-task-title {min-width:0}
 `
 
@@ -2024,6 +2031,174 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // Conversation card for one dag_run. It folds the durable dag_run tool call
+    // and its result, so it stays in the transcript after the sidebar tab is
+    // closed or the session is reopened.
+    const cardKind = 'dsh-ticket-dag/run'
+    const resultText = (message) =>
+      (message?.content ?? [])
+        .filter((b) => b?.type === 'text' && typeof b.text === 'string')
+        .map((b) => b.text)
+        .join('\n')
+    const resultFailed = (data) =>
+      data.error !== undefined ||
+      data.message?.isError === true ||
+      (data.message?.content ?? []).some((b) => b?.type === 'tool-result' && b.isError === true)
+    function runFromResult(message) {
+      try {
+        const result = JSON.parse(resultText(message))
+        if (typeof result?.runId !== 'string' || !result.runId) return null
+        return {
+          runId: result.runId,
+          tickets: (Array.isArray(result.tickets) ? result.tickets : []).map((t) => ({
+            id: String(t?.id ?? ''),
+            agent: typeof t?.agent === 'string' && t.agent ? t.agent : null,
+          })),
+        }
+      } catch {
+        return null
+      }
+    }
+    const runCardDefinition = {
+      kind: cardKind,
+      target: 'chat',
+      match: (event) => {
+        if (event.type === 'tool/call' && event.data?.name === 'dag_run')
+          return { id: String(event.data.callId), role: 'start' }
+        if (event.type === 'tool/result' && event.data?.message?.source?.kind === 'tool')
+          return { id: String(event.data.message.source.callId), role: 'update' }
+        return null
+      },
+      start: () => ({ run: null }),
+      update: (context, match) => {
+        if (match.event.type !== 'tool/result' || resultFailed(match.event.data)) return context.state
+        return { run: runFromResult(match.event.data.message) ?? context.state?.run ?? null }
+      },
+      buildViewNode: (context) =>
+        context.start && context.state?.run
+          ? {
+              key: context.key,
+              kind: cardKind,
+              id: context.id,
+              target: 'chat',
+              anchorSeq: context.start.event.seq,
+              location: context.start.location,
+              visibility: 'visible',
+              data: context.state.run,
+            }
+          : null,
+    }
+    const inTurn = (location) => location?.kind === 'turn' || location?.kind === 'step'
+
+    // Members are the presets that own tickets, in ticket order, with their ticket counts.
+    function runMembers(tickets) {
+      const members = new Map()
+      for (const t of tickets) members.set(t.agent ?? '', (members.get(t.agent ?? '') ?? 0) + 1)
+      return [...members]
+    }
+    const runState = (run) =>
+      !run
+        ? ''
+        : run.available === false
+          ? '记录不可读'
+          : run.mode === 'staged'
+            ? '待确认'
+            : run.mode === 'discarded'
+              ? '已放弃'
+              : run.complete
+                ? '已完成'
+                : '进行中'
+
+    // Reads this conversation's run list once to find the run's sidebar address
+    // and preset names; no polling, the tab owns live progress.
+    function RunCard({ run, sessionId, openRun }) {
+      const [found, setFound] = useState(null)
+      const [presets, setPresets] = useState(null)
+      const [notice, setNotice] = useState('')
+      useEffect(() => {
+        let disposed = false
+        const ctrl = new AbortController()
+        const read = async (key) => {
+          const response = await fetch(dashboardUrl(key, sessionId), { signal: ctrl.signal, cache: 'no-store' })
+          if (!response.ok) throw new Error('HTTP ' + response.status)
+          return response.json()
+        }
+        void (async () => {
+          try {
+            const view = await read('')
+            const hit = view?.runs?.find?.((r) => r.runId === run.runId)
+            if (disposed || !hit) return
+            setFound(hit)
+            const detail = view.selected?.key === hit.key ? view.selected : (await read(hit.key))?.selected
+            if (!disposed && Array.isArray(detail?.presets)) setPresets(detail.presets)
+          } catch {
+            // The card still shows what the tool result recorded.
+          }
+        })()
+        return () => {
+          disposed = true
+          ctrl.abort()
+        }
+      }, [sessionId, run.runId])
+      const members = runMembers(run.tickets)
+      const ids = members.map(([id]) => id)
+      const state = runState(found)
+      return h(
+        'section',
+        { className: 'dtd-dashboard dtd-run-card', 'data-dag-run-card': run.runId },
+        h('style', null, styles),
+        h(
+          'header',
+          { className: 'dtd-run-card-head' },
+          h('span', { className: 'dtd-run-card-title', title: run.runId }, '工单 · ' + run.runId),
+          h('span', { className: 'dtd-run-card-meta' }, [state, run.tickets.length + ' 张工单'].filter(Boolean).join(' · ')),
+          h(
+            'button',
+            {
+              type: 'button',
+              title: '在右侧栏打开「工单 · ' + run.runId + '」标签',
+              onClick: () => (found ? openRun(found) : setNotice('找不到这轮运行的记录，可能已被删除或不属于当前对话。')),
+            },
+            '查看工单',
+          ),
+        ),
+        members.length > 0 &&
+          h(
+            'div',
+            { className: 'dtd-run-card-members' },
+            members.map(([id, count]) =>
+              h(
+                'span',
+                { key: id || 'default', className: 'dtd-run-card-member', 'data-dag-member': id },
+                h(Avatar, { color: memberColor(ids, id), size: 20 }),
+                memberName(id, presets) + ' · ' + count + ' 张',
+              ),
+            ),
+          ),
+        notice && h('p', { role: 'status', className: 'dtd-alert' }, notice),
+      )
+    }
+
+    // Live turns show the card at the tool call; closed turns fold their tool
+    // rows, so the turn tail shows the same cards below the reply.
+    function RunCardNode({ node, sessionId, openRun }) {
+      if (inTurn(node.location) && node.location.turn?.status === 'closed') return null
+      return h(RunCard, { run: node.data, sessionId, openRun })
+    }
+    function RunTurnCards({ sessionId, turn, useChat, openRun }) {
+      const nodes = useChat((snapshot) => snapshot.nodes)
+      if (turn?.status !== 'closed') return null
+      const cards = [...(nodes?.values?.() ?? [])].filter(
+        (n) => n.kind === cardKind && inTurn(n.location) && n.location.turn?.turn === turn.turn,
+      )
+      if (!cards.length) return null
+      return h(
+        'div',
+        { 'data-dag-turn-cards': '' },
+        cards.map((n) => h(RunCard, { key: n.key, run: n.data, sessionId, openRun })),
+      )
+    }
+
     function Panel({ view, form, scope }) {
       if (view === 'summary') return '并发工单、预设 Agent、验收超时与验收命令。'
       if (!form || form.state.status !== 'ready' || !form.state.value || form.state.revision === undefined) {
@@ -2148,6 +2323,27 @@ window.__ModuleLoader__.load({
               ),
             ),
           )
+          const cardFace = () => ({
+            openRun: (run) => native.sidebarRight.openResource(runAddress(run), { kind: tabKind }),
+          })
+          native.effect(() =>
+            native.slots.inject('conversation.chat.node', () =>
+              native.slots.register({ name: 'conversation.chat.node', key: cardKind, inject: cardFace }, RunCardNode),
+            ),
+          )
+          native.effect(() =>
+            native.slots.inject('conversation.chat.turnTail', () =>
+              native.slots.register(
+                { name: 'conversation.chat.turnTail', id: 'ticket-dag-run-cards', order: 55, inject: cardFace },
+                RunTurnCards,
+              ),
+            ),
+          )
+        })
+        // The run card folds durable dag_run tool events; hosts without the
+        // conversation service keep the header entry only.
+        ctx.inject?.(['uiConversation'], (scope) => {
+          scope.effect(() => scope.uiConversation.events.register(runCardDefinition))
         })
       },
     }

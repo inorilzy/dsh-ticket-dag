@@ -88,6 +88,7 @@ function loadHost(seeds, { expanded = false, config = { status: 'loading' }, res
     namespaces: [],
     saved: [],
     sessions: [],
+    definitions: [],
   }
   // Timers still waiting to fire.
   host.pending = () => timers.filter((t) => !t.cleared && !t.fired)
@@ -116,6 +117,7 @@ function loadHost(seeds, { expanded = false, config = { status: 'loading' }, res
           openSubagent: (address) => host.sessions.push(['open', { ...address }]),
         },
         get: () => undefined,
+        uiConversation: { events: { register: (d) => (host.definitions.push(d), () => {}) } },
         configForms: {
           get: (ns) => (
             host.namespaces.push(ns),
@@ -428,7 +430,7 @@ test('each conversation gets a right-sidebar tab that reads only its own runs', 
   const host = loadHost([])
   assert.deepEqual(
     host.injected.map((names) => [...names]),
-    [['configForms'], ['sessions'], ['sidebarRight', 'sidebarRightTabs']],
+    [['configForms'], ['sessions'], ['sidebarRight', 'sidebarRightTabs'], ['uiConversation']],
   )
   assert.deepEqual(
     host.tabs.map((t) => [t.id, t.kind, t.title()]),
@@ -766,6 +768,87 @@ test('the conversation header shows 查看工单 only when this conversation has
   assert.equal(text(entry), '查看工单')
   entry.props.onClick()
   assert.deepEqual(host.opened, [['dsh-resource://ticket-dag/' + key + '/latest', 'ticket-dag']], 'opens the newest run')
+})
+
+// A durable dag_run tool call and its JSON result, as the conversation fold sees them.
+const dagCall = { type: 'tool/call', seq: 7, data: { name: 'dag_run', callId: 'c1', arguments: '{}' } }
+const dagResult = (body, extra = {}) => ({
+  type: 'tool/result',
+  data: { message: { source: { kind: 'tool', callId: 'c1' }, content: [{ type: 'text', text: JSON.stringify(body) }] }, ...extra },
+})
+const dagRunResult = {
+  runId: 'demo-01',
+  mode: 'staged',
+  tickets: [
+    { id: 'T1', agent: 'docs' },
+    { id: 'T2', agent: 'docs' },
+    { id: 'T3', agent: 'implementer' },
+    { id: 'T4', agent: null },
+  ],
+}
+function foldCard(definition, ...events) {
+  const start = { event: events[0], location: { kind: 'turn', turn: { turn: 3, status: 'open' } } }
+  let state = definition.start({}, start)
+  for (const event of events.slice(1)) state = definition.update({ state }, { event })
+  return definition.buildViewNode({ key: 'k1', id: 'c1', start, state })
+}
+
+test('each dag_run tool call folds into a conversation card that keeps the run ID and ticket owners', () => {
+  const host = loadHost([])
+  const [definition] = host.definitions
+  assert.equal(definition.kind, 'dsh-ticket-dag/run')
+  assert.deepEqual({ ...definition.match(dagCall) }, { id: 'c1', role: 'start' })
+  assert.equal(definition.match({ type: 'tool/call', data: { name: 'dag_status', callId: 'c2' } }), null)
+  assert.deepEqual({ ...definition.match(dagResult(dagRunResult)) }, { id: 'c1', role: 'update' })
+
+  const node = foldCard(definition, dagCall, dagResult(dagRunResult))
+  assert.equal(node.kind, 'dsh-ticket-dag/run')
+  assert.equal(node.anchorSeq, 7)
+  assert.equal(node.data.runId, 'demo-01')
+  assert.deepEqual(
+    [...node.data.tickets].map((t) => [t.id, t.agent]),
+    [['T1', 'docs'], ['T2', 'docs'], ['T3', 'implementer'], ['T4', null]],
+  )
+  // A failed or unreadable result shows no card; the call alone shows none either.
+  assert.equal(foldCard(definition, dagCall), null)
+  assert.equal(foldCard(definition, dagCall, dagResult(dagRunResult, { error: 'boom' })), null)
+  assert.equal(foldCard(definition, dagCall, dagResult('not json')), null)
+})
+
+test('the run card names its members, shows the run state and opens the run tab', () => {
+  const key = 'e'.repeat(64)
+  const presets = [{ id: 'docs', name: '写文档的' }]
+  const node = { data: foldCard(loadHost([]).definitions[0], dagCall, dagResult(dagRunResult)).data, location: { kind: 'turn', turn: { turn: 3, status: 'open' } } }
+  // RunCard state order: found run, presets, notice.
+  const host = loadHost([{ key, runId: 'demo-01', mode: 'staged' }, presets, ''])
+  const card = host.renderSlot('conversation.chat.node', { sessionId: 's1', node })
+  assert.deepEqual(host.urls, ['api/ticket-dag.dashboard?parent=s1'], 'reads this conversation only')
+  assert.match(text(card), /工单 · demo-01/)
+  assert.match(text(card), /待确认 · 4 张工单/)
+  const members = findAll(card, (n) => n.props['data-dag-member'] !== undefined)
+  assert.deepEqual(members.map(text), ['写文档的 · 2 张', '实现者 · 1 张', '默认成员 · 1 张'])
+  find(card, (n) => n.type === 'button').props.onClick()
+  assert.deepEqual(host.opened, [['dsh-resource://ticket-dag/' + key + '/demo-01', 'ticket-dag']])
+
+  // Before the run list answers, or for a run no longer listed, the click explains instead.
+  const missing = loadHost([null, null, ''])
+  const lone = missing.renderSlot('conversation.chat.node', { sessionId: 's1', node })
+  find(lone, (n) => n.type === 'button').props.onClick()
+  assert.deepEqual(missing.opened, [])
+  assert.match(missing.sets.at(-1), /找不到这轮运行的记录/)
+})
+
+test('a closed turn shows its run cards in the turn tail instead of at the folded tool call', () => {
+  const data = foldCard(loadHost([]).definitions[0], dagCall, dagResult(dagRunResult)).data
+  const closed = { turn: 3, status: 'closed' }
+  const node = { key: 'k1', kind: 'dsh-ticket-dag/run', data, location: { kind: 'turn', turn: closed } }
+  const host = loadHost([])
+  assert.equal(host.renderSlot('conversation.chat.node', { sessionId: 's1', node }), null)
+  const useChat = (select) => select({ nodes: new Map([['k1', node], ['x', { kind: 'assistant', location: node.location }]]) })
+  const tail = host.renderSlot('conversation.chat.turnTail', { sessionId: 's1', turn: closed, useChat })
+  assert.equal(findAll(tail, (n) => n.props['data-dag-run-card'] === 'demo-01').length, 1)
+  assert.equal(host.renderSlot('conversation.chat.turnTail', { sessionId: 's1', turn: { turn: 4, status: 'closed' }, useChat }), null)
+  assert.equal(host.renderSlot('conversation.chat.turnTail', { sessionId: 's1', turn: { turn: 3, status: 'open' }, useChat }), null)
 })
 
 test('the plugin page tab is the Agent preset page: max agents, presets, per-preset limit and model', () => {
