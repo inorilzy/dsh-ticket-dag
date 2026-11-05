@@ -101,7 +101,7 @@ window.__ModuleLoader__.load({
 .dtd-panel .dtd-command {display:grid;gap:.5rem;border-inline-start:2px solid color-mix(in srgb,currentColor 24%,transparent);padding-inline-start:.75rem}
 .dtd-panel .dtd-primary {background:#245d9b;border-color:transparent;color:#fff;font-weight:600}
 .dtd-panel .dtd-alert {padding:.5rem .7rem;border-inline-start:3px solid #d38f39}
-.dtd-dashboard {--dtd-work:var(--dsw-alias-state-business-primary,#4c8df6);--dtd-wait:var(--dsw-alias-state-warn-primary,#e5a03a);--dtd-done:var(--dsw-alias-state-success-primary,#3fb27f);--dtd-blocked:var(--dsw-alias-state-error-primary,#e5534b);--dtd-idle:color-mix(in srgb,currentColor 38%,transparent);--dtd-line:var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent));--dtd-card:color-mix(in srgb,currentColor 4%,transparent)}
+.dtd-dashboard {--dtd-work:var(--dsw-alias-state-business-primary,#4c8df6);--dtd-wait:var(--dsw-alias-state-warn-primary,#e5a03a);--dtd-done:var(--dsw-alias-state-success-primary,#3fb27f);--dtd-blocked:var(--dsw-alias-state-error-primary,#e5534b);--dtd-pending:var(--dsw-alias-text-secondary,#8b9099);--dtd-idle:color-mix(in srgb,currentColor 38%,transparent);--dtd-line:var(--dsw-alias-border-l2,color-mix(in srgb,currentColor 16%,transparent));--dtd-card:color-mix(in srgb,currentColor 4%,transparent)}
 .dtd-sr {position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
 .dtd-card {border:1px solid var(--dtd-line);border-radius:.75rem;background:var(--dtd-card);padding:.8rem .95rem;display:grid;gap:.3rem}
 .dtd-run-head {display:flex;align-items:baseline;gap:.6rem;flex-wrap:wrap}.dtd-run-head strong {font-size:1.02rem}.dtd-run-head .dtd-badge {margin-inline-start:auto}
@@ -109,10 +109,11 @@ window.__ModuleLoader__.load({
 .dtd-legend {display:flex;flex-wrap:wrap;gap:.25rem .9rem;font-size:.8rem}.dtd-legend span {display:inline-flex;align-items:center;gap:.3rem}
 .dtd-dot {display:inline-block;flex:none;width:.5rem;height:.5rem;border-radius:2px;background:var(--dtd-idle)}
 [data-tone=work]>.dtd-dot,.dtd-bar [data-dag-segment=work],.dtd-dot[data-tone=work] {background:var(--dtd-work)}
-[data-tone=wait]>.dtd-dot,.dtd-bar [data-dag-segment=wait],.dtd-dot[data-tone=wait] {background:var(--dtd-wait)}
+[data-tone=wait]>.dtd-dot,.dtd-dot[data-tone=wait] {background:var(--dtd-wait)}
+.dtd-progress [data-tone=wait]>.dtd-dot,.dtd-progress .dtd-dot[data-tone=wait],.dtd-bar [data-dag-segment=wait] {background:var(--dtd-pending)}
 [data-tone=done]>.dtd-dot,.dtd-bar [data-dag-segment=done],.dtd-dot[data-tone=done] {background:var(--dtd-done)}
 [data-tone=blocked]>.dtd-dot,.dtd-bar [data-dag-segment=blocked],.dtd-dot[data-tone=blocked] {background:var(--dtd-blocked)}
-.dtd-badge.wait {background:color-mix(in srgb,var(--dtd-wait) 24%,transparent)}.dtd-badge.blocked {background:color-mix(in srgb,var(--dtd-blocked) 24%,transparent)}
+.dtd-badge.wait {background:color-mix(in srgb,var(--dtd-wait) 24%,transparent)}.dtd-progress .dtd-badge.wait {background:color-mix(in srgb,var(--dtd-pending) 24%,transparent)}.dtd-badge.blocked {background:color-mix(in srgb,var(--dtd-blocked) 24%,transparent)}
 .dtd-banner {display:flex;align-items:center;gap:.5rem;border-radius:.5rem;padding:.4rem .7rem;font-size:.86rem;background:color-mix(in srgb,var(--dtd-blocked) 12%,transparent)}
 .dtd-fold {display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;border-radius:.5rem;padding:.3rem .5rem;background:var(--dtd-card)}
 .dtd-panel .dtd-fold button {border:0;padding:.2rem .3rem;font-weight:600}.dtd-fold .dtd-hint {margin-inline-start:auto}
@@ -128,7 +129,6 @@ window.__ModuleLoader__.load({
 .dtd-node-title {font-size:.84rem;line-height:1.35;opacity:.86;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .dtd-node[data-tone=work] {border-color:color-mix(in srgb,var(--dtd-work) 60%,transparent)}
 .dtd-node[data-tone=blocked] {border-color:color-mix(in srgb,var(--dtd-blocked) 70%,transparent)}
-.dtd-node[aria-pressed=true] {border-color:var(--dtd-wait);box-shadow:0 0 0 1px var(--dtd-wait)}
 .dtd-node[data-dim=true] {opacity:.42}.dtd-canvas path[data-active=false] {opacity:.45}
 .dtd-steps {display:flex;list-style:none;margin:.2rem 0;padding:0;gap:3px;font-size:.76rem}
 .dtd-steps li {flex:1;min-width:0;text-align:center;padding-top:.3rem;border-top:3px solid var(--dtd-idle);opacity:.7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -137,7 +137,7 @@ window.__ModuleLoader__.load({
 .dtd-steps [data-state=current] {border-top-color:transparent;background:linear-gradient(90deg,transparent,rgba(255,255,255,.7),transparent) -70% 0/40% 3px no-repeat border-box,linear-gradient(var(--dtd-work),var(--dtd-work)) 0 0/100% 3px no-repeat border-box;animation:dtd-sweep 1.4s linear infinite}
 .dtd-spin {flex:none;box-sizing:border-box;width:.75rem;height:.75rem;border-radius:50%;border:2px solid color-mix(in srgb,var(--dtd-work) 25%,transparent);border-top-color:var(--dtd-work);animation:dtd-rotate .8s linear infinite}
 .dtd-status {flex:none;width:.8rem;height:.8rem;fill:none;stroke:var(--dtd-idle);stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
-.dtd-status[data-tone=wait] {stroke:var(--dtd-wait)}.dtd-status[data-tone=done] {stroke:var(--dtd-done)}.dtd-status[data-tone=blocked] {stroke:var(--dtd-blocked)}
+.dtd-status[data-tone=wait] {stroke:var(--dtd-wait)}.dtd-progress .dtd-status[data-tone=wait] {stroke:var(--dtd-pending)}.dtd-status[data-tone=done] {stroke:var(--dtd-done)}.dtd-status[data-tone=blocked] {stroke:var(--dtd-blocked)}
 .dtd-canvas .dtd-status {position:static;inset:auto;pointer-events:none}.dtd-canvas .dtd-status path {stroke:inherit;stroke-width:inherit;opacity:1}
 @keyframes dtd-rotate {to {transform:rotate(360deg)}}
 @keyframes dtd-sweep {from {background-position:-70% 0,0 0} to {background-position:170% 0,0 0}}
@@ -191,6 +191,7 @@ window.__ModuleLoader__.load({
 .dtd-node-compact .dtd-node-head small {font-family:ui-monospace,monospace;font-size:.76rem}
 .dtd-node-compact .dtd-node-title {font-size:.9rem;opacity:.8}
 .dtd-panel .dtd-node.dtd-node-compact[data-tone=wait] {border-color:color-mix(in srgb,var(--dtd-wait) 75%,transparent)}
+.dtd-panel .dtd-progress .dtd-node.dtd-node-compact[data-tone=wait] {border-color:color-mix(in srgb,var(--dtd-pending) 75%,transparent)}
 .dtd-actionbar {position:sticky;bottom:0;z-index:2;display:grid;grid-template-columns:1fr 1fr auto;gap:.6rem;padding:.8rem 0 .2rem;background:var(--dsw-alias-bg-layer-1,Canvas);border-top:1px solid var(--dtd-line)}
 .dtd-panel .dtd-actionbar button {padding:.6rem .9rem;font-weight:600;border-radius:.55rem}
 .dtd-panel .dtd-actionbar .dtd-danger {border-color:transparent;color:var(--dtd-blocked)}
@@ -929,7 +930,8 @@ window.__ModuleLoader__.load({
       const rows = run.tickets.map((ticket) => ({ ticket, view: ticketView(ticket, byId, run.mode) }))
       const [listOpen, setListOpen] = useState(true)
       const [mapOpen, setMapOpen] = useState(true)
-      const [pinned, setPinned] = useState(null)
+      // The map node under the pointer or keyboard focus; null shows the default ticket.
+      const [hovered, setHovered] = useState(null)
       // Frozen tickets name their agent; the snapshot presets give its display name.
       const presets = run.presets ?? []
       const memberIds = [...new Set([...presets.map((p) => p.id), ...run.tickets.map((t) => t.agent ?? '')])]
@@ -939,10 +941,10 @@ window.__ModuleLoader__.load({
       const count = (s) => counts[s] ?? 0
       const attention = count('NEEDS_ATTENTION')
       const groups = [
+        ['done', '已集成', complete],
         ['work', '进行中', rows.filter((r) => r.view.tone === 'work').length],
         ['wait', '等待', rows.filter((r) => r.view.tone === 'wait').length],
         ['blocked', '需要处理', attention],
-        ['done', '已集成', complete],
         ['neutral', '已取消', count('CANCELLED')],
       ]
       const visible = rows.filter(
@@ -997,15 +999,11 @@ window.__ModuleLoader__.load({
           { type: 'button', 'aria-expanded': mapOpen, onClick: () => setMapOpen(!mapOpen) },
           (mapOpen ? '▾ ' : '▸ ') + '工单依赖',
         ),
-        h(
-          'span',
-          { className: 'dtd-hint' },
-          pinned ? '已固定 ' + pinned + ' · 再次点击取消' : '从左到右：上游合入后解锁 · 点击查看详情',
-        ),
+        h('span', { className: 'dtd-hint' }, '从左到右：上游合入后解锁 · 悬停查看详情'),
       )
       const mapBody =
         mapOpen &&
-        h(DependencyMap, { key: 'map', rows, pinned, setPinned, open, captain: run.captain, ownerOf: memberOf })
+        h(DependencyMap, { key: 'map', rows, hovered, setHovered, open, captain: run.captain, ownerOf: memberOf })
       const listBlock = h(
         'section',
         { className: 'dtd-block', 'aria-label': '工单列表', key: 'list-block' },
@@ -1020,7 +1018,7 @@ window.__ModuleLoader__.load({
       )
       return h(
         'section',
-        { className: 'dtd-section', 'aria-label': '运行详情' },
+        { className: 'dtd-section dtd-progress', 'aria-label': '运行详情' },
         h(CaptainCard, { run }),
         h(
           'section',
@@ -1164,7 +1162,7 @@ window.__ModuleLoader__.load({
 
     // Each node card names its ID, owner and task; ownerOf(ticket) returns the
     // owner's { name, color }. compact (plan review) has no focus or detail card.
-    function DependencyMap({ rows, pinned, setPinned, open, captain, compact = false, ownerOf }) {
+    function DependencyMap({ rows, hovered, setHovered, open, captain, compact = false, ownerOf }) {
       if (!rows.length) return null
       const tickets = rows.map((r) => r.ticket)
       const node = compact ? compactNode : fullNode
@@ -1219,7 +1217,7 @@ window.__ModuleLoader__.load({
         rows.find((r) => r.view.tone === 'work') ??
         rows.find((r) => r.ticket.status === 'PENDING') ??
         rows[0]
-      const focus = rows.find((r) => r.ticket.id === pinned) ?? urgent
+      const focus = rows.find((r) => r.ticket.id === hovered) ?? urgent
       const chain = chainOf(focus.ticket.id, tickets)
       return h(
         'div',
@@ -1264,11 +1262,14 @@ window.__ModuleLoader__.load({
                   'data-dag-node': ticket.id,
                   'data-tone': view.tone,
                   'data-dim': !chain.has(ticket.id),
-                  'aria-pressed': pinned === ticket.id,
                   'aria-label': summary,
                   title: summary,
                   style: { left: x, top: y, width: node.width, height: node.height },
-                  onClick: () => setPinned(pinned === ticket.id ? null : ticket.id),
+                  // Pointer and keyboard focus both light up the chain and drive the detail card.
+                  onMouseEnter: () => setHovered(ticket.id),
+                  onMouseLeave: () => setHovered(null),
+                  onFocus: () => setHovered(ticket.id),
+                  onBlur: () => setHovered(null),
                 },
                 h(
                   'span',
