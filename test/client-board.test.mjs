@@ -165,6 +165,13 @@ function findAll(node, match, out = []) {
 const find = (node, match) => findAll(node, match)[0]
 
 function boardFor(tickets) {
+  return boardHost(tickets).root
+}
+
+// Renders the progress board and keeps the host so a test can read state updates.
+// hovered seeds the dependency map's hovered ticket (RunProgress hook 7, after
+// Dashboard's four hooks and the filter and two fold states).
+function boardHost(tickets, { hovered } = {}) {
   const counts = {}
   for (const t of tickets) counts[t.status] = (counts[t.status] ?? 0) + 1
   const selected = {
@@ -179,8 +186,21 @@ function boardFor(tickets) {
     counts,
     tickets: tickets.map((t) => ({ dependsOn: [], attempt: 0, ...t })),
   }
-  const Dashboard = loadBoard([{ runs: [selected], selected }, selected.key])
-  return render({ type: Dashboard, props: {}, children: [] })
+  const seeds = [{ runs: [selected], selected }, selected.key]
+  if (hovered !== undefined) seeds.push('', null, 'all', true, true, hovered)
+  const host = loadHost(seeds)
+  const Dashboard = host.slots['sidebar.right.pane.tab'].component
+  return { host, root: render({ type: Dashboard, props: {}, children: [] }) }
+}
+
+// Declarations of every style rule whose selector list names exactly selector.
+function cssFor(root, selector) {
+  const css = text(find(root, (n) => n.type === 'style').children[0])
+  return css
+    .split('}')
+    .map((rule) => rule.split('{'))
+    .filter(([selectors]) => selectors.split(',').some((s) => s.trim() === selector))
+    .map(([, body]) => body.trim())
 }
 
 const sample = [
@@ -250,13 +270,63 @@ test('overall progress shows one segment and one legend entry per state group', 
   assert.deepEqual(
     segments.map((s) => [s.props['data-dag-segment'], s.props.style.flexGrow]),
     [
+      ['done', 1],
       ['work', 1],
       ['wait', 1],
-      ['done', 1],
     ],
   )
   const legend = text(find(root, (n) => n.props['data-dag-legend'] !== undefined))
   for (const part of ['进行中 1', '等待 1', '需要处理 0', '已集成 1']) assert.ok(legend.includes(part), legend)
+})
+
+test('overall progress runs integrated, working, waiting, then needs attention, in bar and legend alike', () => {
+  const root = boardFor([
+    { id: 'X', status: 'NEEDS_ATTENTION' },
+    { id: 'R', status: 'PENDING' },
+    { id: 'C', status: 'RUNNING', livePhase: { stage: 'agent' } },
+    { id: 'A', status: 'INTEGRATED' },
+  ])
+  const bar = find(root, (n) => n.props['data-dag-bar'] !== undefined)
+  assert.deepEqual(
+    findAll(bar, (n) => n.props['data-dag-segment'] !== undefined).map((s) => s.props['data-dag-segment']),
+    ['done', 'work', 'wait', 'blocked'],
+  )
+  const legend = find(root, (n) => n.props['data-dag-legend'] !== undefined)
+  assert.deepEqual(
+    legend.children.map((entry) => text(entry)),
+    ['已集成 1', '进行中 1', '等待 1', '需要处理 1'],
+  )
+})
+
+test('waiting shows in a neutral grey on the progress board, while the plan review keeps its orange', () => {
+  const root = boardFor(sample)
+  const pending = cssFor(root, '.dtd-dashboard').join(';').match(/--dtd-pending:([^;]+)/)?.[1]
+  assert.ok(pending, 'a --dtd-pending colour is defined')
+  assert.match(pending, /^var\(--dsw-alias-text-secondary,#[0-9a-f]{6}\)$/)
+  assert.doesNotMatch(pending, /e5a03a|--dtd-wait/)
+  const grey = (selector, property) => {
+    const rules = cssFor(root, selector)
+    assert.ok(rules.length, 'a rule for ' + selector)
+    for (const body of rules) {
+      assert.match(body, new RegExp(property + ':[^;]*var\\(--dtd-pending\\)'), selector)
+      assert.doesNotMatch(body, /--dtd-wait|e5a03a/, selector)
+    }
+  }
+  grey('.dtd-bar [data-dag-segment=wait]', 'background')
+  grey('.dtd-progress .dtd-dot[data-tone=wait]', 'background')
+  grey('.dtd-progress [data-tone=wait]>.dtd-dot', 'background')
+  grey('.dtd-progress .dtd-status[data-tone=wait]', 'stroke')
+  grey('.dtd-progress .dtd-badge.wait', 'background')
+  grey('.dtd-panel .dtd-progress .dtd-node.dtd-node-compact[data-tone=wait]', 'border-color')
+  // The board wraps every one of those in .dtd-progress.
+  const progress = find(root, (n) => n.props['aria-label'] === '运行详情')
+  assert.match(progress.props.className, /\bdtd-progress\b/)
+  assert.ok(find(progress, (n) => n.props['data-dag-bar'] !== undefined))
+  assert.ok(find(progress, (n) => n.props['data-dag-map'] !== undefined))
+  assert.ok(find(progress, (n) => n.props['data-dag-ticket'] !== undefined))
+  // Untouched: the 待确认 pill and the plan review's waiting node border.
+  assert.match(cssFor(root, '.dtd-pill')[0], /var\(--dtd-wait\)/)
+  assert.match(cssFor(root, '.dtd-panel .dtd-node.dtd-node-compact[data-tone=wait]')[0], /var\(--dtd-wait\)/)
 })
 
 test('dependency map lays tickets out left to right by depth with one edge per dependency', () => {
@@ -305,6 +375,70 @@ test('focusing a ticket highlights its whole upstream and downstream chain and d
   assert.deepEqual(dim, { A: false, B: false, C: false, X: true })
   const active = findAll(map, (n) => n.props['data-dag-edge'] !== undefined).map((p) => p.props['data-active'])
   assert.deepEqual(active, [true, true])
+})
+
+const chainTickets = [
+  { id: 'A', status: 'INTEGRATED' },
+  { id: 'B', status: 'RUNNING', dependsOn: ['A'], livePhase: { stage: 'agent' } },
+  { id: 'C', status: 'PENDING', dependsOn: ['B'] },
+  { id: 'X', status: 'PENDING' },
+  { id: 'Y', status: 'PENDING', dependsOn: ['X'] },
+]
+const mapState = (root) => {
+  const map = find(root, (n) => n.props['data-dag-map'] !== undefined)
+  return {
+    dim: Object.fromEntries(
+      findAll(map, (n) => n.props['data-dag-node'] !== undefined).map((n) => [n.props['data-dag-node'], n.props['data-dim']]),
+    ),
+    edges: Object.fromEntries(
+      findAll(map, (n) => n.props['data-dag-edge'] !== undefined).map((p) => [p.props['data-dag-edge'], p.props['data-active']]),
+    ),
+    detail: find(root, (n) => n.props['data-dag-detail'] !== undefined).props['data-dag-detail'],
+  }
+}
+
+test('hovering or focusing a node highlights its chain, dims the rest and drives the detail card', () => {
+  const { host, root } = boardHost(chainTickets)
+  // Nothing hovered: the default most urgent ticket and its chain.
+  assert.deepEqual(mapState(root), {
+    dim: { A: false, B: false, C: false, X: true, Y: true },
+    edges: { 'A>B': true, 'B>C': true, 'X>Y': false },
+    detail: 'B',
+  })
+  const node = find(root, (n) => n.props['data-dag-node'] === 'Y')
+  node.props.onMouseEnter()
+  node.props.onMouseLeave()
+  node.props.onFocus()
+  node.props.onBlur()
+  assert.deepEqual(
+    host.indexed.filter(([at]) => at === 7),
+    [
+      [7, 'Y'],
+      [7, null],
+      [7, 'Y'],
+      [7, null],
+    ],
+  )
+  // While Y is hovered its chain lights up and the detail card follows it.
+  assert.deepEqual(mapState(boardHost(chainTickets, { hovered: 'Y' }).root), {
+    dim: { A: true, B: true, C: true, X: false, Y: false },
+    edges: { 'A>B': false, 'B>C': false, 'X>Y': true },
+    detail: 'Y',
+  })
+  // Back to nothing hovered restores the default view.
+  assert.deepEqual(mapState(boardHost(chainTickets, { hovered: null }).root), mapState(root))
+})
+
+test('clicking a node no longer pins it: no pressed state, no selected border, no 已固定 hint', () => {
+  const { root } = boardHost(chainTickets, { hovered: 'Y' })
+  for (const node of findAll(root, (n) => n.props['data-dag-node'] !== undefined)) {
+    assert.equal(node.props.onClick, undefined)
+    assert.equal(node.props['aria-pressed'], undefined)
+  }
+  const fold = find(root, (n) => n.props['aria-label'] === '依赖图')
+  assert.doesNotMatch(text(fold), /已固定|再次点击取消|点击查看详情/)
+  assert.match(text(fold), /悬停查看详情/)
+  assert.deepEqual(cssFor(root, '.dtd-node[aria-pressed=true]'), [])
 })
 
 test('ticket detail shows a stage stepper and node tooltips name the live stage', () => {
