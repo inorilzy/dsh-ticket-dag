@@ -213,6 +213,36 @@ test('the progress board and the plan review open with the full run ID as their 
   assert.equal(findAll(pane, (n) => n.props['data-dag-run-title'] !== undefined).length, 1)
 })
 
+test('only a working ticket spins; the others show a still icon in their state colour', () => {
+  const root = boardFor([
+    { id: 'A', status: 'INTEGRATED' },
+    { id: 'C', status: 'RUNNING', livePhase: { stage: 'agent' } },
+    { id: 'Q', status: 'SUBMITTED' },
+    { id: 'M', status: 'SUBMITTED', livePhase: { stage: 'merge' } },
+    { id: 'R', status: 'PENDING' },
+    { id: 'X', status: 'NEEDS_ATTENTION' },
+  ])
+  const node = (id) => find(root, (n) => n.props['data-dag-node'] === id)
+  const icon = (id) => {
+    const head = find(node(id), (n) => n.props.className === 'dtd-node-head')
+    if (find(head, (n) => n.props.className === 'dtd-spin')) return 'spin'
+    return find(head, (n) => n.props.className === 'dtd-status')?.props['data-tone'] ?? null
+  }
+  assert.deepEqual(
+    ['A', 'C', 'Q', 'M', 'R', 'X'].map((id) => [id, node(id).props['data-tone'], icon(id)]),
+    [
+      ['A', 'done', 'done'],
+      ['C', 'work', 'spin'],
+      ['Q', 'wait', 'wait'],
+      ['M', 'work', 'spin'],
+      ['R', 'wait', 'wait'],
+      ['X', 'blocked', 'blocked'],
+    ],
+  )
+  const legend = text(find(root, (n) => n.props['data-dag-legend'] !== undefined))
+  for (const part of ['进行中 2', '等待 2']) assert.ok(legend.includes(part), legend)
+})
+
 test('overall progress shows one segment and one legend entry per state group', () => {
   const root = boardFor(sample)
   const bar = find(root, (n) => n.props['data-dag-bar'] !== undefined)

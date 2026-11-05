@@ -134,6 +134,14 @@ window.__ModuleLoader__.load({
 .dtd-steps li {flex:1;min-width:0;text-align:center;padding-top:.3rem;border-top:3px solid var(--dtd-idle);opacity:.7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dtd-steps [data-state=done] {border-color:var(--dtd-done);opacity:1}
 .dtd-steps [data-state=current] {border-color:var(--dtd-work);opacity:1;font-weight:600}
+.dtd-steps [data-state=current] {border-top-color:transparent;background:linear-gradient(90deg,transparent,rgba(255,255,255,.7),transparent) -70% 0/40% 3px no-repeat border-box,linear-gradient(var(--dtd-work),var(--dtd-work)) 0 0/100% 3px no-repeat border-box;animation:dtd-sweep 1.4s linear infinite}
+.dtd-spin {flex:none;box-sizing:border-box;width:.75rem;height:.75rem;border-radius:50%;border:2px solid color-mix(in srgb,var(--dtd-work) 25%,transparent);border-top-color:var(--dtd-work);animation:dtd-rotate .8s linear infinite}
+.dtd-status {flex:none;width:.8rem;height:.8rem;fill:none;stroke:var(--dtd-idle);stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.dtd-status[data-tone=wait] {stroke:var(--dtd-wait)}.dtd-status[data-tone=done] {stroke:var(--dtd-done)}.dtd-status[data-tone=blocked] {stroke:var(--dtd-blocked)}
+.dtd-canvas .dtd-status {position:static;inset:auto;pointer-events:none}.dtd-canvas .dtd-status path {stroke:inherit;stroke-width:inherit;opacity:1}
+@keyframes dtd-rotate {to {transform:rotate(360deg)}}
+@keyframes dtd-sweep {from {background-position:-70% 0,0 0} to {background-position:170% 0,0 0}}
+@media (prefers-reduced-motion:reduce) {.dtd-spin,.dtd-steps [data-state=current] {animation:none}}
 .dtd-detail .dtd-run-head strong {font-size:.96rem}
 .dtd-panel .dtd-preset:not(.dtd-rule) {border:1px solid color-mix(in srgb,currentColor 16%,transparent);border-radius:.55rem;padding:.5rem .75rem}
 .dtd-preset-row {display:flex;flex-wrap:wrap;align-items:center;gap:.3rem .8rem}
@@ -809,8 +817,11 @@ window.__ModuleLoader__.load({
         else if (missing.length) label = '等待依赖'
         else if (mode === 'paused') label = '暂停派工'
         else if (ticket.retryAt > Date.now()) label = '等待退避重试'
-        else [label, tone] = ['可派工', 'neutral']
+        // In a live run a ready ticket waits for a slot; in a plan under review it is merely startable.
+        else [label, tone] = ['可派工', mode === 'staged' ? 'neutral' : 'wait']
       }
+      // A submitted ticket only works while it holds the integration slot; otherwise it queues.
+      if (ticket.status === 'SUBMITTED' && !ticket.livePhase) tone = 'wait'
       const phase = ticket.livePhase
       let stage =
         ['RUNNING', 'SUBMITTED', 'PUBLISHING'].includes(ticket.status) && phase && stages[phase.stage]
@@ -911,8 +922,8 @@ window.__ModuleLoader__.load({
       const count = (s) => counts[s] ?? 0
       const attention = count('NEEDS_ATTENTION')
       const groups = [
-        ['work', '进行中', count('RUNNING') + count('SUBMITTED') + count('PUBLISHING')],
-        ['wait', '等待', count('PENDING')],
+        ['work', '进行中', rows.filter((r) => r.view.tone === 'work').length],
+        ['wait', '等待', rows.filter((r) => r.view.tone === 'wait').length],
         ['blocked', '需要处理', attention],
         ['done', '已集成', complete],
         ['neutral', '已取消', count('CANCELLED')],
@@ -1246,6 +1257,7 @@ window.__ModuleLoader__.load({
                   h('span', { className: 'dtd-dot' }),
                   h(Avatar, { route: ticketRoute(ticket, captain), size: 16 }),
                   ticket.id,
+                  h(StatusIcon, { tone: view.tone }),
                   // An unassigned ticket keeps its state here instead of a placeholder owner.
                   ticket.agent
                     ? h('small', { 'data-dag-color': owner.color, style: { color: owner.color } }, owner.name)
@@ -1257,6 +1269,22 @@ window.__ModuleLoader__.load({
           ),
         ),
         h(TicketDetail, { ...focus, tickets, open, member: ownerOf(focus.ticket) }),
+      )
+    }
+
+    // Only a working ticket moves; the others get a still glyph in their tone colour.
+    const statusGlyphs = {
+      wait: 'M4 2h8M4 14h8M5 2c0 4 6 4 6 6s-6 2-6 6M11 2c0 4-6 4-6 6s6 2 6 6',
+      done: 'M3 8.5l3.2 3L13 4.5',
+      blocked: 'M8 1.5a6.5 6.5 0 1 0 0 13a6.5 6.5 0 1 0 0-13M8 4.5v4.2M8 11v.5',
+    }
+    function StatusIcon({ tone }) {
+      if (tone === 'work') return h('span', { className: 'dtd-spin', 'aria-hidden': true })
+      if (!statusGlyphs[tone]) return null
+      return h(
+        'svg',
+        { className: 'dtd-status', 'data-tone': tone, viewBox: '0 0 16 16', 'aria-hidden': true },
+        h('path', { d: statusGlyphs[tone] }),
       )
     }
 
