@@ -875,6 +875,97 @@ test('vendor recognition covers the main model families and falls back to a gene
   )
 })
 
+test('a recognised vendor avatar shows that vendor icon and no abbreviation tag; an unknown model keeps the ? figure', () => {
+  const models = {
+    deepseek: 'deepseek-official/deepseek-v4-pro',
+    claude: 'anthropic/claude-opus-4',
+    gemini: 'google/gemini-2.5-pro',
+    grok: 'xai/grok-4',
+    gpt: 'openai/gpt-5',
+    qwen: 'dashscope/qwen3-max',
+    kimi: 'moonshot/kimi-k2',
+    glm: 'zhipu/glm-4.6',
+  }
+  const root = boardFor([
+    ...Object.entries(models).map(([id, model]) => ({ id, status: 'PENDING', model })),
+    { id: 'unknown', status: 'PENDING', model: 'local/llama-3' },
+  ])
+  const avatarOf = (id) =>
+    find(
+      find(root, (n) => n.props['data-dag-ticket'] === id),
+      (n) => n.props['data-dag-avatar'] !== undefined,
+    )
+  const tags = (node) => findAll(node, (n) => n.props.className === 'dtd-avatar-tag')
+  for (const id of Object.keys(models)) {
+    const avatar = avatarOf(id)
+    assert.equal(avatar.props['data-dag-avatar'], id)
+    const icon = find(avatar, (n) => n.props['data-dag-vendor-icon'] !== undefined)
+    assert.equal(icon?.props['data-dag-vendor-icon'], id, id + ' shows its own icon')
+    assert.ok(findAll(icon, (n) => n.type === 'path' && n.props.d).length > 0, id + ' icon has path data')
+    assert.deepEqual(tags(avatar), [], id + ' has no abbreviation tag')
+    assert.equal(text(avatar), '')
+  }
+  const unknown = avatarOf('unknown')
+  assert.equal(unknown.props['data-dag-avatar'], 'generic')
+  assert.equal(unknown.props.title, '通用模型')
+  assert.equal(find(unknown, (n) => n.props['data-dag-vendor-icon'] !== undefined), undefined)
+  assert.deepEqual(tags(unknown).map(text), ['?'])
+})
+
+test('two Gemini avatars on one page use distinct gradient ids that their own paths reference', () => {
+  const root = boardFor([
+    { id: 'A', status: 'PENDING', model: 'google/gemini-2.5-pro' },
+    { id: 'B', status: 'PENDING', model: 'google/gemini-2.5-flash' },
+  ])
+  const gradientIds = (id) => {
+    const avatar = find(
+      find(root, (n) => n.props['data-dag-ticket'] === id),
+      (n) => n.props['data-dag-avatar'] !== undefined,
+    )
+    const ids = findAll(avatar, (n) => n.type === 'linearGradient').map((n) => n.props.id)
+    const refs = findAll(avatar, (n) => n.type === 'path' && /^url\(#/.test(n.props.fill ?? '')).map((n) =>
+      n.props.fill.slice(5, -1),
+    )
+    assert.equal(ids.length, 3)
+    assert.deepEqual(refs, ids, 'each gradient path points at a gradient in the same avatar')
+    return ids
+  }
+  const a = gradientIds('A')
+  const b = gradientIds('B')
+  assert.equal(new Set([...a, ...b]).size, 6)
+  const all = findAll(root, (n) => n.type === 'linearGradient').map((n) => n.props.id)
+  assert.equal(new Set(all).size, all.length, 'no gradient id repeats on the page')
+})
+
+test('the client builds icons with elements and never injects raw HTML', () => {
+  const source = readFileSync(resolve(import.meta.dirname, '..', 'src', 'client.js'), 'utf8')
+  assert.doesNotMatch(source, /innerHTML|dangerouslySetInnerHTML/)
+})
+
+test('a member avatar keeps its colour and shows a vendor badge for its model, else the captain model, else ?', () => {
+  const selected = reviewRun()
+  // implementer stays on acme/deep-2 (unknown), test-writer moves to GPT, docs uses the host default.
+  selected.tickets = selected.tickets.map((t) =>
+    t.agent === 'test-writer' ? { ...t, route: { provider: 'openai', model: 'gpt-5', reasoningEffort: '' } } : t,
+  )
+  const pane = loadHost([{ runs: [selected], selected }, selected.key]).renderSlot('sidebar.right.pane.tab', {
+    sessionId: 'session-captain',
+  })
+  const badge = (id) => {
+    const avatar = find(
+      find(pane, (n) => n.props['data-dag-member'] === id),
+      (n) => n.props['data-dag-avatar'] !== undefined,
+    )
+    assert.equal(avatar.props['data-dag-avatar'], 'member')
+    const icon = find(avatar, (n) => n.props['data-dag-vendor-icon'] !== undefined)
+    if (icon) return icon.props['data-dag-vendor-icon']
+    return findAll(avatar, (n) => n.props.className === 'dtd-avatar-tag').map(text).join('')
+  }
+  assert.equal(badge('implementer'), '?')
+  assert.equal(badge('test-writer'), 'gpt')
+  assert.equal(badge('docs'), 'claude', 'a member on the host default follows the captain model')
+})
+
 test('the progress board also shows the captain, and avatars on ticket rows and map nodes', () => {
   const selected = {
     ...stagedRun([]),

@@ -161,3 +161,7 @@ DSH_TEST_ROLLING=1 node --test test/dsh-e2e.mjs
 ## 当前范围
 
 本版面向单机、单仓库和已有 spec/tickets 的 Git 开发任务。只读审核报告暂不作为独立的 DAG 节点；交付由配置的可执行验收项把关。worker 默认使用宿主模型路由；工单可通过预设 Agent 指定角色说明和模型。已包含：启动前确认（`requireApproval`，默认开启），在右侧栏审查计划，按成员或对勾选的成员批量修改模型与推理强度，按工单改负责人，然后批准或放弃；每轮运行一个右侧栏标签「工单 · <runId>」，对话顶部的“查看工单”打开最新一轮；队长卡与成员显示名；每个预设的同时运行上限；运行完成后自动清理已集成的 worktree 和分支（`autoCleanup`）及手动的 `dag_cleanup`；用 `dag_add` 向已有运行追加工单。审查面板不能修改工单内容、依赖或验收项，这些仍需队长重新提交清单。专门的 LLM reviewer、同目录跨票工位池和自动发布 PR 均未包含。可先用上述 A/C/B 示例确定本机环境，再运行真实开发任务。
+
+## 第三方素材
+
+看板头像中的模型厂商图标（OpenAI/GPT、Claude、DeepSeek、Grok、Gemini、Qwen、Kimi、智谱 GLM）的路径数据内联在 `src/client.js` 中，来自 [lobehub/lobe-icons](https://github.com/lobehub/lobe-icons)（npm 包 `@lobehub/icons-static-svg@1.102.0`），按 MIT 许可使用。各厂商图标是其商标，归各自所有者所有。
