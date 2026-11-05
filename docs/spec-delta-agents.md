@@ -1,6 +1,6 @@
 # SPEC 变更：预设 Agent 与模型目录
 
-相对交接包 `refs\handoff\dsh-ticket-dag-0.2.0\docs\SPEC.md`（只读，未修改）的增量。覆盖 0.3.0–0.8.0 及其后尚未发布的修复；按版本的条目见 `CHANGELOG.md`。
+相对交接包 `refs\handoff\dsh-ticket-dag-0.2.0\docs\SPEC.md`（只读，未修改）的增量。覆盖 0.3.0–0.9.2，以及尚未发布的工作树清理与追加工单；按版本的条目见 `CHANGELOG.md`。
 
 ## 范围变化
 
@@ -79,6 +79,36 @@ owner-only `POST /api/ticket-dag.approve`，body `{ key, action: 'approve' | 'di
 - 派工前、验收前和发布前，以及 `dag_resume`、批准时，比对 SQLite 账本与摘要。不一致时暂停该轮并通知队长；从未批准的运行（例如账本里被改成 `active`）退回 `staged`。
 - 局限：从磁盘加载的运行以加载时的账本为准，协调器未运行期间的修改无法察觉，非 `staged` 的运行视为已批准。能写账本的本地进程同样能改 Git 与 worktree，这不是权限边界，只防止误改或越过审批开工。
 
+## 工作树清理（未发布）
+
+- 配置 `autoCleanup`（布尔，默认 `true`，实时生效）。新增队长工具 `dag_cleanup({ runId })`，返回运行快照加每张工单的 `results: [{ id, status, reason? }]`。
+- 自动清理的时机：全部工单为 `INTEGRATED`、至少一张工单尚无清理结果、没有待投递的通知，且账本中已有 `run_completed` 事件。通知投递成功后唤醒该轮，重新判断是否到期。`dag_cleanup` 不看这些条件，可用于已结束的运行。
+- 范围：`cancelled` 运行的所有工单、非 `INTEGRATED` 的工单一律跳过；只处理账本中该工单的 `path` 与 `branch`。已 `cleaned` 的工单不再处理；`skipped` 的工单自动清理不重试，`dag_cleanup` 会重试。
+- `git.cleanupWorktree(repo, { path, branch, target, baseRef, root })` 的保护：
+  - 拒绝（抛错，记为 `skipped`，原因前缀 `refused:`）：分支等于集成分支或 `baseRef` 指向的本地分支；路径不在插件 worktree 根目录内；路径是主 worktree；该路径检出的是别的分支；该分支在另一 worktree 中检出。
+  - 跳过（返回原因）：工单分支不是集成分支的祖先；worktree 有未提交改动；路径存在但不是已登记的 worktree。
+  - 删除：`git worktree remove`、以集成分支为上游的 `git branch -d`、`git worktree prune`，均不强制。集成分支永不删除。
+- 账本：`tickets` 新增 `cleanup`（`cleaned` | `skipped` | NULL）与 `cleanupReason` 列，打开旧账本时补列，NULL 视为未清理。`RunStore.recordCleanup(id, status, reason)` 只写 `INTEGRATED` 且未 `cleaned` 的工单，并记 `cleanup_cleaned` / `cleanup_skipped` 事件。
+- 快照：运行带 `cleanup: { cleaned, skipped }`，工单行带 `cleanup` 与 `cleanupReason`；冷历史缺列时读为 `null`。看板阶段条末尾新增“清理”步（`done` / `skipped` / `todo`），运行概况显示“已清理 N 张 / 跳过 M 张（原因）”。
+
+## 追加工单（未发布）
+
+- 配置 `maxAppendedTickets`（非负整数，默认 20，实时生效）。新增队长工具 `dag_add({ runId, tickets })`，`tickets` 为工单数组或其 JSON 字符串，返回运行快照。
+- 规范化：`normalizeAppend` 对每张工单使用与清单相同的规则；验收 ID 在当前配置与本轮冻结命令的并集中查找。`RunStore.append` 拒绝与本轮已有工单（不区分大小写）重复的 ID，并对“已有工单 + 本批”整体检查依赖、环与产物关系（`external_inputs` 取原清单）。
+- 幂等：与此前某一批逐项相同（忽略解析出的 `agentSpec`）时返回该批结果，`added: false`；同一 ID 换了内容再追加被拒绝。`cancelled` 运行拒绝追加。累计追加数超过 `maxAppendedTickets` 时拒绝并提示另开 `dag_run`。
+- 审批：`dag_add` 不需要用户批准，追加的工单以 `PENDING` 进入调度，仍经过试合并、验收和集成。`staged` 运行把它们并入待审查的计划，`RunStore.approve` 与 `Coordinator.approve` 按 `plan()` 列出全部工单。已批准的运行中，追加工单的 `agent` 若与批准时已在计划中的某张工单相同，沿用其 `provider`/`model`/`reasoningEffort`，角色说明按当前配置解析；否则按当前配置解析。
+- 验收命令：本轮已冻结的验收 ID 沿用冻结命令，新 ID 按当前配置冻结。每批记录自己的 `policyHash`，`_checkPolicy` 同时核对原清单与每一批。
+- 已完成的运行：追加后存在非 `INTEGRATED` 工单，运行重新派工；新工单全部集成时再写一条 `run_completed` 并通知队长，随后自动清理只处理尚无清理结果的新工单。
+- 快照：工单行带 `appended` 与 `appendedAt`；看板与审查面板为追加工单显示“追加”标记，悬停显示追加时间。
+
+### 清单语义变化
+
+此前运行的工单集合等于 `dag_run` 时规范化并冻结的清单（`run.manifest`），之后只有批准会改写工单定义。现在运行的工单集合是**原清单 + 追加记录**：
+
+- `run.manifest` 仍保持 `dag_run` 提交时的样子，不写入追加的工单，因此用原清单重新 `dag_run` 仍幂等，原清单的 `policyHash` 不变。
+- 追加的工单另存于新表 `appended`（`ticketId`、`batch`、`definition`、`policyHash`、`createdAt`），同时插入 `tickets` 与 `dependencies`。`RunStore.plan()` 返回原清单工单加各批追加工单，`RunStore.appended()` 按批返回追加记录。
+- 账本防篡改摘要的 `approval` 部分加入 `appended` 表的全部字段；协调器自己追加后以新账本为可信状态。冷启动时从原清单加各批追加工单恢复验收命令。
+
 ## 其他修复（本轮）
 
 - Windows 验收命令：`argv[0]` 经 `PATH`/`PATHEXT` 解析为 `.cmd`/`.bat` 时，经 `cmd.exe /d /s /v:off /c` 执行，每个参数加双引号；参数含 `"`、`%`、`!`、`^`、`&`、`|`、`<`、`>`、CR、LF 时拒绝。超时、取消或输出超限时终止整棵进程树：Windows `taskkill /T /F`，POSIX 用独立进程组并 `kill(-pid)`。
@@ -107,3 +137,11 @@ owner-only `POST /api/ticket-dag.approve`，body `{ key, action: 'approve' | 'di
 | `.cmd` 经 cmd.exe 执行且不注入（仅 win32）、超时与取消终止进程树 | `test/git.test.mjs` |
 | 身份检查缓存后换成另一个 clone 仍被拒绝 | `test/git.test.mjs` |
 | 关闭时一轮失败不影响其他轮、记录失败出错时暂停 | `test/coordinator.test.mjs` |
+| 8 个队长工具；`dag_cleanup`、`dag_add` 仅限队长，`autoCleanup` 默认开启，`maxAppendedTickets` 默认 20 | `test/host.test.mjs` |
+| 清理只删已合入且干净的工单 worktree 与分支，集成分支和 main 保留提交；拒绝集成分支、base 分支、他处检出与根目录外路径；源码中不强制删除 | `test/git.test.mjs` |
+| 清理结果只记录在已集成工单上，旧账本读为未清理（含冷历史） | `test/store.test.mjs`、`test/dashboard.test.mjs` |
+| 运行完成且通知队长后自动清理、`dag_cleanup` 幂等；`autoCleanup` 关闭时不删、开启后补做；有改动的 worktree 带原因跳过；取消的运行不清理 | `test/coordinator.test.mjs` |
+| 阶段条的清理步、运行概况的清理计数 | `test/client-board.test.mjs` |
+| 追加工单遵循清单规则、可依赖本轮或同批工单、原清单不变；待确认运行的追加工单并入审批计划 | `test/store.test.mjs`、`test/coordinator.test.mjs` |
+| `dag_add` 无需再批准即派工、沿用已批准成员的模型、受上限约束；已完成运行被重开后再次通知并只清理新工单 | `test/coordinator.test.mjs` |
+| 看板与审查面板的“追加”标记与悬停时间 | `test/client-board.test.mjs` |
