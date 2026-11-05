@@ -20,6 +20,7 @@ import {
   readCommitMessage,
   publishCandidate,
   releaseCandidate,
+  cleanupWorktree,
   runChecks,
 } from '../src/git.mjs'
 
@@ -195,6 +196,109 @@ test('conflict state and worker commits persist; retry adopts an explicitly reso
   const resolved = await finish(conflict, 'common.txt', 'A+B\n', 'Resolve ticket B with A')
   assert.equal(await buildCandidate(repo, conflict, first, bTip), resolved)
   await assertMergeParents(repo, resolved, first, bTip)
+})
+
+// Publishes each ticket tip onto the integration branch through an exact trial merge.
+async function land(repo, root, tips) {
+  let tip = await resolveRef(repo, target)
+  for (const [i, source] of tips.entries()) {
+    const trial = join(root, 'trial-' + i)
+    const candidate = await buildCandidate(repo, trial, tip, source)
+    tip = await publishCandidate(repo, target, tip, candidate)
+    await releaseCandidate(repo, trial, candidate)
+  }
+  return tip
+}
+
+test('cleanup removes only merged clean ticket worktrees and branches; integration and main keep their commits', async (t) => {
+  const { root, repo, base, main } = await fixture(t)
+  await initIntegration(repo, target, base)
+  const owned = join(root, 'worktrees')
+  const slot = (id) => join(owned, 'tickets', id)
+  const branch = (id) => 'ticket/test-run/' + id
+  const tips = {}
+  for (const id of ['A', 'B', 'C']) {
+    await prepareWorktree(repo, slot(id), branch(id), base)
+    tips[id] = await finish(slot(id), id + '.txt', id, 'Finish ' + id)
+  }
+  // A and C are merged; B never lands.
+  await land(repo, root, [tips.A, tips.C])
+  await writeFile(join(slot('C'), 'notes.txt'), 'uncommitted')
+  const before = { main: await resolveRef(repo, 'main'), target: await resolveRef(repo, target) }
+  const request = (id) => ({ path: slot(id), branch: branch(id), target, baseRef: 'main', root: owned })
+
+  assert.deepEqual(await cleanupWorktree(repo, request('A')), { status: 'cleaned' })
+  await assert.rejects(access(slot('A')))
+  assert.equal(await localRefExists(repo, 'refs/heads/' + branch('A')), false)
+  // Repeating a finished cleanup is not an error.
+  assert.equal((await cleanupWorktree(repo, request('A'))).status, 'cleaned')
+
+  const unmerged = await cleanupWorktree(repo, request('B'))
+  assert.equal(unmerged.status, 'skipped')
+  assert.match(unmerged.reason, /not merged/)
+  await access(slot('B'))
+  assert.equal(await resolveRef(repo, branch('B')), tips.B)
+
+  const dirty = await cleanupWorktree(repo, request('C'))
+  assert.equal(dirty.status, 'skipped')
+  assert.match(dirty.reason, /uncommitted/)
+  assert.equal(await readFile(join(slot('C'), 'notes.txt'), 'utf8'), 'uncommitted')
+  assert.equal(await resolveRef(repo, branch('C')), tips.C)
+
+  assert.equal(await localRefExists(repo, 'refs/heads/main'), true)
+  assert.equal(await localRefExists(repo, target), true)
+  assert.deepEqual({ main: await resolveRef(repo, 'main'), target: await resolveRef(repo, target) }, before)
+  assert.equal(await g(main, 'branch', '--show-current'), 'main')
+  assert.equal(await g(main, 'config', '--get-regexp', '^branch\\.ticket/test-run/A\\.').catch(() => ''), '')
+})
+
+test('cleanup refuses the integration branch, the base branch, foreign checkouts and paths outside its root', async (t) => {
+  const { root, repo, base, main } = await fixture(t)
+  await initIntegration(repo, target, base)
+  const owned = join(root, 'worktrees')
+  const before = { main: await resolveRef(repo, 'main'), target: await resolveRef(repo, target) }
+  const request = { target, baseRef: 'main', root: owned }
+  await assert.rejects(
+    cleanupWorktree(repo, { ...request, path: join(owned, 'tickets', 'I'), branch: 'integration/test-run' }),
+    /protected/,
+  )
+  await assert.rejects(
+    cleanupWorktree(repo, { ...request, path: join(owned, 'tickets', 'M'), branch: 'main' }),
+    /protected/,
+  )
+  // A base_ref naming any branch protects that branch, even one shaped like a ticket branch.
+  const based = join(owned, 'tickets', 'base')
+  await prepareWorktree(repo, based, 'ticket/old-run/base', base)
+  await assert.rejects(
+    cleanupWorktree(repo, { ...request, baseRef: 'ticket/old-run/base', path: based, branch: 'ticket/old-run/base' }),
+    /protected/,
+  )
+  await access(based)
+  // Another worktree has this ticket branch checked out.
+  await assert.rejects(
+    cleanupWorktree(repo, { ...request, path: join(owned, 'tickets', 'elsewhere'), branch: 'ticket/old-run/base' }),
+    /checked out/,
+  )
+  const outside = join(root, 'outside', 'X')
+  await prepareWorktree(repo, outside, 'ticket/test-run/X', base)
+  await assert.rejects(
+    cleanupWorktree(repo, { ...request, path: outside, branch: 'ticket/test-run/X' }),
+    /worktree root/,
+  )
+  await access(outside)
+  await assert.rejects(
+    cleanupWorktree(repo, { ...request, root, path: main, branch: 'ticket/test-run/X' }),
+    /main worktree/,
+  )
+  assert.equal(await localRefExists(repo, 'refs/heads/ticket/old-run/base'), true)
+  assert.equal(await localRefExists(repo, 'refs/heads/ticket/test-run/X'), true)
+  assert.deepEqual({ main: await resolveRef(repo, 'main'), target: await resolveRef(repo, target) }, before)
+})
+
+test('cleanup source never forces a worktree removal or a branch deletion', async () => {
+  const source = await readFile(new URL('../src/git.mjs', import.meta.url), 'utf8')
+  assert.match(source, /export async function cleanupWorktree/)
+  assert.doesNotMatch(source, /'--force'|'-f'|'-D'/)
 })
 
 test('checks use exact argv, stop on nonzero exit, timeout and honor cancellation', async (t) => {

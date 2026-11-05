@@ -832,6 +832,175 @@ test('a ledger error while recording a worker or merge failure holds the run wit
   }
 })
 
+const exists = (path) =>
+  readFile(path).then(
+    () => true,
+    (e) => (e.code === 'ENOENT' ? false : true),
+  )
+const ticketBranches = async (cwd) => (await git(cwd, 'branch', '--list', 'ticket/*')).split('\n').filter(Boolean)
+
+test(
+  'a completed run removes its integrated worktrees and branches after the captain is notified; dag_cleanup is idempotent',
+  { timeout: limit(90000) },
+  async (t) => {
+    const cwd = await repo(t)
+    const main = await git(cwd, 'rev-parse', 'main')
+    const delivered = gate()
+    const notices = []
+    const options = {
+      checks: noopChecks,
+      notify: async (e) => {
+        await delivered.wait
+        notices.push(e)
+        return true
+      },
+      launch: async (job) => ({
+        dispose: async () => {},
+        result: (async () => {
+          await commit(job)
+          return { ok: true }
+        })(),
+      }),
+    }
+    const co = new Coordinator(options)
+    let reopened
+    const q = { cwd, parentId: 'captain', runId: 'auto-clean' }
+    try {
+      await co.start({ ...q, manifest: { spec_id: 'clean', tickets: [ticket('A'), ticket('B', ['A'])] } })
+      const done = await until(async () => {
+        const s = await co.status(q)
+        if (s.counts.NEEDS_ATTENTION) throw Error(JSON.stringify(s))
+        return s.complete && s
+      }, 'complete')
+      const tip = await git(cwd, 'rev-parse', 'integration/auto-clean')
+      await sleep(300)
+      // Nothing is removed before the completion notice reaches the captain.
+      for (const row of (await co.status(q)).tickets) {
+        assert.equal(row.cleanup, null)
+        assert.equal(await exists(join(row.path, 'A.txt')), true)
+      }
+      delivered.release()
+      const cleaned = await until(async () => {
+        const s = await co.status(q)
+        return s.tickets.every((r) => r.cleanup === 'cleaned') && s
+      }, 'auto cleanup')
+      assert.equal(notices.length, 1)
+      assert.deepEqual(cleaned.cleanup, { cleaned: 2, skipped: 0 })
+      for (const row of done.tickets) assert.equal(await exists(join(row.path, 'A.txt')), false)
+      assert.deepEqual(await ticketBranches(cwd), [])
+      assert.equal(await git(cwd, 'rev-parse', 'main'), main)
+      assert.equal(await git(cwd, 'rev-parse', 'integration/auto-clean'), tip)
+      const again = await co.cleanup(q)
+      assert.deepEqual(
+        again.results.map((r) => [r.id, r.status]),
+        [
+          ['A', 'cleaned'],
+          ['B', 'cleaned'],
+        ],
+      )
+      await co.close()
+      // An ended run reopened by a new coordinator can still be cleaned by hand, again without error.
+      reopened = new Coordinator({ ...options, notify: async () => true })
+      const old = await reopened.cleanup(q)
+      assert.deepEqual(old.results.map((r) => r.status), ['cleaned', 'cleaned'])
+      assert.deepEqual(old.cleanup, { cleaned: 2, skipped: 0 })
+      assert.equal(await git(cwd, 'rev-parse', 'integration/auto-clean'), tip)
+    } finally {
+      delivered.release()
+      await co.close()
+      await reopened?.close()
+    }
+  },
+)
+
+test(
+  'with autoCleanup off nothing is removed until it is switched on; a dirty worktree is skipped with its reason',
+  { timeout: limit(90000) },
+  async (t) => {
+    const cwd = await repo(t)
+    const settings = { checks: noopChecks, maxWorkers: 16, checkTimeoutMs: 20000 }
+    const co = new Coordinator({
+      ...settings,
+      autoCleanup: false,
+      notify: async () => true,
+      launch: async (job) => ({
+        dispose: async () => {},
+        result: (async () => {
+          await commit(job)
+          return { ok: true }
+        })(),
+      }),
+    })
+    const q = { cwd, parentId: 'captain', runId: 'manual-clean' }
+    try {
+      await co.start({ ...q, manifest: { spec_id: 'manual', tickets: [ticket('A'), ticket('B')] } })
+      const done = await until(async () => {
+        const s = await co.status(q)
+        if (s.counts.NEEDS_ATTENTION) throw Error(JSON.stringify(s))
+        return s.complete && s.pendingNotifications === 0 && s
+      }, 'complete and notified')
+      await sleep(500)
+      const paths = Object.fromEntries(done.tickets.map((r) => [r.id, r.path]))
+      for (const row of (await co.status(q)).tickets) assert.equal(row.cleanup, null)
+      assert.equal(await exists(join(paths.A, 'A.txt')), true)
+      assert.equal((await ticketBranches(cwd)).length, 2)
+      await writeFile(join(paths.A, 'scratch.txt'), 'keep me')
+      co.updateSettings({ ...settings, autoCleanup: true })
+      const after = await until(async () => {
+        const s = await co.status(q)
+        return s.tickets.every((r) => r.cleanup) && s
+      }, 'cleanup after switching on')
+      const [a, b] = after.tickets
+      assert.equal(a.cleanup, 'skipped')
+      assert.match(a.cleanupReason, /uncommitted/)
+      assert.equal(b.cleanup, 'cleaned')
+      assert.deepEqual(after.cleanup, { cleaned: 1, skipped: 1 })
+      assert.equal(await readFile(join(paths.A, 'scratch.txt'), 'utf8'), 'keep me')
+      assert.equal(await exists(join(paths.B, 'B.txt')), false)
+      // A manual cleanup retries the skipped ticket once its worktree is clean.
+      await rm(join(paths.A, 'scratch.txt'))
+      const manual = await co.cleanup(q)
+      assert.deepEqual(manual.results.map((r) => r.status), ['cleaned', 'cleaned'])
+      assert.deepEqual(await ticketBranches(cwd), [])
+    } finally {
+      await co.close()
+    }
+  },
+)
+
+test('a cancelled run is never cleaned', { timeout: limit(60000) }, async (t) => {
+  const cwd = await repo(t)
+  const co = new Coordinator({
+    checks: noopChecks,
+    notify: async () => true,
+    launch: async (job) => ({
+      dispose: async () => {},
+      result: (async () => {
+        if (job.ticketId === 'B') {
+          // B keeps working until the run is cancelled.
+          await new Promise((r) => job.signal.addEventListener('abort', r, { once: true }))
+          return { ok: false, detail: 'cancelled' }
+        }
+        await commit(job)
+        return { ok: true }
+      })(),
+    }),
+  })
+  const q = { cwd, parentId: 'captain', runId: 'cancel-clean' }
+  try {
+    await co.start({ ...q, manifest: { spec_id: 'cancel', tickets: [ticket('A'), ticket('B')] } })
+    await until(async () => (await co.status(q)).counts.INTEGRATED === 1, 'A integrates')
+    await co.cancel(q)
+    const result = await co.cleanup(q)
+    assert.ok(result.results.every((r) => r.status === 'skipped'))
+    const a = result.tickets.find((r) => r.id === 'A')
+    assert.equal(a.cleanup, null)
+    assert.equal(await exists(join(a.path, 'A.txt')), true)
+  } finally {
+    await co.close()
+  }
+})
+
 test('shutdown closes every run even if one run fails to close', { timeout: limit(60000) }, async (t) => {
   const cwd = await repo(t)
   const options = { checks: noopChecks, requireApproval: true, launch: async () => Error('unexpected launch') }

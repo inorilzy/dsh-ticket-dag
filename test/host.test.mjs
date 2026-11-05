@@ -37,7 +37,7 @@ function harness(extra = {}) {
     events = new Map()
   let cleanup, api
   const controller = {}
-  for (const action of ['start', 'attach', 'status', 'pause', 'resume', 'retry', 'cancel', 'close']) {
+  for (const action of ['start', 'attach', 'status', 'pause', 'resume', 'retry', 'cancel', 'cleanup', 'close']) {
     controller[action] = async (request) => {
       calls.push([action, request])
       return { action }
@@ -116,13 +116,13 @@ function harness(extra = {}) {
   }
 }
 
-test('six captain tools bind identity and trusted checks, existing and new root sessions auto-attach', async () => {
+test('seven captain tools bind identity and trusted checks, existing and new root sessions auto-attach', async () => {
   const h = harness()
   await afterPublication()
   assert.deepEqual(h.calls, [['attach', { cwd: '/repo', parentId: 'root' }]])
   assert.deepEqual(
     [...h.tools.keys()],
-    ['dag_run', 'dag_status', 'dag_pause', 'dag_resume', 'dag_retry', 'dag_cancel'],
+    ['dag_run', 'dag_status', 'dag_pause', 'dag_resume', 'dag_retry', 'dag_cancel', 'dag_cleanup'],
   )
   await h.invoke('dag_run', {
     manifest: '{"specId":"x"}',
@@ -144,6 +144,19 @@ test('six captain tools bind identity and trusted checks, existing and new root 
   assert.deepEqual(h.calls.at(-1)[1], { cwd: '/repo', parentId: 'root', runId: 'r', id: 'A' })
   await h.invoke('dag_retry', { runId: 'r', id: 'A', isolated: true })
   assert.equal(h.calls.at(-1)[1].isolated, true)
+  await h.close()
+})
+
+test('dag_cleanup is a captain-only run tool and autoCleanup defaults on', async () => {
+  const h = harness()
+  assert.deepEqual(h.tools.get('dag_cleanup').parameters, { runId: h.tools.get('dag_status').parameters.runId })
+  assert.equal(h.api.autoCleanup, true)
+  assert.equal(harness({ autoCleanup: false }).api.autoCleanup, false)
+  await h.invoke('dag_cleanup', { runId: 'old-run', cwd: '/etc' })
+  assert.deepEqual(h.calls.at(-1), ['cleanup', { cwd: '/repo', parentId: 'root', runId: 'old-run' }])
+  const before = h.calls.length
+  await assert.rejects(h.invoke('dag_cleanup', { runId: 'old-run' }, h.child), /top-level/)
+  assert.equal(h.calls.length, before)
   await h.close()
 })
 

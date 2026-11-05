@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { spawn } from 'node:child_process'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import { DatabaseSync } from 'node:sqlite'
 import { RunStore, normalizeManifest } from '../src/store.mjs'
 
 const checks = {
@@ -237,6 +238,36 @@ test('publish intent survives restart, commits exactly one completion notice and
       [done.id],
     )
     assert.equal(db.ackNotification(done.id), true)
+  } finally {
+    db.close()
+  }
+})
+
+test('cleanup results persist only for integrated tickets; a ledger from before cleanup reads as not cleaned', (t) => {
+  const file = tempDb(t)
+  let db = new RunStore(file)
+  try {
+    init(db, manifest([ticket('A'), ticket('B')]))
+    const a = db.claim('A', assignment('A'))
+    submit(db, a, 'source')
+    publish(db, a, 'start', 'source', 'landed')
+    db.close()
+    // The ledger layout of earlier releases has no cleanup columns.
+    const old = new DatabaseSync(file)
+    old.exec('ALTER TABLE tickets DROP COLUMN cleanupReason; ALTER TABLE tickets DROP COLUMN cleanup')
+    old.close()
+    db = new RunStore(file)
+    assert.equal(db.get('A').cleanup, null)
+    assert.equal(db.get('A').cleanupReason, null)
+    assert.equal(db.recordCleanup('B', 'cleaned'), false)
+    assert.equal(db.recordCleanup('A', 'skipped', 'worktree has uncommitted changes'), true)
+    assert.deepEqual([db.get('A').cleanup, db.get('A').cleanupReason], ['skipped', 'worktree has uncommitted changes'])
+    assert.equal(db.recordCleanup('A', 'cleaned'), true)
+    // A cleaned ticket stays cleaned.
+    assert.equal(db.recordCleanup('A', 'skipped', 'late'), false)
+    assert.deepEqual([db.get('A').cleanup, db.get('A').cleanupReason], ['cleaned', null])
+    assert.throws(() => db.recordCleanup('A', 'gone'), /cleanup status/)
+    assert.equal(db.get('B').cleanup, null)
   } finally {
     db.close()
   }

@@ -153,6 +153,8 @@ export class RunCatalog {
             retryAt: t.retryAt,
             message: displayDiagnostic(t.message),
             livePhase: t.livePhase ?? null,
+            cleanup: t.cleanup ?? null,
+            cleanupReason: displayDiagnostic(t.cleanupReason),
           })),
         }
       return summary
@@ -188,11 +190,16 @@ function readLedger(file, entry, detail, globalLimit) {
       complete: total > 0 && counts.INTEGRATED === total,
     }
     if (detail) {
+      // A ledger from before worktree cleanup has no cleanup columns: not cleaned.
+      const columns = new Set(db.prepare('PRAGMA table_info(tickets)').all().map((c) => c.name))
+      const cleanup = columns.has('cleanup') && columns.has('cleanupReason')
+        ? 'cleanup,cleanupReason'
+        : 'NULL AS cleanup,NULL AS cleanupReason'
       result.tickets = db
         .prepare(
           `SELECT id,json_extract(definition,'$.title') AS title,
         json_extract(definition,'$.dependsOn') AS deps,status,attempt,baseSha,sourceSha,landedSha,
-        path,branch,childId,message,autoRetries,retryAt,json_extract(definition,'$.agent') AS agent,
+        path,branch,childId,message,autoRetries,retryAt,${cleanup},json_extract(definition,'$.agent') AS agent,
         json_extract(definition,'$.agentSpec.provider') AS provider,
         json_extract(definition,'$.agentSpec.model') AS modelId FROM tickets ORDER BY position`,
         )

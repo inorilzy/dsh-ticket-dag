@@ -157,6 +157,7 @@ export class Coordinator {
     checks = {},
     agents = {},
     requireApproval = false,
+    autoCleanup = true,
     maxWorkers = 16,
     checkTimeoutMs = 120000,
     retryDelayMs = 1500,
@@ -175,6 +176,7 @@ export class Coordinator {
       checks,
       agents,
       requireApproval,
+      autoCleanup,
       maxWorkers,
       checkTimeoutMs,
       retryDelayMs,
@@ -195,7 +197,14 @@ export class Coordinator {
     return cap > 0 && (this.activeByAgent.get(agent) ?? 0) >= cap
   }
 
-  updateSettings({ checks, agents = this.agents, requireApproval = this.requireApproval, maxWorkers, checkTimeoutMs }) {
+  updateSettings({
+    checks,
+    agents = this.agents,
+    requireApproval = this.requireApproval,
+    autoCleanup = this.autoCleanup,
+    maxWorkers,
+    checkTimeoutMs,
+  }) {
     requireValue(
       Number.isInteger(maxWorkers) && maxWorkers >= 1 && maxWorkers <= 32,
       'Host maxWorkers must be 1..32',
@@ -206,7 +215,7 @@ export class Coordinator {
     )
     // Already-open runs retain their immutable verification command and agent
     // preset snapshots. A running worker or a verification process keeps its handle.
-    Object.assign(this, { checks, agents, requireApproval, maxWorkers, checkTimeoutMs })
+    Object.assign(this, { checks, agents, requireApproval, autoCleanup, maxWorkers, checkTimeoutMs })
     for (const run of this.runs.values()) this._wake(run)
   }
 
@@ -536,6 +545,10 @@ export class Coordinator {
       verifiedSha: m.tipSha,
       maxWorkers: Math.min(this.maxWorkers, run.limit),
       counts,
+      cleanup: {
+        cleaned: tickets.filter((t) => t.cleanup === 'cleaned').length,
+        skipped: tickets.filter((t) => t.cleanup === 'skipped').length,
+      },
       diagnostic: run.haltError || m.diagnostic || null,
       tickets: tickets.map(
         ({
@@ -555,6 +568,8 @@ export class Coordinator {
           retryAt,
           agent,
           agentSpec,
+          cleanup,
+          cleanupReason,
         }) => ({
           id,
           title,
@@ -583,6 +598,8 @@ export class Coordinator {
           message,
           autoRetries,
           retryAt,
+          cleanup: cleanup ?? null,
+          cleanupReason: cleanupReason ?? null,
         }),
       ),
       pendingNotifications: run.db.pendingNotifications().length,
@@ -691,6 +708,64 @@ export class Coordinator {
   }
 
   /**
+   * The captain's dag_cleanup: remove the recorded worktree and branch of every
+   * integrated ticket of a run, including an ended one. Cleaned tickets stay
+   * cleaned; skipped ones are tried again.
+   * @returns the run snapshot with one { id, status, reason } result per ticket.
+   */
+  async cleanup(q) {
+    const run = await this._open(q)
+    const results = await serial(run, () => this._cleanup(run, true))
+    return { ...this._snapshot(run), results }
+  }
+
+  // Due once every ticket is integrated and the completion notice reached the captain.
+  _cleanupDue(run, rows) {
+    if (!this.autoCleanup || !rows.length || !rows.every((t) => t.status === 'INTEGRATED')) return false
+    if (!rows.some((t) => !t.cleanup) || run.db.pendingNotifications().length) return false
+    return run.db.events().some((e) => e.type === 'run_completed')
+  }
+
+  // Only the ledger's own path and branch of an INTEGRATED ticket in a run
+  // that was not cancelled; git.cleanupWorktree refuses anything else.
+  async _cleanup(run, manual) {
+    const m = run.db.meta()
+    const results = []
+    for (const t of run.db.tickets()) {
+      if (m.mode === 'cancelled') {
+        results.push({ id: t.id, status: 'skipped', reason: 'run cancelled' })
+        continue
+      }
+      if (t.status !== 'INTEGRATED') {
+        results.push({ id: t.id, status: 'skipped', reason: 'ticket is ' + t.status })
+        continue
+      }
+      if (t.cleanup === 'cleaned' || (t.cleanup && !manual) || this.stopping) {
+        results.push({ id: t.id, status: t.cleanup ?? 'skipped', reason: t.cleanupReason ?? undefined })
+        continue
+      }
+      let result
+      if (!t.path || !t.branch) result = { status: 'skipped', reason: 'no recorded worktree' }
+      else {
+        try {
+          result = await git.cleanupWorktree(m.repo, {
+            path: t.path,
+            branch: t.branch,
+            target: m.ref,
+            baseRef: m.manifest.baseRef,
+            root: run.root,
+          })
+        } catch (err) {
+          result = { status: 'skipped', reason: 'refused: ' + message(err) }
+        }
+      }
+      run.db.recordCleanup(t.id, result.status, result.reason ?? null)
+      results.push({ id: t.id, ...result })
+    }
+    return results
+  }
+
+  /**
    * The user's approval of a staged run, from the board. Each choice names a
    * ticket and its preset (empty for none) plus provider/model/reasoningEffort;
    * tickets without a choice keep their planned preset. Presets resolve from
@@ -794,11 +869,15 @@ export class Coordinator {
     if (run.notifier || !run.db.pendingNotifications().length) return
     run.notifier = (async () => {
       const m = run.db.meta()
+      let delivered = false
       for (const e of run.db.pendingNotifications()) {
         if (this.stopping) break
         if (!(await this.notify({ parentId: m.parentId, eventId: e.eventId, text: eventText(m, e) }))) break
         run.db.ackNotification(e.eventId)
+        delivered = true
       }
+      // A delivered completion notice can make worktree cleanup due.
+      if (delivered && !this.stopping) this._wake(run)
     })()
       .catch(() => {})
       .finally(() => {
@@ -815,6 +894,10 @@ export class Coordinator {
     if (run.db.intents().length) await this._reconcile(run)
     const rows = run.db.tickets(),
       byId = new Map(rows.map((t) => [t.id, t]))
+    if (this._cleanupDue(run, rows)) {
+      await this._cleanup(run, false)
+      return
+    }
     const submitted = rows.find((t) => t.status === 'SUBMITTED')
     const ready = rows.filter(
       (t) => t.status === 'PENDING' && t.dependsOn.every((d) => byId.get(d)?.status === 'INTEGRATED'),

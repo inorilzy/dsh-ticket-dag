@@ -198,7 +198,8 @@ const SCHEMA = `
     id TEXT PRIMARY KEY, definition TEXT NOT NULL, position INTEGER NOT NULL UNIQUE,
     status TEXT NOT NULL CHECK(status IN (${STATES_SQL})), attempt INTEGER NOT NULL DEFAULT 0,
     lease TEXT, baseSha TEXT, sourceSha TEXT, landedSha TEXT, childId TEXT, path TEXT, branch TEXT, message TEXT,
-    retryAt INTEGER NOT NULL DEFAULT 0 CHECK(retryAt >= 0), autoRetries INTEGER NOT NULL DEFAULT 0 CHECK(autoRetries >= 0)
+    retryAt INTEGER NOT NULL DEFAULT 0 CHECK(retryAt >= 0), autoRetries INTEGER NOT NULL DEFAULT 0 CHECK(autoRetries >= 0),
+    cleanup TEXT CHECK(cleanup IN ('cleaned', 'skipped')), cleanupReason TEXT
   );
   CREATE TABLE IF NOT EXISTS dependencies (
     ticketId TEXT NOT NULL REFERENCES tickets(id), upstream TEXT NOT NULL REFERENCES tickets(id),
@@ -251,6 +252,11 @@ export class RunStore {
         'PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;',
       )
       this.#db.exec(SCHEMA)
+      // Ledgers from before worktree cleanup lack its columns: NULL reads as not cleaned.
+      const columns = new Set(this.#db.prepare('PRAGMA table_info(tickets)').all().map((c) => c.name))
+      if (!columns.has('cleanup'))
+        this.#db.exec("ALTER TABLE tickets ADD COLUMN cleanup TEXT CHECK(cleanup IN ('cleaned', 'skipped'))")
+      if (!columns.has('cleanupReason')) this.#db.exec('ALTER TABLE tickets ADD COLUMN cleanupReason TEXT')
     } catch (error) {
       this.#db.close()
       throw error
@@ -661,6 +667,32 @@ export class RunStore {
           .run(id)
         this.#event('retry_requested', ticket, 'Ticket retry requested', { oldLease: ticket.lease })
       }
+      return true
+    })
+  }
+
+  /**
+   * Record one integrated ticket's worktree cleanup.
+   * @param status - 'cleaned' or 'skipped'; a cleaned ticket is never reopened.
+   * @param reason - why it was skipped.
+   * @returns true when the ticket's record changed.
+   */
+  recordCleanup(id, status, reason = null) {
+    if (status !== 'cleaned' && status !== 'skipped') throw new TypeError('invalid cleanup status: ' + status)
+    if (reason !== null) text(reason, 'cleanup reason')
+    return this.#transaction(() => {
+      const changed = this.#db
+        .prepare(
+          `UPDATE tickets SET cleanup=?, cleanupReason=? WHERE id=? AND status='INTEGRATED'
+          AND cleanup IS NOT 'cleaned'`,
+        )
+        .run(status, status === 'cleaned' ? null : reason, id)
+      if (changed.changes !== 1) return false
+      const ticket = this.get(id)
+      this.#event('cleanup_' + status, ticket, reason ?? id + ' worktree and branch removed', {
+        path: ticket.path,
+        branch: ticket.branch,
+      })
       return true
     })
   }
