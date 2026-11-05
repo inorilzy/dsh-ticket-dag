@@ -362,12 +362,15 @@ test('ticket detail defaults to the most urgent ticket and names its neighbours'
 })
 
 test('focusing a ticket highlights its whole upstream and downstream chain and dims the rest', () => {
-  const root = boardFor([
-    { id: 'A', status: 'INTEGRATED' },
-    { id: 'B', status: 'RUNNING', dependsOn: ['A'], livePhase: { stage: 'agent' } },
-    { id: 'C', status: 'PENDING', dependsOn: ['B'] },
-    { id: 'X', status: 'PENDING' },
-  ])
+  const { root } = boardHost(
+    [
+      { id: 'A', status: 'INTEGRATED' },
+      { id: 'B', status: 'RUNNING', dependsOn: ['A'], livePhase: { stage: 'agent' } },
+      { id: 'C', status: 'PENDING', dependsOn: ['B'] },
+      { id: 'X', status: 'PENDING' },
+    ],
+    { hovered: 'B' },
+  )
   const map = find(root, (n) => n.props['data-dag-map'] !== undefined)
   const dim = Object.fromEntries(
     findAll(map, (n) => n.props['data-dag-node'] !== undefined).map((n) => [n.props['data-dag-node'], n.props['data-dim']]),
@@ -399,12 +402,15 @@ const mapState = (root) => {
 
 test('hovering or focusing a node highlights its chain, dims the rest and drives the detail card', () => {
   const { host, root } = boardHost(chainTickets)
-  // Nothing hovered: the default most urgent ticket and its chain.
+  // Nothing hovered: no node or edge is dimmed, and the detail card still shows the most urgent ticket.
   assert.deepEqual(mapState(root), {
-    dim: { A: false, B: false, C: false, X: true, Y: true },
-    edges: { 'A>B': true, 'B>C': true, 'X>Y': false },
+    dim: { A: false, B: false, C: false, X: false, Y: false },
+    edges: { 'A>B': undefined, 'B>C': undefined, 'X>Y': undefined },
     detail: 'B',
   })
+  const unhovered = find(root, (n) => n.props['data-dag-map'] !== undefined)
+  assert.equal(findAll(unhovered, (n) => n.props['data-dim'] === true).length, 0)
+  assert.equal(findAll(unhovered, (n) => n.props['data-active'] === false).length, 0)
   const node = find(root, (n) => n.props['data-dag-node'] === 'Y')
   node.props.onMouseEnter()
   node.props.onMouseLeave()
