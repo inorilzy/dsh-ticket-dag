@@ -150,7 +150,6 @@ window.__ModuleLoader__.load({
 .dtd-check span {display:grid;gap:.15rem}
 .dtd-panel .dtd-ticket-head input[type=checkbox] {width:auto;margin:0}
 .dtd-avatar {position:relative;display:inline-flex;flex:none;border-radius:50%}
-.dtd-avatar-badge {position:absolute;right:-.2rem;bottom:-.15rem;display:inline-flex;border-radius:50%;box-shadow:0 0 0 1px color-mix(in srgb,Canvas 60%,transparent)}
 .dtd-avatar-tag {position:absolute;right:-.25rem;bottom:-.2rem;min-width:1rem;padding:0 .18rem;border-radius:.4rem;font-size:.58rem;line-height:.9rem;font-weight:700;color:#fff;text-align:center;border:1px solid color-mix(in srgb,Canvas 60%,transparent)}
 .dtd-block {border:1px solid var(--dtd-line);border-radius:.8rem;background:var(--dtd-card);padding:.85rem .95rem;display:grid;gap:.55rem;min-width:0}
 .dtd-panel .dtd-block > h4,.dtd-member-head h4 {font-size:1.05rem;font-weight:700}
@@ -171,7 +170,10 @@ window.__ModuleLoader__.load({
 .dtd-wizard [data-state=current] {opacity:1;color:var(--dtd-work);font-weight:600}
 .dtd-wizard [data-state=current] span {background:var(--dtd-work);color:#fff}
 .dtd-wizard [data-state=done] {opacity:1}.dtd-wizard [data-state=done] span {background:var(--dtd-done);color:#fff}
-.dtd-member-head,.dtd-member {display:grid;grid-template-columns:1.1rem 2rem minmax(0,1fr) 7.5rem 6rem;align-items:center;gap:.5rem}
+.dtd-member-head,.dtd-member {display:grid;grid-template-columns:1.1rem 2rem minmax(0,1fr) minmax(0,auto) 7.5rem 6rem;align-items:center;gap:.5rem}
+.dtd-member-tasks {justify-self:start;max-width:100%;padding:.12rem .5rem;border-radius:.35rem;background:color-mix(in srgb,currentColor 10%,transparent);font-size:.8rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dtd-member-captain-model {grid-column:5 / 7;font-size:.84rem;opacity:.8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dtd-map-hint {margin:.4rem 0 0;font-size:.82rem}
 .dtd-member-head h4 {grid-column:2 / 4}.dtd-member-head h4 small {font-weight:400;font-size:.8rem}
 .dtd-member {padding:.4rem 0;border-top:1px solid var(--dtd-line)}
 .dtd-member .dtd-route,.dtd-member-head .dtd-route {display:contents}
@@ -191,7 +193,6 @@ window.__ModuleLoader__.load({
 .dtd-panel .dtd-node.dtd-node-compact {padding:.55rem .7rem;border-radius:.6rem;gap:.3rem;background:color-mix(in srgb,currentColor 4%,var(--dsw-alias-bg-layer-1,Canvas))}
 .dtd-node-compact .dtd-node-head small {font-family:ui-monospace,monospace;font-size:.76rem}
 .dtd-node-compact .dtd-node-title {font-size:.9rem;opacity:.8}
-.dtd-panel .dtd-node.dtd-node-compact[data-tone=wait] {border-color:color-mix(in srgb,var(--dtd-wait) 75%,transparent)}
 .dtd-panel .dtd-progress .dtd-node.dtd-node-compact[data-tone=wait] {border-color:color-mix(in srgb,var(--dtd-pending) 75%,transparent)}
 .dtd-actionbar {position:sticky;bottom:0;z-index:2;display:grid;grid-template-columns:1fr 1fr auto;gap:.6rem;padding:.8rem 0 .2rem;background:var(--dsw-alias-bg-layer-1,Canvas);border-top:1px solid var(--dtd-line)}
 .dtd-panel .dtd-actionbar button {padding:.6rem .9rem;font-weight:600;border-radius:.55rem}
@@ -1168,7 +1169,10 @@ window.__ModuleLoader__.load({
       const tickets = rows.map((r) => r.ticket)
       const node = compact ? compactNode : fullNode
       const layout = dagLayout(tickets, node)
-      if (compact)
+      if (compact) {
+        // Nothing has started in a plan, so waiting tasks stay plain grey. Hover
+        // or focus lights up a node's upstream and downstream and dims the rest.
+        const lit = hovered && tickets.some((t) => t.id === hovered) ? chainOf(hovered, tickets) : null
         return h(
           'div',
           { className: 'dtd-graph', 'data-dag-map': '' },
@@ -1179,7 +1183,12 @@ window.__ModuleLoader__.load({
               'svg',
               { width: layout.width, height: layout.height, 'aria-hidden': true },
               ...layout.edges.map((e) =>
-                h('path', { key: e.from + '>' + e.to, 'data-dag-edge': e.from + '>' + e.to, d: e.d }),
+                h('path', {
+                  key: e.from + '>' + e.to,
+                  'data-dag-edge': e.from + '>' + e.to,
+                  d: e.d,
+                  'data-active': lit ? lit.has(e.from) && lit.has(e.to) : undefined,
+                }),
               ),
             ),
             ...rows.map(({ ticket, view }) => {
@@ -1192,7 +1201,12 @@ window.__ModuleLoader__.load({
                   key: ticket.id,
                   className: 'dtd-node dtd-node-compact',
                   'data-dag-node': ticket.id,
-                  'data-tone': view.tone,
+                  'data-tone': view.tone === 'wait' ? 'neutral' : view.tone,
+                  'data-dim': lit ? !lit.has(ticket.id) : false,
+                  onMouseEnter: () => setHovered?.(ticket.id),
+                  onMouseLeave: () => setHovered?.(null),
+                  onFocus: () => setHovered?.(ticket.id),
+                  onBlur: () => setHovered?.(null),
                   tabIndex: 0,
                   role: 'group',
                   'aria-label': [ticket.id, owner.name, ticket.title !== ticket.id && ticket.title, view.label]
@@ -1203,7 +1217,7 @@ window.__ModuleLoader__.load({
                 },
                 h(
                   'span',
-                  { className: 'dtd-node-head', 'data-tone': view.tone },
+                  { className: 'dtd-node-head', 'data-tone': view.tone === 'wait' ? 'neutral' : view.tone },
                   h('span', { className: 'dtd-dot' }),
                   ticket.id,
                   h('small', { 'data-dag-color': owner.color, style: { color: owner.color } }, owner.name),
@@ -1213,6 +1227,7 @@ window.__ModuleLoader__.load({
             }),
           ),
         )
+      }
       const urgent =
         rows.find((r) => r.ticket.status === 'NEEDS_ATTENTION') ??
         rows.find((r) => r.view.tone === 'work') ??
@@ -1500,53 +1515,45 @@ window.__ModuleLoader__.load({
     }
 
     // A recognised vendor shows its official icon on a light disc, which keeps
-    // colour icons legible in either theme. With color it is a member figure
-    // (plan review) whose badge names its model vendor, or the captain's when
-    // the member uses the host default. An unknown model keeps the grey ? figure.
+    // colour icons legible in either theme. With color it is a plan-review
+    // member: the disc is ringed in the member colour, and a member on the host
+    // default shows the captain's vendor. An unknown model keeps a plain figure:
+    // in the member colour for a member, else the grey ? figure.
     function Avatar({ route, captain, size = 28, color: memberColor, tag: showTag = true }) {
-      const [id, name, , vendorColor, tag] = vendorOf(route?.provider, route?.model)
+      const own = vendorOf(route?.provider, route?.model)
+      const [id, name, , vendorColor, tag] =
+        memberColor && route && !route.model ? vendorOf(captain?.provider, captain?.model) : own
       const color = memberColor ?? vendorColor
       const figure = (fill) => [
         h('circle', { key: 'b', cx: 16, cy: 16, r: 16, fill }),
         h('circle', { key: 'h', cx: 16, cy: 12.5, r: 5.5, fill: '#fff', fillOpacity: 0.92 }),
         h('path', { key: 's', d: 'M6.5 27.5c1.3-5.8 5.1-8.8 9.5-8.8s8.2 3 9.5 8.8z', fill: '#fff', fillOpacity: 0.92 }),
       ]
-      const disc = (key) => h('circle', { key, cx: 16, cy: 16, r: 15.5, fill: '#fff', stroke: '#d4d4d8', strokeWidth: 1 })
-      let badge = null
-      if (memberColor && route) {
-        const [badgeId] = route.model ? [id] : vendorOf(captain?.provider, captain?.model)
-        const badgeSize = Math.round(size * 0.46)
-        badge =
-          badgeId === 'generic'
-            ? h('span', { className: 'dtd-avatar-tag', style: { background: genericVendor[3] } }, genericVendor[4])
-            : h(
-                'span',
-                { className: 'dtd-avatar-badge', style: { width: badgeSize, height: badgeSize } },
-                h(
-                  'svg',
-                  { viewBox: '0 0 32 32', width: badgeSize, height: badgeSize, 'aria-hidden': true },
-                  disc('d'),
-                  h(VendorIcon, { id: badgeId, x: 6, y: 6, size: 20 }),
-                ),
-              )
-      } else if (!memberColor && id === 'generic' && showTag) {
-        badge = h('span', { className: 'dtd-avatar-tag', style: { background: color } }, tag)
-      }
+      const disc = h('circle', {
+        key: 'd',
+        cx: 16,
+        cy: 16,
+        r: memberColor ? 15 : 15.5,
+        fill: '#fff',
+        stroke: memberColor ?? '#d4d4d8',
+        strokeWidth: memberColor ? 2 : 1,
+      })
+      const known = id !== 'generic'
       return h(
         'span',
         {
           className: 'dtd-avatar',
-          'data-dag-avatar': memberColor ? 'member' : id,
+          'data-dag-avatar': known ? id : memberColor ? 'member' : id,
           'data-dag-color': color,
-          title: memberColor ? undefined : name,
+          title: known || !memberColor ? name : undefined,
           style: { width: size, height: size },
         },
         h(
           'svg',
           { viewBox: '0 0 32 32', width: size, height: size, 'aria-hidden': true },
-          memberColor || id === 'generic' ? figure(color) : [disc('d'), h(VendorIcon, { key: 'i', id, x: 6, y: 6, size: 20 })],
+          known ? [disc, h(VendorIcon, { key: 'i', id, x: 6, y: 6, size: 20 })] : figure(color),
         ),
-        badge,
+        !memberColor && !known && showTag && h('span', { className: 'dtd-avatar-tag', style: { background: color } }, tag),
       )
     }
 
@@ -1657,6 +1664,8 @@ window.__ModuleLoader__.load({
       const [checked, setChecked] = useState(() => new Set())
       const [expanded, setExpanded] = useState(null)
       const [bulk, setBulk] = useState(null)
+      // The map node under the pointer or keyboard focus.
+      const [hovered, setHovered] = useState(null)
       useEffect(() => {
         const ctrl = new AbortController()
         fetch('api/ticket-dag.models', { signal: ctrl.signal, cache: 'no-store' })
@@ -1787,7 +1796,6 @@ window.__ModuleLoader__.load({
             ),
           ),
         ),
-        h(CaptainCard, { run, catalog: models }),
         run.attached === false &&
           h('p', { className: 'dtd-alert', role: 'status' }, '这轮计划的队长对话当前未打开。请先打开发起它的对话，再在这里确认。'),
         catalog?.error && h('p', { className: 'dtd-alert', role: 'status' }, '模型列表暂不可用，仍可保留预设里的模型。'),
@@ -1804,15 +1812,25 @@ window.__ModuleLoader__.load({
               disabled: busy,
               onChange: (e) => setChecked(e.target.checked ? new Set(memberIds) : new Set()),
             }),
-            h(
-              'h4',
-              null,
-              '成员与模型',
-              checked.size > 0 && h('small', { className: 'dtd-hint' }, ' 已选 ' + checked.size),
-            ),
+            h('h4', null, '成员', checked.size > 0 && h('small', { className: 'dtd-hint' }, ' 已选 ' + checked.size)),
+            h('span', { className: 'dtd-hint' }, '负责任务'),
             checked.size > 0
               ? h(BulkPicker, { bulk, catalog: models, disabled: busy, onModel: bulkModel, onEffort: bulkEffort })
               : [h('span', { key: 'm', className: 'dtd-hint' }, '模型'), h('span', { key: 'e', className: 'dtd-hint' }, '推理强度')],
+          ),
+          // The captain leads the list; its model is the conversation's and cannot change here.
+          h(
+            'div',
+            { key: 'captain', className: 'dtd-member', 'data-dag-captain': '' },
+            h('span', null),
+            h(Avatar, { route: run.captain, size: 34, tag: false }),
+            h('span', { className: 'dtd-member-name' }, h('strong', null, '队长'), h('small', null, '当前对话')),
+            h('span', { className: 'dtd-member-tasks' }, '拆解 · 派发 · 汇总'),
+            h(
+              'span',
+              { className: 'dtd-member-captain-model', title: '队长使用当前对话的模型，这里不能修改' },
+              routeName(run.captain, models) || '对话未打开，模型未知',
+            ),
           ),
           ...memberIds.map((id) =>
             h(
@@ -1826,12 +1844,8 @@ window.__ModuleLoader__.load({
                 onChange: () => toggle(id),
               }),
               h(Avatar, { route: routeOf(id), captain: run.captain, color: colorOf(id), size: 34 }),
-              h(
-                'span',
-                { className: 'dtd-member-name' },
-                h('strong', null, nameOf(id)),
-                h('small', null, '负责 ' + owned(id).join('、')),
-              ),
+              h('span', { className: 'dtd-member-name' }, h('strong', null, nameOf(id))),
+              h('span', { className: 'dtd-member-tasks', 'data-dag-member-tasks': '' }, '负责 ' + owned(id).join('、')),
               h(ModelPicker, {
                 agent: { id, ...routeOf(id) },
                 label: nameOf(id),
@@ -1921,8 +1935,20 @@ window.__ModuleLoader__.load({
           h(DependencyMap, {
             rows,
             compact: true,
+            hovered,
+            setHovered,
             ownerOf: (t) => ({ name: nameOf(currentOwners[t.id]), color: colorOf(currentOwners[t.id]) }),
           }),
+          h(
+            'p',
+            { className: 'dtd-hint dtd-map-hint', role: 'status' },
+            byId.has(hovered)
+              ? [
+                  hovered + ' 依赖 ' + (byId.get(hovered).dependsOn.join('、') || '无'),
+                  '被 ' + (run.tickets.filter((t) => t.dependsOn.includes(hovered)).map((t) => t.id).join('、') || '无') + ' 依赖',
+                ].join(' · ')
+              : '悬停节点查看它的依赖和被依赖关系',
+          ),
         ),
         error && h('p', { className: 'dtd-alert', role: 'alert' }, error),
         h(

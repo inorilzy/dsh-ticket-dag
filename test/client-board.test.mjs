@@ -298,7 +298,7 @@ test('overall progress runs integrated, working, waiting, then needs attention, 
   )
 })
 
-test('waiting shows in a neutral grey on the progress board, while the plan review keeps its orange', () => {
+test('waiting shows in a neutral grey on the progress board; the plan review map has no orange', () => {
   const root = boardFor(sample)
   const pending = cssFor(root, '.dtd-dashboard').join(';').match(/--dtd-pending:([^;]+)/)?.[1]
   assert.ok(pending, 'a --dtd-pending colour is defined')
@@ -324,9 +324,9 @@ test('waiting shows in a neutral grey on the progress board, while the plan revi
   assert.ok(find(progress, (n) => n.props['data-dag-bar'] !== undefined))
   assert.ok(find(progress, (n) => n.props['data-dag-map'] !== undefined))
   assert.ok(find(progress, (n) => n.props['data-dag-ticket'] !== undefined))
-  // Untouched: the 待确认 pill and the plan review's waiting node border.
+  // Untouched: the 待确认 pill. The plan review map no longer paints waiting tasks orange.
   assert.match(cssFor(root, '.dtd-pill')[0], /var\(--dtd-wait\)/)
-  assert.match(cssFor(root, '.dtd-panel .dtd-node.dtd-node-compact[data-tone=wait]')[0], /var\(--dtd-wait\)/)
+  assert.deepEqual(cssFor(root, '.dtd-panel .dtd-node.dtd-node-compact[data-tone=wait]'), [])
 })
 
 test('dependency map lays tickets out left to right by depth with one edge per dependency', () => {
@@ -745,12 +745,22 @@ test('plan review: named members with their tasks and model, compact task list, 
   assert.match(text(review), /待确认/)
   assert.match(text(review), /3 名成员 · 5 项任务 · 4 条依赖/)
   for (const step of ['审查计划', '确认模型', '开始执行']) assert.match(text(review), new RegExp(step))
-  assert.match(text(find(review, (n) => n.props['data-dag-captain'] !== undefined)), /队长 · 当前对话.*claude-opus-5-5/)
+  // The captain is the first row of the member list, without a checkbox or model picker.
+  const block = find(review, (n) => n.props['aria-label'] === '成员与模型')
+  assert.equal(findAll(review, (n) => n.props['data-dag-captain'] !== undefined).length, 1)
+  const captainRow = find(block, (n) => n.props['data-dag-captain'] !== undefined)
+  assert.ok(captainRow, 'the captain row sits in the member list')
+  assert.match(text(captainRow), /队长.*当前对话.*claude-opus-5-5/)
+  assert.equal(find(captainRow, (n) => n.type === 'input' || n.type === 'select'), undefined, 'the captain model is fixed')
 
   const members = findAll(review, (n) => n.props['data-dag-member'] !== undefined)
   assert.deepEqual(members.map((m) => m.props['data-dag-member']), ['implementer', 'test-writer', 'docs'])
   assert.match(text(members[0]), /实现者/)
-  assert.match(text(members[0]), /负责 A、C、B/)
+  // Owned tasks have their own column, outside the name cell.
+  const ownedCell = find(members[0], (n) => n.props['data-dag-member-tasks'] !== undefined)
+  assert.equal(text(ownedCell), '负责 A、C、B')
+  assert.doesNotMatch(text(find(members[0], (n) => n.props.className === 'dtd-member-name')), /负责/)
+  assert.match(text(find(block, (n) => n.props.className === 'dtd-member-head')), /成员.*负责任务.*模型.*推理强度/)
   assert.doesNotMatch(text(members[0]), /implementer/, 'members show their name, not the preset ID')
   const field = (label) => find(review, (n) => n.props['aria-label'] === label)
   assert.equal(field('实现者 的模型').props.value, JSON.stringify(['acme', 'deep-2']))
@@ -767,7 +777,11 @@ test('plan review: named members with their tasks and model, compact task list, 
   const node = find(review, (n) => n.props['data-dag-node'] === 'A')
   assert.equal(text(node), 'A实现者定义接口', 'a map node shows its ID, owner and task')
   assert.equal(node.props['data-tone'], 'neutral', 'a task that can start is plain')
-  assert.equal(find(review, (n) => n.props['data-dag-node'] === 'T').props['data-tone'], 'wait')
+  assert.equal(
+    find(review, (n) => n.props['data-dag-node'] === 'T').props['data-tone'],
+    'neutral',
+    'nothing has started, so a waiting task is plain grey too',
+  )
   assert.match(text(find(review, (n) => n.props['data-dag-node'] === 'T')), /T测试员编写测试/)
   assert.equal(find(review, (n) => n.props['data-dag-detail'] !== undefined), undefined)
   assert.equal(find(pane, (n) => n.props['data-dag-ticket'] !== undefined), undefined, 'no progress list yet')
@@ -942,7 +956,7 @@ test('the client builds icons with elements and never injects raw HTML', () => {
   assert.doesNotMatch(source, /innerHTML|dangerouslySetInnerHTML/)
 })
 
-test('a member avatar keeps its colour and shows a vendor badge for its model, else the captain model, else ?', () => {
+test('a member avatar is its model vendor icon, ringed in the member colour; an unknown model keeps the member figure', () => {
   const selected = reviewRun()
   // implementer stays on acme/deep-2 (unknown), test-writer moves to GPT, docs uses the host default.
   selected.tickets = selected.tickets.map((t) =>
@@ -951,19 +965,52 @@ test('a member avatar keeps its colour and shows a vendor badge for its model, e
   const pane = loadHost([{ runs: [selected], selected }, selected.key]).renderSlot('sidebar.right.pane.tab', {
     sessionId: 'session-captain',
   })
-  const badge = (id) => {
-    const avatar = find(
+  const avatarOf = (id) =>
+    find(
       find(pane, (n) => n.props['data-dag-member'] === id),
       (n) => n.props['data-dag-avatar'] !== undefined,
     )
-    assert.equal(avatar.props['data-dag-avatar'], 'member')
-    const icon = find(avatar, (n) => n.props['data-dag-vendor-icon'] !== undefined)
-    if (icon) return icon.props['data-dag-vendor-icon']
-    return findAll(avatar, (n) => n.props.className === 'dtd-avatar-tag').map(text).join('')
+  const look = (id) => {
+    const avatar = avatarOf(id)
+    // No figure-plus-badge combination: one picture per member.
+    assert.equal(find(avatar, (n) => n.props.className === 'dtd-avatar-badge'), undefined, id)
+    assert.deepEqual(findAll(avatar, (n) => n.props.className === 'dtd-avatar-tag'), [], id)
+    const icons = findAll(avatar, (n) => n.props['data-dag-vendor-icon'] !== undefined)
+    assert.ok(icons.length <= 1, id)
+    return [avatar.props['data-dag-avatar'], icons[0]?.props['data-dag-vendor-icon'] ?? null]
   }
-  assert.equal(badge('implementer'), '?')
-  assert.equal(badge('test-writer'), 'gpt')
-  assert.equal(badge('docs'), 'claude', 'a member on the host default follows the captain model')
+  assert.deepEqual(look('implementer'), ['member', null])
+  assert.deepEqual(look('test-writer'), ['gpt', 'gpt'])
+  assert.deepEqual(look('docs'), ['claude', 'claude'], 'a member on the host default follows the captain model')
+  const colours = ['implementer', 'test-writer', 'docs'].map((id) => avatarOf(id).props['data-dag-color'])
+  assert.equal(new Set(colours).size, 3, 'each avatar still carries its member colour')
+})
+
+test('plan review map: hovering a node lights its upstream and downstream and names them; nothing dims otherwise', () => {
+  const selected = reviewRun()
+  // Dashboard: data, selectedKey, error, lastRead. PlanReview: owners, routes, catalog,
+  // busy, error, confirmDiscard, checked, expanded, bulk, hovered map node.
+  const seeds = [{ runs: [selected], selected }, selected.key, '', null, null, null, catalog, false, '', false]
+  const render = (hovered) =>
+    loadHost([...seeds, new Set(), null, null, hovered]).renderSlot('sidebar.right.pane.tab', {
+      sessionId: 'session-captain',
+    })
+  const mapOf = (pane) => find(pane, (n) => n.props['aria-label'] === '依赖图')
+  const dims = (map) =>
+    Object.fromEntries(findAll(map, (n) => n.props['data-dag-node'] !== undefined).map((n) => [n.props['data-dag-node'], n.props['data-dim']]))
+
+  const idle = mapOf(render(null))
+  assert.deepEqual(Object.values(dims(idle)).filter(Boolean), [], 'no hover, nothing dims')
+  assert.equal(findAll(idle, (n) => n.props['data-active'] === false).length, 0)
+  assert.match(text(idle), /悬停/)
+  assert.equal(typeof find(idle, (n) => n.props['data-dag-node'] === 'B').props.onMouseEnter, 'function')
+
+  // B depends on A; D depends on B. C and T are outside its chain.
+  const hovered = mapOf(render('B'))
+  assert.deepEqual(dims(hovered), { A: false, C: true, T: true, B: false, D: false })
+  assert.equal(find(hovered, (n) => n.props['data-dag-edge'] === 'A>B').props['data-active'], true)
+  assert.equal(find(hovered, (n) => n.props['data-dag-edge'] === 'C>T').props['data-active'], false)
+  assert.match(text(hovered), /B 依赖 A.*被 D 依赖/)
 })
 
 test('the progress board also shows the captain, and avatars on ticket rows and map nodes', () => {
