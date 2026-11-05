@@ -171,7 +171,7 @@ function boardFor(tickets) {
 // Renders the progress board and keeps the host so a test can read state updates.
 // hovered seeds the dependency map's hovered ticket (RunProgress hook 7, after
 // Dashboard's four hooks and the filter and two fold states).
-function boardHost(tickets, { hovered } = {}) {
+function boardHost(tickets, { hovered, selected: picked } = {}) {
   const counts = {}
   for (const t of tickets) counts[t.status] = (counts[t.status] ?? 0) + 1
   const selected = {
@@ -187,7 +187,7 @@ function boardHost(tickets, { hovered } = {}) {
     tickets: tickets.map((t) => ({ dependsOn: [], attempt: 0, ...t })),
   }
   const seeds = [{ runs: [selected], selected }, selected.key]
-  if (hovered !== undefined) seeds.push('', null, 'all', true, true, hovered)
+  if (hovered !== undefined || picked !== undefined) seeds.push('', null, 'all', true, true, hovered ?? null, picked ?? null)
   const host = loadHost(seeds)
   const Dashboard = host.slots['sidebar.right.pane.tab'].component
   return { host, root: render({ type: Dashboard, props: {}, children: [] }) }
@@ -435,16 +435,36 @@ test('hovering or focusing a node highlights its chain, dims the rest and drives
   assert.deepEqual(mapState(boardHost(chainTickets, { hovered: null }).root), mapState(root))
 })
 
-test('clicking a node no longer pins it: no pressed state, no selected border, no 已固定 hint', () => {
-  const { root } = boardHost(chainTickets, { hovered: 'Y' })
-  for (const node of findAll(root, (n) => n.props['data-dag-node'] !== undefined)) {
-    assert.equal(node.props.onClick, undefined)
-    assert.equal(node.props['aria-pressed'], undefined)
+test('clicking a node selects it: the detail card and the lit chain follow the selection until clicked again', () => {
+  const { host, root } = boardHost(chainTickets)
+  const node = (r, id) => find(r, (n) => n.props['data-dag-node'] === id)
+  // Nothing selected yet: every node offers a click and reports it is not pressed.
+  for (const n of findAll(root, (x) => x.props['data-dag-node'] !== undefined)) {
+    assert.equal(typeof n.props.onClick, 'function')
+    assert.equal(n.props['aria-pressed'], false)
   }
-  const fold = find(root, (n) => n.props['aria-label'] === '依赖图')
-  assert.doesNotMatch(text(fold), /已固定|再次点击取消|点击查看详情/)
-  assert.match(text(fold), /悬停查看详情/)
-  assert.deepEqual(cssFor(root, '.dtd-node[aria-pressed=true]'), [])
+  node(root, 'Y').props.onClick()
+  assert.deepEqual(host.indexed.filter(([at]) => at === 8), [[8, 'Y']], 'a click selects the ticket')
+
+  // Y selected, nothing hovered: Y's detail shows and its chain stays lit.
+  const chosen = boardHost(chainTickets, { selected: 'Y' })
+  assert.deepEqual(mapState(chosen.root), {
+    dim: { A: true, B: true, C: true, X: false, Y: false },
+    edges: { 'A>B': false, 'B>C': false, 'X>Y': true },
+    detail: 'Y',
+  })
+  assert.equal(node(chosen.root, 'Y').props['aria-pressed'], true)
+  assert.equal(node(chosen.root, 'Y').props['data-selected'], true)
+  // Hover still previews another ticket over the selection.
+  assert.equal(mapState(boardHost(chainTickets, { selected: 'Y', hovered: 'A' }).root).detail, 'A')
+  // Clicking the selected node again clears the selection.
+  node(chosen.root, 'Y').props.onClick()
+  assert.deepEqual(chosen.host.indexed.filter(([at]) => at === 8), [[8, null]])
+  // The hint names the selection and how to clear it.
+  const fold = find(chosen.root, (n) => n.props['aria-label'] === '依赖图')
+  assert.match(text(fold), /已选中 Y · 再次点击取消/)
+  assert.match(text(find(root, (n) => n.props['aria-label'] === '依赖图')), /点击节点选中/)
+  assert.ok(cssFor(root, '.dtd-node[data-selected=true]').length, 'a selected node has its own outline')
 })
 
 test('ticket detail shows a stage stepper and node tooltips name the live stage', () => {
@@ -927,7 +947,7 @@ test('a recognised vendor avatar shows that vendor icon and no abbreviation tag;
 })
 
 // Dashboard: data, selectedKey, error, lastRead. RunProgress: filter, listOpen, mapOpen,
-// hovered. DependencyMap: the measured width of the map area (null before layout).
+// hovered, selected. DependencyMap: the measured width of the map area (null before layout).
 function mapFor(tickets, width = null) {
   const selected = {
     key: 'k'.repeat(64),
@@ -938,7 +958,7 @@ function mapFor(tickets, width = null) {
     counts: { PENDING: tickets.length },
     tickets: tickets.map((t) => ({ dependsOn: [], attempt: 0, status: 'PENDING', ...t })),
   }
-  const Dashboard = loadBoard([{ runs: [selected], selected }, selected.key, '', null, 'all', true, true, null, width])
+  const Dashboard = loadBoard([{ runs: [selected], selected }, selected.key, '', null, 'all', true, true, null, null, width])
   return find(render({ type: Dashboard, props: {}, children: [] }), (n) => n.props['data-dag-map'] !== undefined)
 }
 const nodeBox = (map, id) => find(map, (n) => n.props['data-dag-node'] === id).props.style

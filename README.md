@@ -2,13 +2,13 @@
 
 DeepSeek Harness 的本地 Git 工单调度插件。队长交给它一个已确认的 JSON 清单。插件为每张开发工单创建独立分支、worktree 和 DSH 子会话，并行执行就绪工单，将测试通过的候选逐个合入本轮集成分支。运行完成或需要处理时，插件给原队长发送持久消息。
 
-**版本 0.10.6** · DSH `0.2.1-rc.2` 或 `0.2.1-rc.5` · Node.js `^22.19.0 || >=24` · Git **2.43+**。包内含可直接执行的原生 ESM 源码和测试，无须编译。Git 仓库需要已有本地提交、可用的提交身份，以及创建同级 worktree 目录的权限。
+**版本 0.10.7** · DSH `0.2.1-rc.2` 或 `0.2.1-rc.5` · Node.js `^22.19.0 || >=24` · Git **2.43+**。包内含可直接执行的原生 ESM 源码和测试，无须编译。Git 仓库需要已有本地提交、可用的提交身份，以及创建同级 worktree 目录的权限。
 
 ## 安装与首次运行
 
-1. 下载 `dsh-ticket-dag-0.10.6.tgz`，保存在运行 DSH 的电脑上。打开侧栏 **插件 → 添加插件 → 安装第三方插件**，输入该文件的本地绝对路径，例如 `D:\DSH-Plugins\dsh-ticket-dag-0.10.6.tgz`，然后安装并启用。使用命令行也可以在目标 profile 安装同一个文件：
+1. 下载 `dsh-ticket-dag-0.10.7.tgz`，保存在运行 DSH 的电脑上。打开侧栏 **插件 → 添加插件 → 安装第三方插件**，输入该文件的本地绝对路径，例如 `D:\DSH-Plugins\dsh-ticket-dag-0.10.7.tgz`，然后安装并启用。使用命令行也可以在目标 profile 安装同一个文件：
    ```powershell
-   dsh plugin --profile web add "$HOME\Downloads\dsh-ticket-dag-0.10.6.tgz"
+   dsh plugin --profile web add "$HOME\Downloads\dsh-ticket-dag-0.10.7.tgz"
    ```
    旧版用户可以等当前工单结束后，在同一 profile 使用上面的命令升级。SDK profile 将 `web` 换为 `sdk`。安装后重新打开插件详情；若宿主提示需要重启，则重启该 profile。
 2. 在 **插件 → 已安装 → dsh-ticket-dag** 中找到同名组件，点 **配置**。先运行示例时，点 **补入示例验收项**，再点 **保存配置**；已设置的同名验收项会保留。没有图形界面的 SDK 环境仍可将 `examples/profile.patch.yml` 中的配置合入当前 profile 的 `cordis.patch.yml`，并保留其他现有配置。

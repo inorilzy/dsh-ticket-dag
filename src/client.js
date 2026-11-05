@@ -131,6 +131,7 @@ window.__ModuleLoader__.load({
 .dtd-node[data-tone=work] {border-color:color-mix(in srgb,var(--dtd-work) 60%,transparent)}
 .dtd-node[data-tone=blocked] {border-color:color-mix(in srgb,var(--dtd-blocked) 70%,transparent)}
 .dtd-node[data-dim=true] {opacity:.42}.dtd-edges path[data-active=false] {opacity:.45}
+.dtd-node[data-selected=true] {border-color:var(--dtd-work);box-shadow:0 0 0 1px var(--dtd-work)}
 .dtd-steps {display:flex;list-style:none;margin:.2rem 0;padding:0;gap:3px;font-size:.76rem}
 .dtd-steps li {flex:1;min-width:0;text-align:center;padding-top:.3rem;border-top:3px solid var(--dtd-idle);opacity:.7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dtd-steps [data-state=done] {border-color:var(--dtd-done);opacity:1}
@@ -935,6 +936,8 @@ window.__ModuleLoader__.load({
       const [mapOpen, setMapOpen] = useState(true)
       // The map node under the pointer or keyboard focus; null shows the default ticket.
       const [hovered, setHovered] = useState(null)
+      // The map node the user clicked; the detail card stays on it until clicked again.
+      const [selected, setSelected] = useState(null)
       // Frozen tickets name their agent; the snapshot presets give its display name.
       const presets = run.presets ?? []
       const memberIds = [...new Set([...presets.map((p) => p.id), ...run.tickets.map((t) => t.agent ?? '')])]
@@ -1002,11 +1005,27 @@ window.__ModuleLoader__.load({
           { type: 'button', 'aria-expanded': mapOpen, onClick: () => setMapOpen(!mapOpen) },
           (mapOpen ? '▾ ' : '▸ ') + '工单依赖',
         ),
-        h('span', { className: 'dtd-hint' }, '从左到右：上游合入后解锁 · 悬停查看详情'),
+        h(
+          'span',
+          { className: 'dtd-hint' },
+          run.tickets.some((t) => t.id === selected)
+            ? '已选中 ' + selected + ' · 再次点击取消'
+            : '从左到右：上游合入后解锁 · 点击节点选中，下方显示详情',
+        ),
       )
       const mapBody =
         mapOpen &&
-        h(DependencyMap, { key: 'map', rows, hovered, setHovered, open, captain: run.captain, ownerOf: memberOf })
+        h(DependencyMap, {
+          key: 'map',
+          rows,
+          hovered,
+          setHovered,
+          selected,
+          setSelected,
+          open,
+          captain: run.captain,
+          ownerOf: memberOf,
+        })
       const listBlock = h(
         'section',
         { className: 'dtd-block', 'aria-label': '工单列表', key: 'list-block' },
@@ -1180,7 +1199,7 @@ window.__ModuleLoader__.load({
 
     // Each node card names its ID, owner and task; ownerOf(ticket) returns the
     // owner's { name, color }. compact (plan review) has no focus or detail card.
-    function DependencyMap({ rows, hovered, setHovered, open, captain, compact = false, ownerOf }) {
+    function DependencyMap({ rows, hovered, setHovered, selected, setSelected, open, captain, compact = false, ownerOf }) {
       // The map area's width, measured after layout and on every resize.
       const [available, setAvailable] = useState(null)
       const frame = useRef(null)
@@ -1260,7 +1279,8 @@ window.__ModuleLoader__.load({
         rows.find((r) => r.view.tone === 'work') ??
         rows.find((r) => r.ticket.status === 'PENDING') ??
         rows[0]
-      const hit = rows.find((r) => r.ticket.id === hovered)
+      // Hover previews a ticket; otherwise the clicked selection, else the most urgent one.
+      const hit = rows.find((r) => r.ticket.id === hovered) ?? rows.find((r) => r.ticket.id === selected)
       const focus = hit ?? urgent
       // Only a hovered node lights up its chain; with nothing hovered the whole map stays undimmed.
       const chain = hit ? chainOf(hit.ticket.id, tickets) : null
@@ -1315,6 +1335,9 @@ window.__ModuleLoader__.load({
                   onMouseLeave: () => setHovered(null),
                   onFocus: () => setHovered(ticket.id),
                   onBlur: () => setHovered(null),
+                  onClick: () => setSelected?.(selected === ticket.id ? null : ticket.id),
+                  'aria-pressed': selected === ticket.id,
+                  'data-selected': selected === ticket.id,
                 },
                 h(
                   'span',
