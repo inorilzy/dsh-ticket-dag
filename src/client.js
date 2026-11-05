@@ -1217,8 +1217,10 @@ window.__ModuleLoader__.load({
         rows.find((r) => r.view.tone === 'work') ??
         rows.find((r) => r.ticket.status === 'PENDING') ??
         rows[0]
-      const focus = rows.find((r) => r.ticket.id === hovered) ?? urgent
-      const chain = chainOf(focus.ticket.id, tickets)
+      const hit = rows.find((r) => r.ticket.id === hovered)
+      const focus = hit ?? urgent
+      // Only a hovered node lights up its chain; with nothing hovered the whole map stays undimmed.
+      const chain = hit ? chainOf(hit.ticket.id, tickets) : null
       return h(
         'div',
         { className: 'dtd-section', 'data-dag-map': '' },
@@ -1236,7 +1238,7 @@ window.__ModuleLoader__.load({
                   key: e.from + '>' + e.to,
                   'data-dag-edge': e.from + '>' + e.to,
                   d: e.d,
-                  'data-active': chain.has(e.from) && chain.has(e.to),
+                  'data-active': chain ? chain.has(e.from) && chain.has(e.to) : undefined,
                 }),
               ),
             ),
@@ -1261,7 +1263,7 @@ window.__ModuleLoader__.load({
                   className: 'dtd-node dtd-node-compact',
                   'data-dag-node': ticket.id,
                   'data-tone': view.tone,
-                  'data-dim': !chain.has(ticket.id),
+                  'data-dim': chain ? !chain.has(ticket.id) : false,
                   'aria-label': summary,
                   title: summary,
                   style: { left: x, top: y, width: node.width, height: node.height },
