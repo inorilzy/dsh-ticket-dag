@@ -29,7 +29,7 @@ const hook = registerHooks({
 const { apply } = await import('../src/index.mjs')
 hook.deregister()
 
-function harness(extra = {}) {
+function harness(extra = {}, { commands } = {}) {
   const calls = [],
     roster = new Map(),
     logs = new Map(),
@@ -97,6 +97,13 @@ function harness(extra = {}) {
     effect: (start) => {
       cleanup = start()
     },
+    // Only the commands service is offered; the Web and settings mounts stay out of these tests.
+    ...(commands && {
+      inject: (names, fn) => {
+        if (names[0] !== 'commands') return
+        fn({ effect: (start) => start(), commands: { register: (c) => (commands.push(c), () => {}) } })
+      },
+    }),
   }
   const checks = { lint: [['node', '--check', 'index.js']] }
   apply(ctx, { checks, maxWorkers: 3, checkTimeoutMs: 500, ...extra })
@@ -335,6 +342,65 @@ test('dag_add is a captain-only tool that appends tickets; its cap defaults to 2
   await assert.rejects(h.invoke('dag_add', { runId: 'r', tickets: [] }, h.child), /top-level/)
   assert.equal(h.calls.length, before)
   assert.match(h.tools.get('dag_run').description, /dag_add/)
-  assert.match(h.sections.map((s) => s.text).join('\n'), /dag_add.*approval/)
+  assert.match(h.sections.map((s) => (typeof s.text === 'function' ? s.text() : s.text)).join('\n'), /dag_add.*approval/)
+  await h.close()
+})
+
+test('the captain section says when to use the plugin, names Agent Teams, lists the trusted checks and the /dag command', async () => {
+  const h = harness({ checks: { lint: [['node', '--check', 'index.js']], 'unit-tests': [['npm', 'test']] } })
+  const section = h.sections.find((s) => s.name === 'tool:dsh-ticket-dag')
+  const text = typeof section.text === 'function' ? section.text() : section.text
+  assert.match(text, /Agent Teams/i, 'the plugin answers to Agent Teams requests')
+  assert.match(text, /two or more tickets/i, 'used only when the work splits into 2+ tickets')
+  assert.match(text, /explicitly/i)
+  assert.match(text, /\/dag/)
+  assert.match(text, /lint.*unit-tests|unit-tests.*lint/s, 'the configured check IDs are listed by name')
+  assert.match(text, /no .*check|configure/i, 'the captain is told what to do when no check fits')
+  // The live settings are read each time, so a newly saved check shows up.
+  const none = harness({ checks: {} }).sections.find((s) => s.name === 'tool:dsh-ticket-dag')
+  assert.match(typeof none.text === 'function' ? none.text() : none.text, /no verification checks are configured/i)
+  await h.close()
+})
+
+test('the /dag slash command is registered and replays the goal as a user message', async () => {
+  const commands = []
+  const h = harness({}, { commands })
+  assert.equal(commands.length, 1)
+  const cmd = commands[0]
+  assert.equal(cmd.name, 'dag')
+  assert.match(cmd.description, /Agent Teams/)
+  const sent = []
+  const agent = { followup: (m) => sent.push(m) }
+  assert.equal(cmd.handler({ rawInput: '   ', agent }).kind, 'error')
+  assert.equal(sent.length, 0)
+  assert.equal(cmd.handler({ rawInput: ' 重构登录模块', agent }).kind, 'success')
+  assert.equal(sent[0].content[0].text, '/dag 重构登录模块')
+  assert.equal(sent[0].source.kind, 'user')
+  await h.close()
+})
+
+test('a user message starting with /dag adds a captain directive with the goal; other messages and workers are untouched', async () => {
+  const h = harness()
+  const step = h.events.get('agent/pre-step')
+  const user = (text) => ({ id: 'u', source: { kind: 'user' }, content: [{ type: 'text', text }] })
+  const enter = { kind: 'enter', messages: [] }
+  const run = (messages, agent = h.root) => step({ agent, messages, signal: new AbortController().signal }, async () => enter)
+
+  const decision = await run([user('/dag 给登录页加记住我，并补测试和文档')])
+  assert.equal(decision.kind, 'enter')
+  const directive = decision.messages.at(-1)
+  assert.equal(directive.source.kind, 'dsh-ticket-dag-command')
+  const said = directive.content[0].text
+  assert.match(said, /dag_run/)
+  assert.match(said, /Goal: 给登录页加记住我，并补测试和文档/)
+  assert.match(said, /lint/, 'the directive names the usable check IDs')
+
+  const empty = await run([user('/dag')])
+  assert.match(empty.messages.at(-1).content[0].text, /ask the user/i)
+  // A command name that only starts with dag, prose and older messages do not trigger it.
+  for (const text of ['/dagger now', '请用 /dag 吗', '我们团队讨论一下']) assert.equal(await run([user(text)]), enter, text)
+  assert.equal(await run([user('/dag A'), { id: 'a', source: { kind: 'assistant' }, content: [] }, user('继续')]), enter)
+  // Workers never receive the captain directive.
+  assert.notEqual((await run([user('/dag X')], h.child)).messages?.at(-1)?.source?.kind, 'dsh-ticket-dag-command')
   await h.close()
 })

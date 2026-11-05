@@ -56,6 +56,49 @@ const runTools = [
   ],
 ]
 const sourceKind = 'dsh-ticket-dag'
+const commandSource = 'dsh-ticket-dag-command'
+// /dag alone or followed by whitespace; /dagger and mid-sentence mentions do not count.
+const commandPattern = /^\/dag(?=$|\s)/u
+
+function checkList(checks) {
+  const ids = Object.keys(checks ?? {})
+  if (!ids.length)
+    return 'No verification checks are configured in this profile. Do not invent check IDs: stop and ask the user to add one under Plugins > dsh-ticket-dag > Configure (for example a test command), then continue.'
+  return (
+    'Verification check IDs you may use in each ticket verify list (each runs a trusted command in the candidate checkout): ' +
+    ids.map((id) => id + ' = ' + checks[id].map((argv) => argv.join(' ')).join(' && ')).join('; ') +
+    '. If none of them checks the work, stop and ask the user to configure a suitable one instead of picking an unrelated ID.'
+  )
+}
+
+export function captainSection({ checks, agents }) {
+  const presets = Object.keys(agents ?? {})
+  return [
+    'dsh-ticket-dag is this profile’s Agent Teams plugin: it runs a coding goal as a DAG of tickets, one worker per ticket in its own git worktree, verified and merged into an integration branch.',
+    'Use it only when the user explicitly asks for it (Agent Teams, agent team, teams, 工单团队, ticket DAG, or the /dag command) and the work splits into two or more tickets. Mentioning, discussing or declining it is not a request. A single small change is done directly, without dag_run.',
+    'As captain: read the code first, split the goal into tickets with id, title, a self-contained prompt, depends_on for genuine prerequisites, acceptance, verify and agent' +
+      (presets.length ? ' (presets: ' + presets.join(', ') + ')' : '') +
+      ', then call dag_run in the current repository. ' +
+      checkList(checks),
+    'Only the top-level captain may use dag_* tools. Keep the runId. When dag_run returns mode staged, tell the user to review and approve the plan in the 「工单 · <runId>」 tab of the right sidebar, then end the turn; after starting, end the turn when only waiting remains. The host schedules work and notifies you. Use dag_status for inspection, dag_resume after a host restart, and dag_retry only after addressing the specified ticket blocker. dag_cleanup removes the worktrees and branches of integrated tickets in a run. dag_add appends tickets to a run: they need no user approval but must still pass their verification checks. Workers complete their own assignment and leave orchestration to the captain.',
+  ].join('\n')
+}
+
+// The goal of the latest user message when it starts with /dag; undefined otherwise.
+function invokedGoal(messages) {
+  const last = [...(messages ?? [])].reverse().find((m) => m?.source?.kind === 'user')
+  const text = last?.content?.find((block) => block.type === 'text')?.text?.trimStart() ?? ''
+  return commandPattern.test(text) ? text.slice(4).trim() : undefined
+}
+
+function commandDirective(goal, checks) {
+  return [
+    'The user invoked /dag, the Agent Teams command. Follow the dsh-ticket-dag captain rules in your system instructions.',
+    'Inspect the repository, split the goal into two or more tickets with genuine dependencies only, and call dag_run in this repository. If it returns staged, ask the user to review the plan in the right sidebar and end the turn; do not approve it yourself.',
+    checkList(checks),
+    goal ? 'Goal: ' + goal : 'No goal was given: ask the user what the team should accomplish.',
+  ].join('\n')
+}
 const detailLimit = 4096
 const childLabel = 'dsh-ticket-dag/'
 
@@ -255,7 +298,24 @@ export function apply(ctx, config = {}) {
     }
     return false
   }
-  ctx.on('agent/pre-step', async ({ agent }, next) => ((await mayRun(agent)) ? next() : { kind: 'reject' }))
+  // The captain directive rides on the same pre-step hook that fences retired workers.
+  ctx.on('agent/pre-step', async ({ agent, messages }, next) => {
+    if (!(await mayRun(agent))) return { kind: 'reject' }
+    const decision = await next()
+    if (decision?.kind !== 'enter' || !topLevel(agent)) return decision
+    const goal = invokedGoal(messages)
+    if (goal === undefined) return decision
+    return {
+      ...decision,
+      messages: [
+        ...decision.messages,
+        createUserMessage({
+          content: [{ type: 'text', text: commandDirective(goal, settings().checks) }],
+          source: { kind: commandSource },
+        }),
+      ],
+    }
+  })
   ctx.on('tools/pre-execute', async (exec, next) =>
     (await mayRun(exec.agent)) ? next() : { kind: 'deny', reason },
   )
@@ -356,7 +416,28 @@ export function apply(ctx, config = {}) {
   ctx.systemPrompt.section({
     name: 'tool:dsh-ticket-dag',
     order: ctx.systemPrompt.getSectionOrder('TOOL_WORKFLOW'),
-    text: 'Only the top-level captain may use dag_* tools. Run an approved ticket DAG with dag_run. Keep its runId. After starting, end the current turn when only waiting remains. The host schedules work and notifies you. Use dag_status for inspection, dag_resume after a host restart, and dag_retry only after addressing the specified ticket blocker. dag_cleanup removes the worktrees and branches of integrated tickets in a run. dag_add appends tickets to a run: they need no user approval but must still pass their verification checks. Workers complete their own assignment and leave orchestration to the captain.',
+    // Read on every build, so newly saved checks and presets reach the captain.
+    text: () => captainSection(settings()),
+  })
+  // /dag <goal> is the deterministic entry; the pre-step hook above adds the directive.
+  ctx.inject?.(['commands'], (scope) => {
+    scope.effect(
+      () =>
+        scope.commands.register({
+          name: 'dag',
+          description: 'run a goal as an Agent Teams ticket DAG (you become the captain)',
+          input: { hint: '<goal>' },
+          handler(invocation) {
+            const goal = invocation.rawInput.trim()
+            if (!goal) return { kind: 'error', text: 'Usage: /dag <goal>' }
+            invocation.agent.followup(
+              createUserMessage({ content: [{ type: 'text', text: '/dag ' + goal }], source: { kind: 'user' } }),
+            )
+            return { kind: 'success', text: 'Agent Teams activated: the captain will split the goal into tickets.' }
+          },
+        }),
+      'dsh-ticket-dag: /dag command',
+    )
   })
   ctx.effect(
     () => async () => {
