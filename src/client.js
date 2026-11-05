@@ -148,6 +148,8 @@ window.__ModuleLoader__.load({
 .dtd-captain-model {margin-inline-start:auto;opacity:.8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dtd-review {gap:1rem}
 .dtd-review-head {display:grid;gap:.35rem}
+.dtd-run-name {margin:0;font-weight:600;overflow-wrap:anywhere}
+.dtd-review-head .dtd-run-name {color:var(--dsw-alias-text-secondary,inherit);font-size:.9rem}
 .dtd-review-title {display:flex;align-items:center;justify-content:space-between;gap:.6rem}
 .dtd-panel .dtd-review-title h3 {font-size:1.4rem;font-weight:700}
 .dtd-pill {border:1px solid var(--dtd-wait);color:var(--dtd-wait);border-radius:99px;padding:.1rem .75rem;font-size:.85rem;white-space:nowrap}
@@ -1575,6 +1577,7 @@ window.__ModuleLoader__.load({
         h(
           'header',
           { className: 'dtd-review-head' },
+          h('p', { className: 'dtd-run-name', 'data-dag-run-title': '' }, '工单 · ' + run.runId),
           h(
             'div',
             { className: 'dtd-review-title' },
@@ -1903,7 +1906,10 @@ window.__ModuleLoader__.load({
           h(
             'div',
             { className: 'dtd-head' },
-            h('h3', null, '运行进度'),
+            // The tab title is cut short in a narrow sidebar; the full run ID leads the panel.
+            selected
+              ? h('h3', { className: 'dtd-run-name', 'data-dag-run-title': '' }, '工单 · ' + selected.runId)
+              : h('h3', null, '运行进度'),
             button('刷新进度', () => {
               void refresh.current?.()
             }),

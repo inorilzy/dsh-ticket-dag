@@ -199,6 +199,18 @@ test('board keeps the ticket rows and the integrated progress value', () => {
   assert.equal(progress.props.max, 3)
 })
 
+test('the progress board and the plan review open with the full run ID as their title', () => {
+  const title = (root) => find(root, (n) => n.props['data-dag-run-title'] !== undefined)
+  const progress = title(boardFor(sample))
+  assert.equal(progress?.type, 'h3')
+  assert.equal(text(progress), '工单 · hello-01')
+  const selected = reviewRun()
+  const host = loadHost([{ runs: [selected], selected }, selected.key])
+  const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  assert.equal(text(title(pane)), '工单 · plan')
+  assert.equal(findAll(pane, (n) => n.props['data-dag-run-title'] !== undefined).length, 1)
+})
+
 test('overall progress shows one segment and one legend entry per state group', () => {
   const root = boardFor(sample)
   const bar = find(root, (n) => n.props['data-dag-bar'] !== undefined)
