@@ -1039,3 +1039,181 @@ test('shutdown closes every run even if one run fails to close', { timeout: limi
     await next.close()
   }
 })
+
+test(
+  'dag_add dispatches appended tickets without another approval, keeps approved member models and is capped',
+  { timeout: limit(120000) },
+  async (t) => {
+    const cwd = await repo(t)
+    const jobs = []
+    const checks = { ...noopChecks, extra: [[process.execPath, '-e', 'process.exit(0)']] }
+    const co = new Coordinator({
+      checks,
+      requireApproval: true,
+      maxAppendedTickets: 3,
+      agents: {
+        docs: { instructions: 'Docs only.', provider: 'acme', model: 'fast-1' },
+        impl: { instructions: 'Implement.', model: 'impl-1' },
+      },
+      notify: async () => true,
+      launch: async (job) => {
+        jobs.push(job)
+        return {
+          dispose: async () => {},
+          result: (async () => {
+            await commit(job)
+            return { ok: true }
+          })(),
+        }
+      },
+    })
+    const q = { cwd, parentId: 'captain', runId: 'append' }
+    const plan = { spec_id: 'append', tickets: [{ ...ticket('A'), agent: 'docs' }] }
+    try {
+      await co.start({ ...q, manifest: plan })
+      const [file] = co.runs.keys()
+      await co.approve(file, [{ id: 'A', agent: 'docs', provider: 'acme', model: 'deep-2', reasoningEffort: 'high' }])
+      await assert.rejects(co.add({ ...q, tickets: [{ ...ticket('X'), verify: ['nope'] }] }), /unknown verification/)
+      await assert.rejects(co.add({ ...q, tickets: [ticket('X', ['Y']), ticket('Y', ['X'])] }), /cycle/)
+      const batch = [
+        { ...ticket('B', ['A']), agent: 'docs' },
+        { ...ticket('C'), agent: 'impl', verify: ['extra'] },
+      ]
+      const added = await co.add({ ...q, tickets: batch })
+      assert.equal(added.mode, 'active', 'no approval is needed for appended tickets')
+      assert.deepEqual(
+        added.tickets.map((r) => [r.id, r.appended, typeof r.appendedAt]),
+        [
+          ['A', false, 'object'],
+          ['B', true, 'number'],
+          ['C', true, 'number'],
+        ],
+      )
+      // The appended check is frozen into the run like the manifest checks.
+      co.updateSettings({ checks: noopChecks, agents: co.agents, maxAppendedTickets: 3, maxWorkers: 16, checkTimeoutMs: 20000 })
+      const done = await until(async () => {
+        const s = await co.status(q)
+        if (s.counts.NEEDS_ATTENTION || s.mode !== 'active') throw Error(JSON.stringify(s))
+        return s.complete && s
+      }, 'appended tickets integrate', 60000)
+      assert.equal(done.diagnostic, null, 'its own append is not mistaken for tampering')
+      const byId = Object.fromEntries(jobs.map((j) => [j.ticketId, j]))
+      assert.deepEqual(byId.B.agentOptions, { provider: 'acme', model: 'deep-2', reasoningEffort: 'high' })
+      assert.match(byId.B.prompt, /Role \(docs\): Docs only\./)
+      assert.deepEqual(byId.C.agentOptions, { model: 'impl-1' })
+      // An identical batch is idempotent; the run still accepts its original manifest.
+      const again = await co.add({ ...q, tickets: batch })
+      assert.equal(again.tickets.length, 3)
+      assert.equal((await co.start({ ...q, manifest: plan })).complete, true)
+      await assert.rejects(co.add({ ...q, tickets: [{ ...batch[0], title: 'changed' }] }), /different definition/)
+      await assert.rejects(co.add({ ...q, tickets: [ticket('D'), ticket('E')] }), /maxAppendedTickets.*new run/)
+      assert.equal(jobs.length, 3)
+      // Real tampering of an appended ticket is still detected.
+      tamper(file, `UPDATE appended SET definition=json_set(definition,'$.title','forged') WHERE ticketId='B'`)
+      const held = await until(async () => {
+        const s = await co.status(q)
+        return s.mode === 'paused' && s
+      }, 'tampered append held', 20000)
+      assert.match(held.diagnostic, /outside the coordinator/)
+    } finally {
+      await co.close()
+    }
+  },
+)
+
+test('tickets appended to a staged run wait for the user and are approved with the plan', { timeout: limit(60000) }, async (t) => {
+  const cwd = await repo(t)
+  const jobs = []
+  const co = new Coordinator({
+    checks: noopChecks,
+    requireApproval: true,
+    agents: { docs: { instructions: 'Docs only.', model: 'fast-1' } },
+    launch: async (job) => {
+      jobs.push(job)
+      return {
+        dispose: async () => {},
+        result: (async () => {
+          await commit(job)
+          return { ok: true }
+        })(),
+      }
+    },
+  })
+  const q = { cwd, parentId: 'captain', runId: 'append-staged' }
+  try {
+    await co.start({ ...q, manifest: { spec_id: 'staged', tickets: [ticket('A')] } })
+    const added = await co.add({ ...q, tickets: [{ ...ticket('B', ['A']), agent: 'docs' }] })
+    assert.equal(added.mode, 'staged')
+    assert.equal(added.tickets[1].model, 'fast-1')
+    await sleep(400)
+    assert.equal(jobs.length, 0)
+    assert.equal((await co.status(q)).diagnostic, null)
+    const [file] = co.runs.keys()
+    await co.approve(file, [{ id: 'A' }, { id: 'B', agent: 'docs', model: 'deep-2' }])
+    await until(async () => (await co.status(q)).complete, 'approved plan with appended ticket integrates', 30000)
+    assert.deepEqual(jobs.find((j) => j.ticketId === 'B').agentOptions, { model: 'deep-2' })
+    await co.cancel(q)
+    await assert.rejects(co.add({ ...q, tickets: [ticket('C')] }), /cancelled/)
+  } finally {
+    await co.close()
+  }
+})
+
+test(
+  'a completed run reopened by dag_add notifies completion again and cleans only the new tickets',
+  { timeout: limit(90000) },
+  async (t) => {
+    const cwd = await repo(t)
+    const notices = []
+    const options = {
+      checks: noopChecks,
+      notify: async (e) => {
+        notices.push(e)
+        return true
+      },
+      launch: async (job) => ({
+        dispose: async () => {},
+        result: (async () => {
+          await commit(job)
+          return { ok: true }
+        })(),
+      }),
+    }
+    const co = new Coordinator(options)
+    let reopened
+    const q = { cwd, parentId: 'captain', runId: 'append-done' }
+    const completions = () => notices.filter((n) => /All tickets integrated/.test(n.text)).length
+    try {
+      await co.start({ ...q, manifest: { spec_id: 'done', tickets: [ticket('A')] } })
+      await until(async () => (await co.status(q)).tickets[0].cleanup === 'cleaned', 'first completion cleaned')
+      assert.equal(completions(), 1)
+      const added = await co.add({ ...q, tickets: [ticket('B', ['A'])] })
+      assert.equal(added.complete, false, 'appending reopens a completed run')
+      const done = await until(async () => {
+        const s = await co.status(q)
+        if (s.counts.NEEDS_ATTENTION) throw Error(JSON.stringify(s))
+        return s.complete && s.tickets.every((r) => r.cleanup === 'cleaned') && s
+      }, 'appended ticket integrated and cleaned')
+      assert.equal(done.diagnostic, null)
+      assert.equal(completions(), 2)
+      const [run] = co.runs.values()
+      assert.deepEqual(
+        run.db.events().filter((e) => e.type === 'cleanup_cleaned').map((e) => e.ticketId),
+        ['A', 'B'],
+      )
+      await co.close()
+      // A new coordinator reloads the appended checks and keeps the run trusted.
+      reopened = new Coordinator(options)
+      const loaded = await reopened.status(q)
+      await sleep(300)
+      const after = await reopened.status(q)
+      assert.equal(loaded.complete, true)
+      assert.equal(after.mode, 'active')
+      assert.equal(after.diagnostic, null)
+      assert.deepEqual(after.tickets.map((r) => r.appended), [false, true])
+    } finally {
+      await co.close()
+      await reopened?.close()
+    }
+  },
+)

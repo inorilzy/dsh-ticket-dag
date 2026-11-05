@@ -1088,3 +1088,24 @@ test('a dependency cycle in a damaged ledger still renders every ticket', () => 
   ])
   assert.equal(findAll(root, (n) => n.props['data-dag-node'] !== undefined).length, 2)
 })
+
+test('appended tickets carry a 追加 tag with their time on hover, on the board and in the plan review', () => {
+  const at = Date.UTC(2026, 10, 4, 12, 30)
+  const root = boardFor([
+    { id: 'A', status: 'INTEGRATED', appended: false, appendedAt: null },
+    { id: 'B', status: 'PENDING', dependsOn: ['A'], appended: true, appendedAt: at },
+  ])
+  const tagOf = (node) => find(node, (n) => n.props['data-dag-appended'] !== undefined)
+  const row = (id) => find(root, (n) => n.props['data-dag-ticket'] === id)
+  assert.equal(tagOf(row('A')), undefined)
+  const tag = tagOf(row('B'))
+  assert.equal(text(tag), '追加')
+  assert.equal(tag.props.title, '追加于 ' + new Date(at).toLocaleString('zh-CN'))
+  const selected = reviewRun()
+  selected.tickets[4] = { ...selected.tickets[4], appended: true, appendedAt: at }
+  const host = loadHost([{ runs: [selected], selected }, selected.key])
+  const review = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  const tasks = findAll(review, (n) => n.props['data-dag-task'] !== undefined)
+  assert.deepEqual(tasks.map((t) => Boolean(tagOf(t))), [false, false, false, false, true])
+  assert.equal(tagOf(tasks[4]).props.title, tag.props.title)
+})
