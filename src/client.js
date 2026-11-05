@@ -189,6 +189,7 @@ window.__ModuleLoader__.load({
 .dtd-preset-row .dtd-actions {margin-inline-start:auto}
 .dtd-preset-meta {font-size:.83rem;background:color-mix(in srgb,currentColor 7%,transparent);border-radius:.35rem;padding:.1rem .45rem}
 .dtd-owner {font-size:.84rem;font-weight:600;white-space:nowrap}
+.dtd-appended {font-size:.76rem;padding:0 .35rem;border-radius:.3rem;border:1px solid currentColor;opacity:.75;white-space:nowrap;cursor:help}
 .dtd-run-card {border:1px solid var(--dtd-line);border-radius:.75rem;background:var(--dtd-card);padding:.7rem .9rem;display:grid;gap:.55rem;margin:.4rem 0;line-height:1.5}
 .dtd-run-card-head {display:flex;align-items:center;gap:.6rem;min-width:0}
 .dtd-run-card-title {font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -841,6 +842,19 @@ window.__ModuleLoader__.load({
     const memberTag = (member) =>
       h('span', { className: 'dtd-owner', 'data-dag-color': member.color, style: { color: member.color } }, member.name)
 
+    // A ticket the captain added with dag_add after the run started; hover shows when.
+    const appendedTag = (ticket) =>
+      ticket.appended &&
+      h(
+        'span',
+        {
+          className: 'dtd-appended',
+          'data-dag-appended': '',
+          title: '追加于 ' + new Date(ticket.appendedAt).toLocaleString('zh-CN'),
+        },
+        '追加',
+      )
+
     function Ticket({ ticket, view, open, captain, member }) {
       const { id, title, status, dependsOn, attempt, retryAt, message } = ticket
       const info = [
@@ -861,6 +875,7 @@ window.__ModuleLoader__.load({
           h(Avatar, { route: ticketRoute(ticket, captain), size: 22 }),
           h('span', { className: 'dtd-chip' }, id),
           title && title !== id && h('span', { className: 'dtd-task-title' }, title),
+          appendedTag(ticket),
           memberTag(member),
           h('span', { className: 'dtd-badge ' + view.tone }, view.label),
           chatButton(ticket, open),
@@ -1733,6 +1748,7 @@ window.__ModuleLoader__.load({
                   },
                   h('span', { className: 'dtd-chip' }, t.id),
                   h('span', { className: 'dtd-task-title' }, t.title || t.id),
+                  appendedTag(t),
                   h(
                     'span',
                     { className: 'dtd-hint' },

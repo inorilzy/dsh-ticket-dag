@@ -155,6 +155,8 @@ export class RunCatalog {
             livePhase: t.livePhase ?? null,
             cleanup: t.cleanup ?? null,
             cleanupReason: displayDiagnostic(t.cleanupReason),
+            appended: t.appended ?? false,
+            appendedAt: t.appendedAt ?? null,
           })),
         }
       return summary
@@ -195,6 +197,10 @@ function readLedger(file, entry, detail, globalLimit) {
       const cleanup = columns.has('cleanup') && columns.has('cleanupReason')
         ? 'cleanup,cleanupReason'
         : 'NULL AS cleanup,NULL AS cleanupReason'
+      // A ledger from before dag_add has no appended table: nothing was appended.
+      const appended = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='appended'").get()
+        ? new Map(db.prepare('SELECT ticketId,createdAt FROM appended').all().map((r) => [r.ticketId, r.createdAt]))
+        : new Map()
       result.tickets = db
         .prepare(
           `SELECT id,json_extract(definition,'$.title') AS title,
@@ -209,6 +215,8 @@ function readLedger(file, entry, detail, globalLimit) {
           dependsOn: JSON.parse(deps),
           model: modelId ? [provider, modelId].filter(Boolean).join('/') : null,
           livePhase: null,
+          appended: appended.has(row.id),
+          appendedAt: appended.get(row.id) ?? null,
         }))
     }
     return result
