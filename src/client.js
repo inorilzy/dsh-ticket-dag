@@ -120,16 +120,16 @@ window.__ModuleLoader__.load({
 .dtd-fold label {display:flex;align-items:center;gap:.4rem;margin-inline-start:auto;font-size:.83rem}
 .dtd-ticket-head .dtd-dot {align-self:center}
 .dtd-graph {overflow:auto;padding:.2rem 0 .4rem}.dtd-canvas {position:relative}
-.dtd-canvas svg {position:absolute;inset:0;overflow:visible;pointer-events:none}
-.dtd-canvas path {fill:none;stroke:color-mix(in srgb,currentColor 30%,transparent);stroke-width:1.3}
-.dtd-canvas path[data-active=true] {stroke:var(--dtd-work);stroke-width:1.8}
+.dtd-canvas .dtd-edges {position:absolute;inset:0;overflow:visible;pointer-events:none}
+.dtd-edges path {fill:none;stroke:color-mix(in srgb,currentColor 30%,transparent);stroke-width:1.3}
+.dtd-edges path[data-active=true] {stroke:var(--dtd-work);stroke-width:1.8}
 .dtd-panel .dtd-node {position:absolute;display:grid;align-content:start;gap:.2rem;text-align:start;border:1px solid var(--dtd-line);border-radius:.6rem;background:var(--dsw-alias-bg-layer-1,Canvas);padding:.45rem .6rem;overflow:hidden}
 .dtd-node-head {display:flex;align-items:center;gap:.4rem;font-weight:600;font-size:.84rem}
 .dtd-node-head small {margin-inline-start:auto;font-weight:400;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dtd-node-title {font-size:.84rem;line-height:1.35;opacity:.86;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .dtd-node[data-tone=work] {border-color:color-mix(in srgb,var(--dtd-work) 60%,transparent)}
 .dtd-node[data-tone=blocked] {border-color:color-mix(in srgb,var(--dtd-blocked) 70%,transparent)}
-.dtd-node[data-dim=true] {opacity:.42}.dtd-canvas path[data-active=false] {opacity:.45}
+.dtd-node[data-dim=true] {opacity:.42}.dtd-edges path[data-active=false] {opacity:.45}
 .dtd-steps {display:flex;list-style:none;margin:.2rem 0;padding:0;gap:3px;font-size:.76rem}
 .dtd-steps li {flex:1;min-width:0;text-align:center;padding-top:.3rem;border-top:3px solid var(--dtd-idle);opacity:.7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dtd-steps [data-state=done] {border-color:var(--dtd-done);opacity:1}
@@ -1181,7 +1181,7 @@ window.__ModuleLoader__.load({
             { className: 'dtd-canvas', style: { width: layout.width, height: layout.height } },
             h(
               'svg',
-              { width: layout.width, height: layout.height, 'aria-hidden': true },
+              { className: 'dtd-edges', width: layout.width, height: layout.height, 'aria-hidden': true },
               ...layout.edges.map((e) =>
                 h('path', {
                   key: e.from + '>' + e.to,
@@ -1248,7 +1248,7 @@ window.__ModuleLoader__.load({
             { className: 'dtd-canvas', style: { width: layout.width, height: layout.height } },
             h(
               'svg',
-              { width: layout.width, height: layout.height, 'aria-hidden': true },
+              { className: 'dtd-edges', width: layout.width, height: layout.height, 'aria-hidden': true },
               ...layout.edges.map((e) =>
                 h('path', {
                   key: e.from + '>' + e.to,

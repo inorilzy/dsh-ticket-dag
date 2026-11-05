@@ -926,6 +926,18 @@ test('a recognised vendor avatar shows that vendor icon and no abbreviation tag;
   assert.deepEqual(tags(unknown).map(text), ['?'])
 })
 
+test('edge styles apply only to the edge layer, so avatar icons inside map nodes keep their fill', () => {
+  const root = boardFor([{ id: 'A', status: 'RUNNING', model: 'magpie/group/deepseek' }])
+  const map = find(root, (n) => n.props['data-dag-map'] !== undefined)
+  const layers = findAll(map, (n) => n.type === 'svg' && n.props.className === 'dtd-edges')
+  assert.equal(layers.length, 1, 'the map draws its edges in one dtd-edges layer')
+  assert.ok(find(find(map, (n) => n.props['data-dag-node'] === 'A'), (n) => n.props['data-dag-vendor-icon'] === 'deepseek'))
+  const source = readFileSync(resolve(import.meta.dirname, '..', 'src', 'client.js'), 'utf8')
+  for (const selector of ['.dtd-canvas svg {', '.dtd-canvas path {', '.dtd-canvas path[']) {
+    assert.ok(!source.includes(selector), selector + ' would also style avatar icons in nodes')
+  }
+})
+
 test('two Gemini avatars on one page use distinct gradient ids that their own paths reference', () => {
   const root = boardFor([
     { id: 'A', status: 'PENDING', model: 'google/gemini-2.5-pro' },
