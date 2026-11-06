@@ -3,29 +3,90 @@ import { resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
 /**
+ * The raw ledger arrays that decide what a plan approves: the run row, every
+ * ticket definition, the dependency edges, the dag_add batches and the approval
+ * records. Kept in one place so the coordinator's ledger digest, the plan
+ * revision and the read-only dashboard all hash the same rows.
+ */
+export function ledgerSnapshot({ run, tickets, dependencies, appended, approvals }) {
+  return {
+    run: [run.runId, run.repo, run.ref, run.baseSha, run.parentId, run.policyHash, run.manifest],
+    tickets: tickets.map((t) => [t.id, t.position, t.definition]),
+    dependencies: dependencies.map((d) => [d.ticketId, d.upstream]),
+    appended: appended.map((a) => [a.ticketId, a.batch, a.definition, a.policyHash, a.createdAt]),
+    approvals: approvals.map((a) => a.details),
+  }
+}
+
+// The preset fields approval resolves for a ticket right now: the preset named
+// by its definition, resolved from the live settings, or the copy frozen at
+// dag_run when that preset has since been removed (approve's own fallback). A
+// settings edit that changes any of these must change the plan revision, so a
+// review of the old preset cannot be approved as if nothing changed.
+function effectivePreset(ticket, agents) {
+  let definition = ticket?.definition
+  if (typeof definition === 'string') {
+    try {
+      definition = JSON.parse(definition)
+    } catch {
+      return null
+    }
+  }
+  const agent = definition?.agent
+  if (typeof agent !== 'string' || !agent) return null
+  if (agents && Object.hasOwn(agents, agent)) return agentSpec(agents, agent)
+  const frozen = definition.agentSpec
+  return frozen && typeof frozen === 'object' && !Array.isArray(frozen) ? frozen : {}
+}
+
+/**
  * The opaque revision the plan review carries for a staged run. It covers every
- * ledger field that decides what the user is approving: each ticket definition
- * (preset and model route included), the dependency edges, the dag_add batches
- * and their frozen commands, the submission (manifest, which holds the command
- * registry) and the approval records. A stale approval names an older revision.
+ * ledger field that decides what the user is approving: each ticket definition,
+ * the effective preset fields approval would freeze for that ticket now, the
+ * dependency edges, the dag_add batches and their frozen commands, the
+ * submission (manifest, which holds the command registry) and the approval
+ * records. A stale approval names an older revision.
  *
  * Both the live coordinator (RunStore.revision) and the read-only dashboard
  * (readLedger) build the same digest from raw ledger rows so a refresh shows the
  * exact revision the coordinator checks in its serial region.
  */
-export function planRevision({ run, tickets, dependencies, appended, approvals }) {
+export function planRevision({ run, tickets, dependencies, appended, approvals, agents = {} }) {
+  const snapshot = ledgerSnapshot({ run, tickets, dependencies, appended, approvals })
   return createHash('sha256')
     .update(
       JSON.stringify([
         run.mode,
-        [run.runId, run.repo, run.ref, run.baseSha, run.parentId, run.policyHash, run.manifest],
-        tickets.map((t) => [t.id, t.position, t.definition]),
-        dependencies.map((d) => [d.ticketId, d.upstream]),
-        appended.map((a) => [a.ticketId, a.batch, a.definition, a.policyHash, a.createdAt]),
-        approvals.map((a) => a.details),
+        snapshot.run,
+        tickets.map((t, i) => [...snapshot.tickets[i], effectivePreset(t, agents)]),
+        snapshot.dependencies,
+        snapshot.appended,
+        snapshot.approvals,
       ]),
     )
     .digest('hex')
+}
+
+/**
+ * Run the ledger integrity queries against any open connection, so the writer
+ * (RunStore.integrity) and the read-only dashboard (readLedger) read the same
+ * rows instead of keeping two copies that can drift.
+ */
+export function readIntegrity(db) {
+  const hasAppended = Boolean(
+    db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='appended'").get(),
+  )
+  return {
+    run: db
+      .prepare('SELECT runId,repo,ref,baseSha,manifest,parentId,policyHash,mode FROM run WHERE singleton=1')
+      .get(),
+    tickets: db.prepare('SELECT id,position,definition FROM tickets ORDER BY position').all(),
+    dependencies: db.prepare('SELECT ticketId,upstream FROM dependencies ORDER BY ticketId,upstream').all(),
+    appended: hasAppended
+      ? db.prepare('SELECT ticketId,batch,definition,policyHash,createdAt FROM appended ORDER BY batch,rowid').all()
+      : [],
+    approvals: db.prepare("SELECT details FROM events WHERE type='run_approved' ORDER BY rowid").all(),
+  }
 }
 
 const STATUSES = [
@@ -659,27 +720,18 @@ export class RunStore {
    * a digest of them against outside edits.
    */
   integrity() {
-    return {
-      run: this.#db
-        .prepare('SELECT runId,repo,ref,baseSha,manifest,parentId,policyHash,mode FROM run WHERE singleton=1')
-        .get(),
-      tickets: this.#db.prepare('SELECT id,position,definition FROM tickets ORDER BY position').all(),
-      dependencies: this.#db.prepare('SELECT ticketId,upstream FROM dependencies ORDER BY ticketId,upstream').all(),
-      appended: this.#db
-        .prepare('SELECT ticketId,batch,definition,policyHash,createdAt FROM appended ORDER BY batch,rowid')
-        .all(),
-      approvals: this.#approvals(),
-    }
+    return readIntegrity(this.#db)
   }
 
   /**
    * The opaque plan revision a staged plan is approved against. It is derived
    * from integrity(), so any change that would alter what runs or how it is
-   * accepted (an appended ticket, a frozen command, an approval record) makes
-   * an earlier snapshot's revision stale.
+   * accepted (an appended ticket, a frozen command, an approval record, or the
+   * effective preset a ticket would resolve now) makes an earlier snapshot's
+   * revision stale.
    */
-  revision() {
-    return planRevision(this.integrity())
+  revision(agents = {}) {
+    return planRevision({ ...this.integrity(), agents })
   }
 
   get(id) {

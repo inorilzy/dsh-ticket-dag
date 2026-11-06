@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, statSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { planRevision } from './store.mjs'
+import { planRevision, readIntegrity } from './store.mjs'
 
 const route = '/api/ticket-dag.dashboard'
 const noStore = { 'cache-control': 'no-store' }
@@ -216,7 +216,7 @@ export class RunCatalog {
         } else if (detail) {
           const signature = ledgerSignature(file)
           this.ledgerOpens++
-          data = readLedger(file, entry, true, coordinator.maxWorkers)
+          data = readLedger(file, entry, true, coordinator.maxWorkers, coordinator.agents)
           // Refresh the cache only when the ledger changed since it was last read.
           if (signature && this.cache.get(entry.key)?.signature !== signature)
             this.#storeSummary(entry.key, summaryOf(data), signature)
@@ -301,7 +301,7 @@ export class RunCatalog {
 // Read one ledger. `detail` also loads each ticket row; otherwise only the run
 // row and status counts are read. Exported so the history benchmark can measure
 // the pre-cache cost without duplicating the queries.
-export function readLedger(file, entry, detail, globalLimit) {
+export function readLedger(file, entry, detail, globalLimit, agents = {}) {
   const db = new DatabaseSync(file, { readOnly: true })
   try {
     db.exec('PRAGMA trusted_schema=OFF; PRAGMA query_only=ON; BEGIN')
@@ -335,11 +335,10 @@ export function readLedger(file, entry, detail, globalLimit) {
       const cleanup = columns.has('cleanup') && columns.has('cleanupReason')
         ? 'cleanup,cleanupReason'
         : 'NULL AS cleanup,NULL AS cleanupReason'
-      // A ledger from before dag_add has no appended table: nothing was appended.
-      const appendedRows = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='appended'").get()
-        ? db.prepare('SELECT ticketId,batch,definition,policyHash,createdAt FROM appended ORDER BY batch,rowid').all()
-        : []
-      const appended = new Map(appendedRows.map((r) => [r.ticketId, r.createdAt]))
+      // One shared read of the integrity rows: the same rows RunStore.integrity()
+      // returns, so the append list and plan revision cannot drift from the writer.
+      const integrity = readIntegrity(db)
+      const appended = new Map(integrity.appended.map((r) => [r.ticketId, r.createdAt]))
       result.tickets = db
         .prepare(
           `SELECT id,json_extract(definition,'$.title') AS title,
@@ -361,25 +360,13 @@ export function readLedger(file, entry, detail, globalLimit) {
         }))
       // A plan waiting for approval shows the captain's commands even before its captain reopens.
       if (run.mode === 'staged') {
-        const stored = db
-          .prepare(
-            'SELECT runId,repo,ref,baseSha,manifest,parentId,policyHash,mode FROM run WHERE singleton=1',
-          )
-          .get()
-        const checks = JSON.parse(stored.manifest).checks ?? {}
+        const checks = JSON.parse(integrity.run.manifest).checks ?? {}
         result.checks = checks
         result.planChecks = Object.keys(checks)
-        // The same revision RunStore.revision() computes, built from raw rows so
-        // a plan read without the coordinator still carries the exact version.
-        result.revision = planRevision({
-          run: stored,
-          tickets: db.prepare('SELECT id,position,definition FROM tickets ORDER BY position').all(),
-          dependencies: db
-            .prepare('SELECT ticketId,upstream FROM dependencies ORDER BY ticketId,upstream')
-            .all(),
-          appended: appendedRows,
-          approvals: db.prepare("SELECT details FROM events WHERE type='run_approved' ORDER BY rowid").all(),
-        })
+        // The same revision RunStore.revision() computes, built from the shared
+        // integrity rows so a plan read without the coordinator still carries
+        // the exact version, including each ticket's effective preset now.
+        result.revision = planRevision({ ...integrity, agents })
       }
     }
     return result
