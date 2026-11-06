@@ -1,5 +1,6 @@
 import { execFile, spawn } from 'node:child_process'
-import { lstat, mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { access, lstat, mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
 import { basename, delimiter, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
@@ -89,11 +90,28 @@ async function checkIdentity(repo) {
   return check
 }
 
+// Absolute host git, keyed by PATH and PATHEXT. cwd is not part of the key: a
+// checkout must not be able to change which git later commands run.
+const gitPrograms = new Map()
+function gitProgram(env) {
+  const key = (envValue(env, 'PATH') ?? '') + '\0' + (envValue(env, 'PATHEXT') ?? '')
+  let found = gitPrograms.get(key)
+  if (!found) {
+    found = resolveProgram('git', null, env, { native: true })
+    gitPrograms.set(key, found)
+    found.catch(() => {
+      if (gitPrograms.get(key) === found) gitPrograms.delete(key)
+    })
+  }
+  return found
+}
+
 async function git(repo, ...args) {
   if (typeof repo === 'object' && repo?.commonDir) await checkIdentity(repo)
-  const { stdout } = await exec('git', args, {
+  const env = envForCheckout()
+  const { stdout } = await exec(await gitProgram(env), args, {
     cwd: rootOf(repo),
-    env: envForCheckout(),
+    env,
     encoding: 'utf8',
     shell: false,
     windowsHide: true,
@@ -499,12 +517,46 @@ async function baseBranch(repo, baseRef) {
 }
 
 /**
+ * Why a worktree must stay, or null when nothing local would be lost. A plain
+ * git worktree remove deletes ignored files without complaint, and user config
+ * can hide untracked files or submodule changes, so every option is explicit.
+ */
+async function localFilesReason(wt) {
+  const status = await git(
+    wt,
+    'status',
+    '--porcelain=v1',
+    '--ignored=matching',
+    '--untracked-files=all',
+    '--ignore-submodules=none',
+    '--no-renames',
+    '-z',
+  )
+  if (!status) return null
+  const kinds = { 'tracked changes': [], untracked: [], ignored: [] }
+  for (const entry of status.split('\0').filter(Boolean)) {
+    const code = entry.slice(0, 2)
+    kinds[code === '!!' ? 'ignored' : code === '??' ? 'untracked' : 'tracked changes'].push(entry.slice(3))
+  }
+  // Names only, bounded, and quoted so a hostile file name stays one inert token in the diagnostic.
+  const parts = Object.entries(kinds)
+    .filter(([, names]) => names.length)
+    .map(([kind, names]) => {
+      const shown = names.slice(0, 5).map((name) => JSON.stringify(name.slice(0, 120)))
+      const more = names.length > shown.length ? ', and ' + (names.length - shown.length) + ' more' : ''
+      return kind + ': ' + shown.join(', ') + more
+    })
+  return 'worktree has uncommitted local files (' + parts.join('; ') + '): ' + wt
+}
+
+/**
  * Remove one integrated ticket's recorded worktree and branch. Refuses (throws)
  * a protected branch, a path outside the plugin worktree root, the main
  * worktree, or a branch checked out elsewhere. Skips (with a reason) work not
- * merged into the integration branch or a worktree with local changes. Never
- * forces: git worktree remove, then git branch -d against the integration
- * branch as its upstream, then git worktree prune. Repeating it is harmless.
+ * merged into the integration branch or a worktree holding tracked changes,
+ * untracked or ignored files. Never forces: git worktree remove, then git
+ * branch -d against the integration branch as its upstream, then git worktree
+ * prune. Repeating it is harmless.
  */
 export async function cleanupWorktree(repo, { path, branch, target, baseRef, root }) {
   await checkedRef(repo, target, targetPattern)
@@ -536,8 +588,8 @@ export async function cleanupWorktree(repo, { path, branch, target, baseRef, roo
   if (hasBranch && !(await isAncestor(repo, await resolveRef(repo, ref), await resolveRef(repo, target))))
     return { status: 'skipped', reason: 'ticket branch is not merged into ' + target }
   if (own) {
-    if (await git(wt, 'status', '--porcelain'))
-      return { status: 'skipped', reason: 'worktree has uncommitted changes: ' + wt }
+    const reason = await localFilesReason(wt)
+    if (reason) return { status: 'skipped', reason }
     await git(repo, 'worktree', 'remove', '--', wt)
   }
   if (hasBranch) {
@@ -567,23 +619,69 @@ async function isFile(path) {
   }
 }
 
-/** Windows: the batch file argv[0] would launch (PATH/PATHEXT lookup), or null for a native executable. */
-async function windowsBatch(command, cwd, env) {
-  const exts = (envValue(env, 'PATHEXT') || '.COM;.EXE;.BAT;.CMD')
+async function isProgram(path) {
+  if (!(await isFile(path))) return false
+  if (isWindows) return true
+  try {
+    await access(path, constants.X_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
+// Absolute PATH entries only. Empty and relative entries are the current
+// directory in disguise, and Windows also searches the child cwd before PATH.
+function trustedPathDirs(env) {
+  return (envValue(env, 'PATH') || '')
+    .split(delimiter)
+    .map((entry) => {
+      const trimmed = entry.trim()
+      return (isWindows ? trimmed.replace(/^"(.*)"$/, '$1') : trimmed).trim()
+    })
+    .filter((dir) => dir && isAbsolute(dir))
+}
+
+function pathexts(env, native) {
+  if (!isWindows) return []
+  return (envValue(env, 'PATHEXT') || '.COM;.EXE;.BAT;.CMD')
     .split(';')
-    .filter(Boolean)
-    .map((ext) => ext.toLowerCase())
-  const names = extname(command) ? [command] : exts.map((ext) => command + ext)
-  const dirs = /[\\/]/.test(command)
-    ? [cwd]
-    : [cwd, ...(envValue(env, 'PATH') || '').split(delimiter).filter(Boolean)]
+    .map((ext) => ext.trim().toLowerCase())
+    .filter((ext) => ext && (!native || ext === '.com' || ext === '.exe'))
+}
+
+/**
+ * Absolute path of the program argv[0] names. A bare name is looked up only in
+ * absolute entries of the host PATH: never in cwd, and never in relative
+ * entries such as "." that would resolve inside the candidate checkout. A name
+ * that already contains a path separator is an explicit project script and
+ * resolves against cwd. Missing programs fail loudly.
+ * `native` limits Windows to .com/.exe, which execFile can start without a shell.
+ */
+async function resolveProgram(command, cwd, env, { native = false } = {}) {
+  const exts = pathexts(env, native)
+  // Windows does not append PATHEXT when the name already contains a dot.
+  const names = !isWindows || extname(command) ? [command] : exts.map((ext) => command + ext)
+  const explicit = isAbsolute(command) || /[\\/]/.test(command)
+  const dirs = explicit ? [cwd ?? process.cwd()] : trustedPathDirs(env)
   for (const dir of dirs) {
     for (const name of names) {
-      const path = resolve(dir, name)
-      if (await isFile(path)) return /\.(?:bat|cmd)$/i.test(path) ? path : null
+      const found = resolve(dir, name)
+      if (!(await isProgram(found))) continue
+      verify(isAbsolute(found), 'Resolved program is not absolute: ' + command)
+      return found
     }
   }
-  return null
+  throw Object.assign(
+    new Error(
+      explicit
+        ? 'Program not found: ' +
+          command +
+          (cwd && !isAbsolute(command) ? ' (relative to ' + cwd + ')' : '')
+        : 'Program not found on the trusted host PATH (absolute entries only): ' + command,
+    ),
+    { code: 'ENOENT' },
+  )
 }
 
 function quoteForCmd(arg) {
@@ -594,18 +692,24 @@ function quoteForCmd(arg) {
 
 /** spawn() arguments; .cmd/.bat run via cmd.exe with strictly quoted, metacharacter-free tokens. */
 async function checkCommand(argv, cwd, env) {
-  const batch = isWindows ? await windowsBatch(argv[0], cwd, env) : null
-  if (!batch) return { file: argv[0], args: argv.slice(1), verbatim: false }
-  const line = [batch, ...argv.slice(1)].map(quoteForCmd).join(' ')
-  const comspec = envValue(env, 'COMSPEC') || 'cmd.exe'
+  const program = await resolveProgram(argv[0], cwd, env)
+  if (!isWindows || !/\.(?:bat|cmd)$/i.test(program))
+    return { file: program, args: argv.slice(1), verbatim: false }
+  const line = [program, ...argv.slice(1)].map(quoteForCmd).join(' ')
+  // A relative COMSPEC would be resolved inside the candidate checkout.
+  const configured = envValue(env, 'COMSPEC')
+  const comspec =
+    configured && isAbsolute(configured)
+      ? configured
+      : join(envValue(env, 'SYSTEMROOT') || 'C:\\Windows', 'System32', 'cmd.exe')
   return { file: comspec, args: ['/d', '/s', '/v:off', '/c', '"' + line + '"'], verbatim: true }
 }
 
 function killTree(child) {
   if (!child.pid) return Promise.resolve()
   if (isWindows) {
-    const root = process.env.SystemRoot
-    const taskkill = root ? join(root, 'System32', 'taskkill.exe') : 'taskkill'
+    const root = envValue(process.env, 'SYSTEMROOT') || 'C:\\Windows'
+    const taskkill = join(root, 'System32', 'taskkill.exe')
     return new Promise((done) =>
       execFile(taskkill, ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true }, (err) => {
         if (err) child.kill('SIGKILL')

@@ -4,7 +4,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { builtinAgents } from './agents.mjs'
 import { Coordinator } from './coordinator.mjs'
-import { RunCatalog, mountApproval, mountDashboard, mountModels } from './dashboard.mjs'
+import { RunCatalog, mountApproval, mountDashboard, mountModels, validateTicketRoutes } from './dashboard.mjs'
 import { importTickets, writeback } from './tracker.mjs'
 
 export const name = 'dsh-ticket-dag'
@@ -57,7 +57,7 @@ const runTools = [
   ['cancel', 'Cancel the run and stop its owned workers.'],
   [
     'cleanup',
-    'Remove the recorded worktrees and branches of the integrated tickets in a run, including an ended one, and return each ticket result. Unmerged or dirty worktrees are skipped with a reason; repeating it is harmless.',
+    'Remove the recorded worktrees and branches of the integrated tickets in a run, including an ended one, and return each ticket result. Unmerged worktrees and worktrees with tracked changes, untracked or ignored files are kept and skipped with a reason; repeating it is harmless.',
   ],
 ]
 const sourceKind = 'dsh-ticket-dag'
@@ -73,7 +73,7 @@ const keywordPattern = /(?<![a-z0-9])agent[\s_-]*teams?(?![a-z0-9])/i
 function checkList(checks) {
   const ids = Object.keys(checks ?? {})
   return [
-    'Verification is optional per ticket. A ticket with an empty or omitted verify list integrates after its commit merges cleanly, with no command run; use that for docs or other work no command can check.',
+    'Verification is optional per ticket. An empty or omitted verify list means the ticket has no check of its own: its candidate still runs the accumulated regression checks of the tickets already integrated in this run, then integrates once those pass and its trial merge is clean and the candidate is reviewed. Use that for docs or other work no command can check.',
     ids.length
       ? 'Profile check IDs (trusted, no approval needed): ' +
         ids.map((id) => id + ' = ' + checks[id].map((argv) => argv.join(' ')).join(' && ')).join('; ') +
@@ -286,7 +286,16 @@ export function apply(ctx, config = {}, { importer = importTickets, reporter = w
       ctx.logger.warn('Cannot index this run for the dashboard: ' + String(error).slice(0, 300))
     }
   }
-  const coordinator = new Coordinator({ launch, notify, canRetry, rememberRun, writeback: reporter, ...settings() })
+  const coordinator = new Coordinator({
+    launch,
+    notify,
+    canRetry,
+    rememberRun,
+    writeback: reporter,
+    // Approving a staged plan resolves every effective route before dispatch.
+    validateRoutes: (tickets) => validateTicketRoutes(tickets, () => ctx.get('llm')),
+    ...settings(),
+  })
   ctx.inject?.(['connection'], (scope) => {
     // A ticket without its own model inherits the captain's route, so the board shows it.
     mountDashboard(scope, catalog, coordinator, (parentId) => ctx.agents.get(parentId)?.options)
@@ -368,7 +377,24 @@ export function apply(ctx, config = {}, { importer = importTickets, reporter = w
       .then(async () => {
         if (closing || ctx.agents.get(agent.id) !== agent) return
         const cwd = await ctx.workingDirectory.ensure(agent)
-        if (!closing) await coordinator.attach({ cwd, parentId: agent.id })
+        if (closing) return
+        const scan = await coordinator.attach({ cwd, parentId: agent.id })
+        // A run the scan could not recover must not fail silently: show it on a
+        // board row with its diagnostic and send the captain one notice. The
+        // scan still never takes another coordinator's owner lock.
+        for (const { runId, error, file } of scan.failures ?? []) {
+          ctx.logger.warn('DAG recovery scan, run ' + runId + ': ' + error.slice(0, 500))
+          catalog.reportFailure(agent.id, runId, error, file)
+          const eventId = 'recovery-failed:' + runId
+          void notify({
+            parentId: agent.id,
+            eventId,
+            text:
+              '[dsh-ticket-dag ' + runId + '] 恢复失败：' + error.slice(0, 500) +
+              '\n这轮运行在挂载时无法恢复（可能被其他协调器占用、记录损坏或加载失败）。请在处理后在队长会话中重新打开。' +
+              '\nevent_id=' + eventId,
+          })
+        }
       })
       .catch((error) => ctx.logger.warn('DAG recovery scan: ' + String(error).slice(0, 300)))
       .finally(() => attaching.delete(job))
@@ -414,7 +440,7 @@ export function apply(ctx, config = {}, { importer = importTickets, reporter = w
 
   register(
     'run',
-    'Start the approved spec manifest and return its runId. Reusing a runId with the same manifest is idempotent. Each ticket verify list is optional and names check IDs: a profile check, or one defined in the manifest checks object ({"<id>": [["program", "arg"]]}), which the user approves with the plan; a ticket without checks integrates after a clean merge. A ticket may set agent to a configured agent preset ID (for example implementer, frontend, verifier, test-writer, docs or merger) to give its worker that role and model; omit it for the default worker. When the result mode is staged, nothing has started: the user reviews each ticket preset and model in the 「工单 · <runId>」 tab of the conversation right sidebar and approves or discards the plan there. Tell the user that and end the turn; you are notified once it is approved. dag_resume cannot start a staged run. To add work to this run later, use dag_add instead of a new dag_run.',
+    'Start the approved spec manifest and return its runId. Reusing a runId with the same manifest is idempotent. Each ticket verify list is optional and names check IDs: a profile check, or one defined in the manifest checks object ({"<id>": [["program", "arg"]]}), which the user approves with the plan. An empty or omitted verify list means the ticket has no check of its own: its candidate still runs the accumulated regression checks of the tickets already integrated in this run, then integrates once those pass and its trial merge is clean. A ticket may set agent to a configured agent preset ID (for example implementer, frontend, verifier, test-writer, docs or merger) to give its worker that role and model; omit it for the default worker. When the result mode is staged, nothing has started: the user reviews each ticket preset and model in the 「工单 · <runId>」 tab of the conversation right sidebar and approves or discards the plan there. Tell the user that and end the turn; you are notified once it is approved. dag_resume cannot start a staged run. To add work to this run later, use dag_add instead of a new dag_run.',
     {
       manifest: { type: 'json', required: true, description: 'Ticket DAG manifest object or JSON string.' },
       runId: {

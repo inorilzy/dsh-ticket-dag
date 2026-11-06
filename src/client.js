@@ -112,6 +112,7 @@ window.__ModuleLoader__.load({
 .dtd-phase,.dtd-ticket details {font-size:.86rem}.dtd-ticket summary {cursor:pointer}
 .dtd-info {display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.25rem .75rem;margin:.3rem 0}
 .dtd-info dd {margin:0}.dtd-ticket .dtd-alert {white-space:pre-wrap}
+.dtd-elapsed {display:flex;align-items:baseline;gap:.25rem .6rem;flex-wrap:wrap}.dtd-elapsed [data-dag-elapsed] {font-variant-numeric:tabular-nums;font-weight:600}.dtd-elapsed details {flex-basis:100%;font-size:.86rem}.dtd-elapsed summary {cursor:pointer}
 .dtd-panel h3,.dtd-panel h4,.dtd-panel p,.dtd-panel fieldset {margin:0}
 .dtd-panel h3 {font-size:1.1rem}.dtd-panel h4 {font-size:.96rem}
 .dtd-panel small,.dtd-panel .dtd-hint {font-size:.83rem;color:inherit;opacity:.78}
@@ -956,7 +957,57 @@ window.__ModuleLoader__.load({
         '追加',
       )
 
-    function Ticket({ ticket, view, open, captain, member }) {
+    // 12:34, or 1:02:34 from an hour up. An unknown duration is a dash, never 0:00.
+    function durationText(ms) {
+      if (!Number.isFinite(ms)) return '—'
+      const seconds = Math.floor(Math.max(0, ms) / 1000)
+      const pad = (n) => String(n).padStart(2, '0')
+      const hours = Math.floor(seconds / 3600)
+      const minutes = Math.floor(seconds / 60) % 60
+      return (hours ? hours + ':' + pad(minutes) : minutes) + ':' + pad(seconds % 60)
+    }
+
+    // Holds its own timer so a tick repaints only this number. accumulatedMs already
+    // runs up to the server's reading, so only the local time since that reading is
+    // added, and the page and server clocks are never compared.
+    function ElapsedTime({ timing, receivedAt }) {
+      const [, setTick] = useState(0)
+      const ticking = timing.runningSince !== null
+      useEffect(() => {
+        if (!ticking) return undefined
+        const interval = setInterval(() => setTick((n) => n + 1), 1000)
+        return () => clearInterval(interval)
+      }, [ticking])
+      const sinceRead = ticking && receivedAt ? Math.max(0, Date.now() - receivedAt) : 0
+      return h('span', { 'data-dag-elapsed': '' }, durationText(timing.accumulatedMs + sinceRead))
+    }
+
+    function timingBreakdown(timing) {
+      const { workerMs, queueMs, verifyMs, checkRuns, conflicts } = timing.totals
+      return [
+        ['工单工作合计', durationText(workerMs)],
+        ['集成排队', durationText(queueMs)],
+        ['验收', durationText(verifyMs)],
+        ['等待处理', durationText(timing.attentionMs)],
+        // A ledger that cannot split verification has no check_finished rows to count either.
+        ['验收命令次数', verifyMs === null ? '—' : String(checkRuns)],
+        ['冲突次数', String(conflicts)],
+      ]
+    }
+
+    // A ticket with no events yet has no row in timing.tickets.
+    function ticketTiming(timing, id) {
+      if (!timing || !Object.hasOwn(timing.tickets, id)) return []
+      const { workerMs, queueMs, verifyMs, attempts } = timing.tickets[id]
+      return [
+        ['工作时长', durationText(workerMs)],
+        ['排队时长', durationText(queueMs)],
+        ['验收时长', durationText(verifyMs)],
+        ['尝试次数', String(attempts)],
+      ]
+    }
+
+    function Ticket({ ticket, view, open, captain, member, timing }) {
       const { id, title, status, dependsOn, attempt, retryAt, message } = ticket
       const info = [
         ['子会话', ticket.childId],
@@ -965,6 +1016,7 @@ window.__ModuleLoader__.load({
         ['基线提交', ticket.baseSha],
         ['成果提交', ticket.sourceSha],
         ['已集成提交', ticket.landedSha],
+        ...ticketTiming(timing, id),
       ].filter(([, value]) => value)
       return h(
         'li',
@@ -1069,7 +1121,15 @@ window.__ModuleLoader__.load({
               'ul',
               { className: 'dtd-tickets', key: 'list' },
               ...visible.map(({ ticket, view }) =>
-                h(Ticket, { key: ticket.id, ticket, view, open, captain: run.captain, member: memberOf(ticket) }),
+                h(Ticket, {
+                  key: ticket.id,
+                  ticket,
+                  view,
+                  open,
+                  captain: run.captain,
+                  member: memberOf(ticket),
+                  timing: run.timing,
+                }),
               ),
             )
           : h('p', { className: 'dtd-hint', key: 'list' }, '当前没有符合筛选条件的工单。'))
@@ -1131,6 +1191,27 @@ window.__ModuleLoader__.load({
               h('span', { className: 'dtd-hint' }, routeName(run.captain) || '模型未知'),
             ),
           ),
+          run.timing &&
+            h(
+              'div',
+              { className: 'dtd-elapsed' },
+              h('span', { className: 'dtd-hint' }, '累计用时'),
+              h(ElapsedTime, { timing: run.timing, receivedAt: run.receivedAt }),
+              run.mode === 'paused' && !run.complete && h('span', { className: 'dtd-hint' }, '已暂停'),
+              h(
+                'details',
+                { 'data-dag-elapsed-breakdown': '' },
+                h('summary', null, '用时分解'),
+                h(
+                  'dl',
+                  { className: 'dtd-info' },
+                  ...timingBreakdown(run.timing).flatMap(([key, value]) => [
+                    h('dt', { key: key + '-key' }, key),
+                    h('dd', { key: key + '-value' }, value),
+                  ]),
+                ),
+              ),
+            ),
           h('progress', {
             className: 'dtd-sr',
             max: run.total || 1,
@@ -1768,6 +1849,21 @@ window.__ModuleLoader__.load({
         ?.focus()
     }
 
+    // One argument per token, so the reader sees the argv the check runs. Plain
+    // tokens are literal; anything else is a quoted JSON string with every
+    // invisible character escaped, which keeps "", "a b" and "a\nb" apart.
+    const invisible = /(?! )[\p{C}\p{Z}]/gu
+    const escapeInvisible = (c) => {
+      const code = c.codePointAt(0)
+      return code > 0xffff ? '\\u{' + code.toString(16) + '}' : '\\u' + code.toString(16).padStart(4, '0')
+    }
+    const argvText = (argv) =>
+      argv
+        .map((arg) =>
+          /^[\p{L}\p{N}_@%+=:,./-]+$/u.test(arg) ? arg : JSON.stringify(arg).replace(invisible, escapeInvisible),
+        )
+        .join(' ')
+
     // A staged run waits for the user. Members are the presets that own tasks:
     // each member's model applies to all of its tasks; a task row expands to
     // change its owner. Approve starts dispatch; discard cancels the plan.
@@ -1787,6 +1883,12 @@ window.__ModuleLoader__.load({
       const [hovered, setHovered] = useState(null)
       // The user's concurrency for this run, as typed; null keeps the plan's.
       const [workers, setWorkers] = useState(null)
+      // The plan version the user started reviewing, and the ticket IDs it held.
+      // Approval must echo this pinned revision, not whatever the 2-second poll
+      // has since replaced it with; a poll that brings a new revision only
+      // enables approval again after the user reconfirms the current plan.
+      const [pinnedRevision, setPinnedRevision] = useState(run.revision)
+      const [pinnedIds, setPinnedIds] = useState(() => run.tickets.map((t) => t.id))
       useEffect(() => {
         const ctrl = new AbortController()
         fetch('api/ticket-dag.models', { signal: ctrl.signal, cache: 'no-store' })
@@ -1799,7 +1901,9 @@ window.__ModuleLoader__.load({
       const presets = run.presets ?? []
       const presetOf = (id) => presets.find((p) => p.id === id)
       const plannedOwners = Object.fromEntries(run.tickets.map((t) => [t.id, t.agent ?? '']))
-      const currentOwners = owners ?? plannedOwners
+      // Overlay the user's edits on the current plan: a ticket appended while the
+      // plan is under review keeps its planned owner until the user changes it.
+      const currentOwners = { ...plannedOwners, ...(owners ?? {}) }
       // Every possible owner, in a stable order that also fixes each member colour.
       const allIds = [
         ...new Set([...presets.map((p) => p.id), ...Object.values(plannedOwners), ...Object.values(currentOwners)]),
@@ -1821,7 +1925,7 @@ window.__ModuleLoader__.load({
       const edges = run.tickets.reduce((n, t) => n + t.dependsOn.length, 0)
       const byId = new Map(run.tickets.map((t) => [t.id, t]))
       const rows = run.tickets.map((ticket) => ({ ticket, view: ticketView(ticket, byId, 'staged') }))
-      // Every check the plan runs, with its commands and the tasks that use it.
+      // Every check the plan runs or later tickets may use, with its commands and the tasks that use it.
       const ownChecks = new Set(run.planChecks ?? [])
       const checkRows = Object.entries(run.checks ?? {}).map(([id, commands]) => ({
         id,
@@ -1831,6 +1935,25 @@ window.__ModuleLoader__.load({
       }))
       const unchecked = run.tickets.filter((t) => !(t.verify ?? []).length).map((t) => t.id)
       const changed = owners !== null || routes !== null
+      // A poll replaced the plan under review. Name the ticket difference when
+      // it is cheap to compute; a change from preset or check edits has none.
+      const planChanged = pinnedRevision !== run.revision
+      const currentIds = run.tickets.map((t) => t.id)
+      const addedIds = currentIds.filter((id) => !pinnedIds.includes(id))
+      const removedIds = pinnedIds.filter((id) => !currentIds.includes(id))
+      const planChangeSummary = [
+        addedIds.length && '新增工单 ' + addedIds.join('、'),
+        removedIds.length && '移除工单 ' + removedIds.join('、'),
+      ]
+        .filter(Boolean)
+        .join('；')
+      // Keep the owner/model edits keyed by ticket and member, so an appended
+      // ticket picks up its planned owner and every existing edit survives.
+      const reconfirm = () => {
+        setPinnedRevision(run.revision)
+        setPinnedIds(currentIds)
+        setError('')
+      }
       const allChecked = memberIds.length > 0 && memberIds.every((id) => checked.has(id))
       const toggle = (id) =>
         setChecked((old) => {
@@ -1876,7 +1999,31 @@ window.__ModuleLoader__.load({
             headers: { 'content-type': 'application/json', 'x-dsh-ticket-dag': '1' },
             body: JSON.stringify({ key: run.key, ...body }),
           })
-          if (!response.ok) throw new Error((await response.text()) || 'HTTP ' + response.status)
+          if (!response.ok) {
+            const raw = ((await response.text()) || '').trim()
+            // The host marks the one refusal that means "the plan you reviewed
+            // is stale" with a code; every other failure keeps its own message.
+            let payload = null
+            try {
+              payload = raw ? JSON.parse(raw) : null
+            } catch {
+              payload = null
+            }
+            const detail = (payload && typeof payload === 'object' ? String(payload.message ?? '') : raw).trim()
+            const code = payload && typeof payload === 'object' ? payload.code : undefined
+            // Only a stale plan revision means "refresh and review the current
+            // plan again". Keep the user's edits, show the current plan and
+            // require a fresh confirmation before approval can send.
+            if (response.status === 409 && body.action === 'approve' && code === 'stale-revision') {
+              setError(
+                '计划已更新，正在为你刷新。请核对最新的工单、验收命令与模型后再次确认。' +
+                  (detail ? ' ' + detail : ''),
+              )
+              refresh()
+              return
+            }
+            throw new Error(detail || 'HTTP ' + response.status)
+          }
           refresh()
         } catch (err) {
           setError(err.message || '操作失败，请重试。')
@@ -1894,11 +2041,18 @@ window.__ModuleLoader__.load({
         }
         send({
           action: 'approve',
+          // Echo the plan version the user started reviewing, not the latest
+          // polled one; the host refuses a different version with a 409 so
+          // nothing unseen is started.
+          revision: pinnedRevision,
           choices: run.tickets.map((t) => ({ id: t.id, agent: currentOwners[t.id], ...routeOf(currentOwners[t.id]) })),
           ...(currentWorkers !== plannedWorkers && { maxWorkers: n }),
         })
       }
+      // A changed plan disables approval until the user reconfirms; discard
+      // still uses the plain busy/attachment guard.
       const blocked = busy || run.attached === false
+      const approveBlocked = blocked || planChanged
       return h(
         'section',
         { className: 'dtd-section dtd-review', 'data-dag-review': '', 'aria-label': '执行前计划审查' },
@@ -1918,6 +2072,24 @@ window.__ModuleLoader__.load({
             memberIds.length + ' 名成员 · ' + run.tickets.length + ' 项任务 · ' + edges + ' 条依赖 · 最多同时 ' + currentWorkers + ' 个',
           ),
         ),
+        planChanged &&
+          h(
+            'section',
+            { className: 'dtd-block dtd-plan-changed', 'data-dag-plan-changed': '', role: 'alert' },
+            h('h4', null, '计划已更新'),
+            h(
+              'p',
+              { className: 'dtd-hint' },
+              '你正在审查的计划在打开后发生了变化' +
+                (planChangeSummary ? '（' + planChangeSummary + '）' : '') +
+                '。你已修改的模型与负责人仍然保留；请核对最新的工单、验收命令与模型，然后确认这份最新计划。',
+            ),
+            h(
+              'div',
+              { className: 'dtd-actions' },
+              button('确认最新计划', reconfirm, { className: 'dtd-primary', disabled: busy }),
+            ),
+          ),
         h(
           'section',
           { className: 'dtd-block', 'aria-label': '并行' },
@@ -2084,8 +2256,12 @@ window.__ModuleLoader__.load({
                     { key: id, className: 'dtd-check', 'data-dag-check': id },
                     h('span', { className: 'dtd-chip' }, id),
                     h('span', { className: 'dtd-hint' }, own ? '队长编写，需你确认' : '插件配置'),
-                    h('span', { className: 'dtd-hint' }, users.join('、')),
-                    ...commands.map((argv, i) => h('code', { key: i, className: 'dtd-check-cmd' }, argv.join(' '))),
+                    h(
+                      'span',
+                      { className: 'dtd-hint', 'data-dag-check-users': '' },
+                      users.length ? '工单：' + users.join('、') : '尚无工单引用，批准后可供追加工单使用',
+                    ),
+                    ...commands.map((argv, i) => h('code', { key: i, className: 'dtd-check-cmd' }, argvText(argv))),
                   ),
                 ),
               )
@@ -2094,7 +2270,8 @@ window.__ModuleLoader__.load({
             ? h(
                 'p',
                 { className: 'dtd-hint', 'data-dag-unchecked': true },
-                unchecked.join('、') + ' 不跑验收命令，干净合并即集成。',
+                unchecked.join('、') +
+                  ' 没有本票专属验收命令；候选仍会执行已集成工单的累计回归检查，通过后干净合并即集成。',
               )
             : null,
         ),
@@ -2124,7 +2301,7 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'dtd-actionbar', 'data-dag-actions': '' },
-          h('button', { type: 'button', className: 'dtd-primary', disabled: blocked, onClick: approve }, '确认并启动'),
+          h('button', { type: 'button', className: 'dtd-primary', disabled: approveBlocked, onClick: approve }, '确认并启动'),
           button('返回对话修改', backToChat),
           button(
             confirmDiscard ? '再次点击确认放弃' : '放弃本次计划',
@@ -2245,6 +2422,8 @@ window.__ModuleLoader__.load({
             settled = Boolean(view.selected?.complete || view.selected?.mode === 'cancelled')
             target.current = selected
             setSelectedKey(selected)
+            // The local moment of this reading, which the elapsed time counts on from.
+            if (view.selected) view.selected.receivedAt = Date.now()
             setData(view)
             setError('')
             setLastRead(new Date())
@@ -2455,24 +2634,16 @@ window.__ModuleLoader__.load({
       for (const t of tickets) members.set(t.agent ?? '', (members.get(t.agent ?? '') ?? 0) + 1)
       return [...members]
     }
-    const runState = (run) =>
-      !run
-        ? ''
-        : run.available === false
-          ? '记录不可读'
-          : run.mode === 'staged'
-            ? '待确认'
-            : run.mode === 'discarded'
-              ? '已放弃'
-              : run.complete
-                ? '已完成'
-                : '进行中'
 
-    // Reads this conversation's run list once to find the run's sidebar address
-    // and preset names; no polling, the tab owns live progress.
+    // Reads this conversation's run once on mount (a remount reads again). The
+    // folded tool result is only the plan at dag_run time, so a successful read
+    // shows the board's status plus the snapshot's members and ticket count.
+    // No polling; the sidebar tab owns live progress.
     function RunCard({ run, sessionId, openRun }) {
       const [found, setFound] = useState(null)
-      const [presets, setPresets] = useState(null)
+      // null until the dashboard answers. false: the read failed, so the tool
+      // result is an old snapshot and must not look like the live state.
+      const [snapshot, setSnapshot] = useState(null)
       const [notice, setNotice] = useState('')
       useEffect(() => {
         let disposed = false
@@ -2485,13 +2656,28 @@ window.__ModuleLoader__.load({
         void (async () => {
           try {
             const view = await read('')
-            const hit = view?.runs?.find?.((r) => r.runId === run.runId)
-            if (disposed || !hit) return
+            if (!Array.isArray(view?.runs)) throw new Error('宿主未返回有效的运行快照。')
+            const hit = view.runs.find((r) => r.runId === run.runId)
+            if (disposed) return
+            if (!hit) {
+              // The run is missing from the board list: treat it like a read
+              // failure so the folded plan is marked as a historical snapshot
+              // instead of passing the original ticket count off as live state.
+              setSnapshot(false)
+              return
+            }
+            // The list row is enough to open the right sidebar tab if the detail read fails.
             setFound(hit)
             const detail = view.selected?.key === hit.key ? view.selected : (await read(hit.key))?.selected
-            if (!disposed && Array.isArray(detail?.presets)) setPresets(detail.presets)
+            if (disposed) return
+            if (!detail || !Array.isArray(detail.tickets)) {
+              setSnapshot(false)
+              return
+            }
+            if (detail.key) setFound(detail)
+            setSnapshot(detail)
           } catch {
-            // The card still shows what the tool result recorded.
+            if (!disposed) setSnapshot(false)
           }
         })()
         return () => {
@@ -2499,9 +2685,19 @@ window.__ModuleLoader__.load({
           ctrl.abort()
         }
       }, [sessionId, run.runId])
-      const members = runMembers(run.tickets)
+      const live = Boolean(snapshot && Array.isArray(snapshot.tickets))
+      const historical = snapshot === false
+      const unreadable = live && snapshot.available === false
+      const roster = live && !unreadable ? snapshot.tickets : run.tickets
+      const members = runMembers(roster)
       const ids = members.map(([id]) => id)
-      const state = runState(found)
+      const presets = live && !unreadable ? snapshot.presets : null
+      const state = live ? runMode(snapshot) : ''
+      const meta = historical
+        ? '旧快照 · ' + run.tickets.length + ' 张工单'
+        : unreadable
+          ? state
+          : [state, roster.length + ' 张工单'].filter(Boolean).join(' · ')
       return h(
         'section',
         { className: 'dtd-dashboard dtd-run-card', 'data-dag-run-card': run.runId },
@@ -2510,7 +2706,7 @@ window.__ModuleLoader__.load({
           'header',
           { className: 'dtd-run-card-head' },
           h('span', { className: 'dtd-run-card-title', title: run.runId }, '工单 · ' + run.runId),
-          h('span', { className: 'dtd-run-card-meta' }, [state, run.tickets.length + ' 张工单'].filter(Boolean).join(' · ')),
+          h('span', { className: 'dtd-run-card-meta', 'data-dag-run-state': historical ? '旧快照' : state }, meta),
           h(
             'button',
             {
@@ -2521,7 +2717,10 @@ window.__ModuleLoader__.load({
             '查看工单',
           ),
         ),
-        members.length > 0 &&
+        historical &&
+          h('p', { role: 'status', className: 'dtd-alert' }, '读取失败，以下是旧快照，不是当前状态。'),
+        !unreadable &&
+          members.length > 0 &&
           h(
             'div',
             { className: 'dtd-run-card-members' },
@@ -2533,6 +2732,12 @@ window.__ModuleLoader__.load({
                 memberName(id, presets) + ' · ' + count + ' 张',
               ),
             ),
+          ),
+        unreadable &&
+          h(
+            'p',
+            { role: 'status', className: 'dtd-alert' },
+            snapshot.diagnostic || '这轮运行的持久记录暂不可读取。',
           ),
         notice && h('p', { role: 'status', className: 'dtd-alert' }, notice),
       )

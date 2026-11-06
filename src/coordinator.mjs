@@ -3,7 +3,8 @@ import { access, lstat, mkdir, readFile, readdir, writeFile } from 'node:fs/prom
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import * as git from './git.mjs'
-import { agentSpec, normalizeAppend, normalizeManifest, RunStore } from './store.mjs'
+import { agentSpec, ledgerSnapshot, normalizeAppend, normalizeManifest, RunStore } from './store.mjs'
+import { runTiming } from './timing.mjs'
 
 const hash = (text) => createHash('sha256').update(text).digest('hex')
 const message = (err) => String(err?.message ?? err).slice(-3500)
@@ -13,8 +14,12 @@ const transient =
 const capacityCode = 'ACTIVATION_LIMIT_REACHED'
 const runPattern = /^[a-z0-9][a-z0-9_-]{0,62}$/
 
-function requireValue(test, text) {
-  if (!test) throw new Error(text)
+function requireValue(test, text, code) {
+  if (!test) {
+    const error = new Error(text)
+    if (code) error.code = code
+    throw error
+  }
 }
 async function exists(path) {
   try {
@@ -53,26 +58,30 @@ function copyChecks(manifest, registry) {
 function registryOf(profile, manifest) {
   return { ...profile, ...(manifest?.checks ?? {}) }
 }
+// Manifest checks no approval covers and no ticket of the run uses. A run
+// approved before the review listed unused checks never showed them to the user.
+function unapprovedChecks(db, meta, used) {
+  if (meta.mode === 'staged') return []
+  const approved = new Set(db.approvedChecks())
+  return Object.keys(meta.manifest.checks ?? {}).filter((id) => !approved.has(id) && !Object.hasOwn(used, id))
+}
 // Every ticket a run will verify: the submitted manifest plus each dag_add batch.
 function runTickets(db, meta = db.meta()) {
   return { tickets: [...meta.manifest.tickets, ...db.appended().flatMap((b) => b.tickets)] }
 }
 // Digest of the ledger fields that decide dispatch and acceptance. plan covers
 // the run row and submitted manifest; approval covers the per-ticket
-// definitions (approved presets, verify IDs), dependency edges and append records.
+// definitions (approved presets, verify IDs), dependency edges, append records
+// and which manifest checks the approval covered. The arrays come from
+// store.ledgerSnapshot so this digest and planRevision hash the same rows.
 function ledgerDigest(db) {
-  const { run, tickets, dependencies, appended } = db.integrity()
+  const integrity = db.integrity()
+  const snapshot = ledgerSnapshot(integrity)
   return {
-    mode: run.mode,
-    plan: hash(
-      JSON.stringify([run.runId, run.repo, run.ref, run.baseSha, run.parentId, run.policyHash, run.manifest]),
-    ),
+    mode: integrity.run.mode,
+    plan: hash(JSON.stringify(snapshot.run)),
     approval: hash(
-      JSON.stringify([
-        tickets.map((t) => [t.id, t.position, t.definition]),
-        dependencies.map((d) => [d.ticketId, d.upstream]),
-        appended.map((a) => [a.ticketId, a.batch, a.definition, a.policyHash, a.createdAt]),
-      ]),
+      JSON.stringify([snapshot.tickets, snapshot.dependencies, snapshot.appended, snapshot.approvals]),
     ),
   }
 }
@@ -182,6 +191,19 @@ function openWriter(directory) {
     throw new Error('Another DSH coordinator owns this run: ' + directory, { cause: e })
   }
 }
+// Read without acquiring the owner lock, so a scan never touches another captain's run.
+function ledgerOwner(file) {
+  try {
+    const reader = new DatabaseSync(file, { readOnly: true })
+    try {
+      return reader.prepare('SELECT parentId FROM run WHERE singleton=1').get()?.parentId
+    } finally {
+      reader.close()
+    }
+  } catch (e) {
+    throw new Error('Cannot read the run ledger ' + file + ': ' + message(e), { cause: e })
+  }
+}
 
 export class Coordinator {
   constructor({
@@ -201,6 +223,7 @@ export class Coordinator {
     maxConflictRetries = 2,
     trackerWriteback = 'off',
     reviewOnComplete = false,
+    validateRoutes,
     writeback,
   } = {}) {
     requireValue(typeof launch === 'function', 'A subagent launch adapter is required')
@@ -225,6 +248,7 @@ export class Coordinator {
       maxConflictRetries,
       trackerWriteback,
       reviewOnComplete,
+      validateRoutes,
       writeback,
     })
     this.runs = new Map()
@@ -432,44 +456,53 @@ export class Coordinator {
 
   // An owner dashboard can only observe an already-attached run through this
   // method. It cannot attach to a repository or wake its scheduler.
-  peek(file) {
+  // Only the selected run passes now: its timing reads every event of the ledger.
+  peek(file, now) {
     const run = this.runs.get(file)
-    return run ? this._snapshot(run) : null
+    if (!run) return null
+    return now === undefined ? this._snapshot(run) : { ...this._snapshot(run), timing: runTiming(run.db.events(), now) }
   }
 
+  /**
+   * The recovery scan: take over every run of this captain in the repository.
+   * One run failing (owner lock held elsewhere, corrupt ledger, failed load)
+   * is reported and the scan goes on. A ledger too damaged to name its captain
+   * is reported to every captain scanning the repository.
+   * @returns { attached: runId[], failures: { runId, error }[] }
+   */
   async attach({ cwd, parentId }) {
-    if (this.stopping) return
+    const report = { attached: [], failures: [] }
+    if (this.stopping) return report
     let repo
     try {
       repo = await git.repoInfo(cwd)
     } catch {
-      return
+      return report
     }
     const dir = dirname(dirname(dbFile(repo, 'probe')))
     let entries
     try {
       entries = await readdir(dir, { withFileTypes: true })
     } catch (err) {
-      if (err.code === 'ENOENT') return
+      if (err.code === 'ENOENT') return report
       throw err
     }
     for (const e of entries) {
       if (this.stopping || !e.isDirectory() || !runPattern.test(e.name)) continue
-      // Do not acquire or reconcile a different captain's runs.
+      // The ledger path is known before opening, so a failure can name the file
+      // the board should show as unreadable alongside the diagnostic.
       const file = dbFile(repo, e.name)
-      if (!(await exists(file))) continue
-      const reader = new DatabaseSync(file, { readOnly: true })
-      let same
       try {
-        same = reader.prepare('SELECT parentId FROM run WHERE singleton=1').get()?.parentId === parentId
-      } finally {
-        reader.close()
-      }
-      if (same) {
+        // Do not acquire or reconcile a different captain's runs.
+        if (!(await exists(file)) || ledgerOwner(file) !== parentId) continue
         const run = await this._open({ cwd, parentId, runId: e.name })
         this._wake(run)
+        report.attached.push(e.name)
+      } catch (err) {
+        report.failures.push({ runId: e.name, error: message(err), file })
       }
     }
+    return report
   }
 
   // This grant is stored outside the worker checkout and exists before DSH can
@@ -573,8 +606,9 @@ export class Coordinator {
     throw err
   }
   async _reconcile(run, publish = true) {
-    const m = run.db.meta()
-    for (const i of run.db.intents()) {
+    const m = run.db.meta(),
+      open = run.db.intents()
+    for (const i of open) {
       const actual = await git.resolveRef(m.repo, m.ref)
       await git.assertMergeParents(m.repo, i.candidateSha, i.oldTip, i.sourceSha)
       if (actual === i.candidateSha) {
@@ -592,11 +626,18 @@ export class Coordinator {
         this._writeback(run, i.id)
       } else throw new Error('Unrecognized target tip during publication recovery: ' + i.id)
     }
+    // A final run has nothing else to recover: its open publication was what the diagnostic warned about.
+    if (m.mode === 'cancelled' && open.length) {
+      run.haltError = ''
+      run.db.clearDiagnostic()
+    }
   }
   _snapshot(run) {
     const m = run.db.meta(),
-      tickets = run.db.tickets()
+      tickets = run.db.tickets(),
+      unapproved = unapprovedChecks(run.db, m, run.checks)
     const appendedAt = new Map(run.db.appended().flatMap((b) => b.tickets.map((t) => [t.id, b.createdAt])))
+    const planCommands = Object.entries(m.manifest.checks ?? {}).filter(([id]) => !unapproved.includes(id))
     const counts = Object.create(null)
     for (const t of tickets) counts[t.status] = (counts[t.status] ?? 0) + 1
     return {
@@ -606,6 +647,9 @@ export class Coordinator {
       complete: tickets.every((t) => t.status === 'INTEGRATED'),
       integrationRef: m.ref,
       verifiedSha: m.tipSha,
+      // The opaque version of the plan the review is showing. Sending it back
+      // with approval lets the serial region refuse an approval of an older plan.
+      revision: run.db.revision(this.agents),
       maxWorkers: Math.min(this.maxWorkers, run.limit),
       counts,
       cleanup: {
@@ -613,9 +657,11 @@ export class Coordinator {
         skipped: tickets.filter((t) => t.cleanup === 'skipped').length,
       },
       diagnostic: run.haltError || m.diagnostic || null,
-      // What the user approves: the captain's own check commands, and each ticket's check IDs.
-      checks: run.checks,
+      // What the user approves: every check command the captain wrote, used or
+      // not, the profile commands the run uses, and each ticket's check IDs.
+      checks: { ...Object.fromEntries(planCommands), ...run.checks },
       planChecks: Object.keys(m.manifest.checks ?? {}),
+      unapprovedChecks: unapproved,
       tickets: tickets.map(
         ({
           id,
@@ -675,12 +721,14 @@ export class Coordinator {
         }),
       ),
       pendingNotifications: run.db.pendingNotifications().length,
+      pendingPublications: run.db.intents(),
     }
   }
   async status(q) {
     const run = await this._open(q)
     this._wake(run)
-    return this._snapshot(run)
+    const now = Date.now()
+    return { ...this._snapshot(run), timing: runTiming(run.db.events(), now), now }
   }
   async pause(q) {
     const run = await this._open(q)
@@ -765,21 +813,33 @@ export class Coordinator {
     this._wake(run)
     return this._snapshot(run)
   }
+  /**
+   * The captain's dag_cancel. Once the ledger says cancelled, workers and checks
+   * stop whether or not Git can be reconciled. Repeating it sends the stop again
+   * and retries an open publication: a published one is accounted, an unpublished
+   * one is abandoned, and one that cannot be proven either way stays on record.
+   * @returns the run snapshot; reconcileError is null once nothing failed to settle.
+   */
   async cancel(q) {
     const run = await this._open(q)
-    await serial(run, async () => {
-      this._setMode(run, 'cancelled')
-      await this._reconcile(run, false)
-    })
-    const jobs = [...run.work.values()]
+    await serial(run, () => this._setMode(run, 'cancelled'))
+    const jobs = [...run.work.values(), run.integration].filter(Boolean)
     for (const j of jobs) {
       j.ctrl.abort()
-      if (j.handle) j.handle.dispose().catch(() => {})
+      if (j.handle) Promise.resolve().then(() => j.handle.dispose()).catch(() => {})
     }
-    run.integration?.ctrl.abort()
+    const reconcileError = await serial(run, async () => {
+      try {
+        await this._reconcile(run, false)
+        return null
+      } catch (err) {
+        this._holdQuietly(run, err)
+        return message(err)
+      }
+    })
     await Promise.allSettled(jobs.map((j) => j.promise))
     this._wake(run)
-    return this._snapshot(run)
+    return { ...this._snapshot(run), reconcileError }
   }
 
   /**
@@ -811,6 +871,14 @@ export class Coordinator {
       // appended tickets skip the user's review.
       const registry = registryOf(this.checks, run.db.meta().manifest)
       const tickets = normalizeAppend(q.tickets, { ...registry, ...run.checks }, this.agents)
+      const unapproved = unapprovedChecks(run.db, run.db.meta(), run.checks)
+      for (const t of tickets) {
+        const id = t.verify.find((name) => unapproved.includes(name))
+        requireValue(
+          !id,
+          t.id + ': check ' + id + ' was not shown when this run was approved, so dag_add cannot use it; start a new run',
+        )
+      }
       const approval = run.db.events().find((e) => e.type === 'run_approved')
       if (approval) {
         const late = new Set(
@@ -896,12 +964,17 @@ export class Coordinator {
    * tickets without a choice keep their planned preset. Presets resolve from
    * the current settings, except a planned preset since removed from them,
    * which keeps the copy frozen at dag_run; the result is frozen into the run.
+   * The approval must name the revision of the plan the user saw: a missing or
+   * stale revision is refused before anything is dispatched, so a plan that
+   * changed after review (an appended ticket, a concurrent approval) can only
+   * start after the user refreshes and confirms the current plan again.
    * @param file - the run ledger the board selected.
    * @param choices - per-ticket selections.
    * @param options.maxWorkers - the user's concurrency for this run, replacing the manifest's.
+   * @param options.revision - the opaque plan revision the board showed the user.
    * @returns the run snapshot after approval.
    */
-  async approve(file, choices, { maxWorkers } = {}) {
+  async approve(file, choices, { maxWorkers, revision } = {}) {
     const run = this.runs.get(file)
     requireValue(run, 'Open the captain conversation of this run first')
     await serial(run, async () => {
@@ -909,7 +982,35 @@ export class Coordinator {
       requireValue(m.mode === 'staged', 'This run is not waiting for approval')
       requireValue(Array.isArray(choices), 'choices must be an array')
       this._checkLedger(run)
-      const byId = new Map(choices.map((c) => [c?.id, c]))
+      // The plan changes whenever a ticket is appended or a frozen command and
+      // its approval record change. Refuse a request that names any other plan.
+      requireValue(
+        typeof revision === 'string' && revision.length > 0,
+        'This approval did not include the revision of the plan you reviewed. ' +
+          'Refresh the plan and confirm again; if you are on an older client, upgrade before approving a staged plan.',
+        'missing-revision',
+      )
+      requireValue(
+        revision === run.db.revision(this.agents),
+        'The plan changed after you reviewed it (a ticket was appended, the approved checks changed, or an effective preset changed). ' +
+          'Refresh the plan and confirm the current version again.',
+        'stale-revision',
+      )
+      // A choice may only name a ticket of the plan, once each. Unknown or
+      // duplicate IDs are a malformed request, not a grant to start anything.
+      const planIds = new Set(run.db.plan().map((t) => t.id))
+      const named = new Set()
+      for (const c of choices) {
+        requireValue(
+          c !== null && typeof c === 'object' && !Array.isArray(c),
+          'Each approval choice must be an object',
+        )
+        requireValue(typeof c.id === 'string' && c.id.length > 0, 'Each approval choice must name a ticket ID')
+        requireValue(!named.has(c.id), 'Duplicate ticket ID in approval: ' + c.id)
+        requireValue(planIds.has(c.id), 'Unknown ticket ID in approval: ' + c.id)
+        named.add(c.id)
+      }
+      const byId = new Map(choices.map((c) => [c.id, c]))
       const tickets = run.db.plan().map((t) => {
         const c = byId.get(t.id)
         if (!c) return t
@@ -936,6 +1037,9 @@ export class Coordinator {
           ...(Object.keys(spec).length && { agentSpec: spec }),
         }
       })
+      // Every actually-effective route (including a preset the user kept) must
+      // resolve before any worker starts. The host injects the catalog check.
+      if (this.validateRoutes) await this.validateRoutes(tickets)
       requireValue(run.db.approve(tickets, { maxWorkers }), 'This run is not waiting for approval')
       run.limit = run.db.workerLimit()
       const after = ledgerDigest(run.db)
@@ -1279,9 +1383,17 @@ export class Coordinator {
     ]
     const commands = checkIds.flatMap((id) => run.checks[id].map((argv) => ({ id, argv })))
     const options = { signal: job.ctrl.signal, timeoutMs: this.checkTimeoutMs }
+    run.db.recordVerifyStart(row.id, checkIds)
     for (const [index, { id, argv }] of commands.entries()) {
       job.phase = { stage: 'verify', checkId: id, index: index + 1, total: commands.length }
-      await git.runChecks(candidatePath, [argv], options)
+      const began = Date.now()
+      let ok = false
+      try {
+        await git.runChecks(candidatePath, [argv], options)
+        ok = true
+      } finally {
+        run.db.recordCheck(row.id, { checkId: id, ms: Date.now() - began, ok, aborted: !ok && job.ctrl.signal.aborted })
+      }
     }
     job.phase = { stage: 'publish' }
     await git.assertCandidate(m.repo, candidatePath, candidate)

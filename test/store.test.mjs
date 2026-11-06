@@ -45,6 +45,36 @@ function publish(db, row, oldTip, sourceSha, candidateSha) {
   assert.equal(db.finish(row.id, row.lease, candidateSha), true)
 }
 
+test('verification events stay out of the outbox and the plan revision', (t) => {
+  const db = new RunStore(tempDb(t))
+  try {
+    init(db, manifest([ticket('A')]))
+    assert.equal(db.events()[0].details.mode, 'active')
+    const row = db.claim('A', assignment('A'))
+    submit(db, row, 'source')
+    const revision = db.revision()
+    const integrity = JSON.stringify(db.integrity())
+    const pending = db.pendingNotifications().length
+    db.recordVerifyStart('A', ['unit'])
+    db.recordCheck('A', { checkId: 'unit', ms: 12, ok: true })
+    db.recordCheck('A', { checkId: 'lint', ms: 3, ok: false, aborted: true })
+    const [started, passed, stopped] = db.events().slice(-3)
+    assert.deepEqual([started.type, started.ticketId, started.attempt], ['verify_started', 'A', 1])
+    assert.deepEqual(started.details, { checks: ['unit'] })
+    assert.equal(passed.type, 'check_finished')
+    assert.deepEqual(passed.details, { checkId: 'unit', ms: 12, ok: true })
+    assert.deepEqual(stopped.details, { checkId: 'lint', ms: 3, ok: false, aborted: true })
+    assert.equal(db.pendingNotifications().length, pending)
+    assert.equal(db.revision(), revision)
+    assert.equal(JSON.stringify(db.integrity()), integrity)
+    // They change no ticket state, so publication proceeds as before.
+    publish(db, db.get('A'), 'start', 'source', 'landed')
+    assert.equal(db.get('A').status, 'INTEGRATED')
+  } finally {
+    db.close()
+  }
+})
+
 test('plan aliases, defaults and declared artifact dependencies', () => {
   const m = manifest(
     [
@@ -423,6 +453,67 @@ test('a staged run can be discarded, and approval must name exactly the run tick
   }
 })
 
+test('the plan revision is opaque and changes with the plan and its frozen commands', (t) => {
+  const file = tempDb(t)
+  const db = new RunStore(file)
+  try {
+    const spec = manifest([ticket('A')])
+    db.init({
+      runId: 'run-1',
+      repo: { root: '/work', commonDir: '/work/.git' },
+      ref: 'refs/heads/integration/run-1',
+      baseSha: 'start',
+      parentId: 'parent',
+      policyHash: 'checks-hash',
+      manifest: spec,
+      mode: 'staged',
+    })
+    const first = db.revision()
+    assert.match(first, /^[0-9a-f]{64}$/)
+    assert.equal(first, db.revision(), 'stable while nothing changes')
+    // Appending a ticket changes the version a review would show.
+    const batch = normalizeAppend([{ id: 'B', title: 'B', depends_on: ['A'], verify: ['unit'] }], checks)
+    assert.equal(db.append(batch, { policyHash: 'p' }).added, true)
+    const afterAppend = db.revision()
+    assert.notEqual(afterAppend, first)
+    // Repeating the identical batch is idempotent and leaves the version alone.
+    assert.equal(db.append(batch, { policyHash: 'p' }).added, false)
+    assert.equal(db.revision(), afterAppend)
+  } finally {
+    db.close()
+  }
+  // The frozen command registry is part of what the user approves, so a plan
+  // with an extra captain-written command has a different revision.
+  const plain = new RunStore(file + '-plain')
+  const extra = new RunStore(file + '-extra')
+  try {
+    plain.init({
+      runId: 'run-1',
+      repo: { root: '/work', commonDir: '/work/.git' },
+      ref: 'refs/heads/integration/run-1',
+      baseSha: 'start',
+      parentId: 'parent',
+      policyHash: 'checks-hash',
+      manifest: manifest([ticket('A')]),
+      mode: 'staged',
+    })
+    extra.init({
+      runId: 'run-1',
+      repo: { root: '/work', commonDir: '/work/.git' },
+      ref: 'refs/heads/integration/run-1',
+      baseSha: 'start',
+      parentId: 'parent',
+      policyHash: 'checks-hash',
+      manifest: manifest([ticket('A')], { checks: { extra: [['node', '--test']] } }),
+      mode: 'staged',
+    })
+    assert.notEqual(extra.revision(), plain.revision())
+  } finally {
+    plain.close()
+    extra.close()
+  }
+})
+
 test('pause stops dispatch; cancellation preserves running and potentially published tickets', (t) => {
   const db = new RunStore(tempDb(t))
   try {
@@ -580,6 +671,24 @@ test('hold stores its diagnostic with one notification, repeat observation is id
     assert.equal(db.pendingNotifications()[0].message, 'Target ref changed')
     assert.equal(db.setMode('active'), true)
     assert.equal(db.meta().diagnostic, null)
+  } finally {
+    db.close()
+  }
+})
+
+test('a cancelled run stays final while keeping a diagnostic until the caller clears it', (t) => {
+  const db = new RunStore(tempDb(t))
+  try {
+    init(db, manifest([ticket('A')]))
+    assert.equal(db.setMode('cancelled'), true)
+    assert.equal(db.hold('Unrecognized tip', { staged: true }), true)
+    assert.equal(db.hold('Unrecognized tip'), false)
+    assert.equal(db.meta().mode, 'cancelled')
+    assert.equal(db.meta().diagnostic, 'Unrecognized tip')
+    assert.equal(db.pendingNotifications().filter((n) => n.type === 'run_blocked').length, 1)
+    assert.equal(db.clearDiagnostic(), true)
+    assert.equal(db.meta().diagnostic, null)
+    assert.equal(db.events().filter((e) => e.type === 'run_blocked').length, 1)
   } finally {
     db.close()
   }

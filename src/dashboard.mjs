@@ -1,10 +1,53 @@
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, statSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { planRevision, readIntegrity } from './store.mjs'
+import { runTiming } from './timing.mjs'
 
 const route = '/api/ticket-dag.dashboard'
 const noStore = { 'cache-control': 'no-store' }
+const unreadableDiagnostic = '无法读取这轮任务的 SQLite 记录。请确认原仓库及运行记录仍然可用。'
+
+// A ledger writes recent pages to its -wal file, so both files decide whether a
+// cached summary is current. A settled run never changes and stays cached; only
+// an active run's growing WAL invalidates it. A missing file returns null so the
+// caller still reports that run as unavailable instead of trusting stale data.
+function ledgerSignature(file) {
+  try {
+    const main = statSync(file)
+    let signature = main.mtimeMs + ':' + main.size
+    try {
+      const wal = statSync(file + '-wal')
+      signature += '|' + wal.mtimeMs + ':' + wal.size
+    } catch {
+      // No WAL file: the main file alone is the signature.
+    }
+    return signature
+  } catch {
+    return null
+  }
+}
+
+// The summary fields a history row needs, without its ticket detail. rawMaxWorkers
+// keeps the ledger's own cap so the caller can re-apply a changed host limit.
+function summaryOf(data) {
+  return {
+    available: data.available ?? true,
+    mode: data.mode,
+    complete: data.complete,
+    counts: data.counts,
+    verifiedSha: data.verifiedSha ?? null,
+    integrationRef: data.integrationRef ?? null,
+    maxWorkers: data.rawMaxWorkers ?? data.maxWorkers ?? null,
+    diagnostic: displayDiagnostic(data.diagnostic),
+  }
+}
+
+function capWorkers(value, limit) {
+  if (value == null) return null
+  return Number.isInteger(limit) && limit >= 1 ? Math.min(limit, value) : value
+}
 
 function displayDiagnostic(value) {
   if (!value) return null
@@ -17,11 +60,42 @@ function displayDiagnostic(value) {
 }
 
 // Only the coordinator can enroll a ledger. The browser supplies an opaque key,
-// never a path or a repository to scan. A dashboard read never opens a writer.
+// never a path or a repository to scan. A dashboard read never opens a run ledger
+// as a writer; only the small summary cache index is written.
 export class RunCatalog {
   constructor(profileDir) {
     this.index = profileDir ? join(profileDir, 'dsh-ticket-dag', 'catalog.sqlite') : null
     this.live = new Map()
+    // key -> { signature, summary }: this process's already-read history rows.
+    this.cache = new Map()
+    // Files this instance opened. A detail request must open the selected ledger
+    // only; settled history comes from the cache, so the count stays constant.
+    this.ledgerOpens = 0
+    // Recovery failures reported by the attach scan, keyed by parentId + runId.
+    // A run the host could not take over is shown as unreadable with its
+    // diagnostic instead of disappearing from the board.
+    this.failures = new Map()
+  }
+
+  // Remember a run that failed to attach so its board row can explain why.
+  // The host reports the same failure to the captain; this keeps the board honest.
+  reportFailure(parentId, runId, diagnostic, file = null) {
+    const id = String(parentId) + '\u0000' + String(runId)
+    this.failures.set(id, {
+      parentId: String(parentId),
+      runId: String(runId),
+      file: file ? String(file) : null,
+      diagnostic: displayDiagnostic(diagnostic) || unreadableDiagnostic,
+      createdAt: Date.now(),
+    })
+  }
+
+  // Add the cache columns to an index created before them. Old rows read as NULL
+  // (nothing cached) and are migrated incrementally on the next read.
+  #ensureCacheColumns(db) {
+    const columns = new Set(db.prepare('PRAGMA table_info(runs)').all().map((c) => c.name))
+    if (!columns.has('summary')) db.exec('ALTER TABLE runs ADD COLUMN summary TEXT')
+    if (!columns.has('summarySig')) db.exec('ALTER TABLE runs ADD COLUMN summarySig TEXT')
   }
 
   remember(file, meta, createdAt) {
@@ -39,6 +113,7 @@ export class RunCatalog {
       createdAt,
     }
     this.live.set(key, row)
+    this.cache.delete(key)
     if (!this.index) return
     mkdirSync(dirname(this.index), { recursive: true, mode: 0o700 })
     const db = new DatabaseSync(this.index)
@@ -46,56 +121,153 @@ export class RunCatalog {
       db.exec(`PRAGMA busy_timeout=1000;
         CREATE TABLE IF NOT EXISTS runs (
           key TEXT PRIMARY KEY, file TEXT NOT NULL, runId TEXT NOT NULL, parentId TEXT NOT NULL,
-          repoName TEXT NOT NULL, specId TEXT NOT NULL, total INTEGER NOT NULL, createdAt INTEGER NOT NULL
+          repoName TEXT NOT NULL, specId TEXT NOT NULL, total INTEGER NOT NULL, createdAt INTEGER NOT NULL,
+          summary TEXT, summarySig TEXT
         )`)
-      db.prepare('INSERT OR REPLACE INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
-        key,
-        file,
-        row.runId,
-        row.parentId,
-        row.repoName,
-        row.specId,
-        row.total,
-        row.createdAt,
-      )
+      this.#ensureCacheColumns(db)
+      // Keep any cached summary on re-open; its signature decides whether it is
+      // still current, so a restart does not need to reread every settled ledger.
+      db.prepare(
+        `INSERT INTO runs(key,file,runId,parentId,repoName,specId,total,createdAt,summary,summarySig)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+        ON CONFLICT(key) DO UPDATE SET
+          file=excluded.file, runId=excluded.runId, parentId=excluded.parentId,
+          repoName=excluded.repoName, specId=excluded.specId, total=excluded.total,
+          createdAt=excluded.createdAt`,
+      ).run(key, file, row.runId, row.parentId, row.repoName, row.specId, row.total, row.createdAt)
     } finally {
       db.close()
     }
   }
 
-  entries() {
-    const known = new Map(this.live)
+  // A session filter runs inside the index query, so one conversation's board
+  // never loads another conversation's rows. Rows carry their cached summary
+  // when available; an index from before the cache columns reads them as NULL.
+  entries(parent = null) {
+    const known = new Map()
     if (this.index && existsSync(this.index)) {
       const db = new DatabaseSync(this.index, { readOnly: true })
       try {
-        for (const row of db
-          .prepare('SELECT key,file,runId,parentId,repoName,specId,total,createdAt FROM runs')
-          .all()) {
-          if (!known.has(row.key)) known.set(row.key, row)
-        }
+        const columns = new Set(db.prepare('PRAGMA table_info(runs)').all().map((c) => c.name))
+        const summary =
+          columns.has('summary') && columns.has('summarySig')
+            ? 'summary,summarySig'
+            : 'NULL AS summary,NULL AS summarySig'
+        const statement = db.prepare(
+          `SELECT key,file,runId,parentId,repoName,specId,total,createdAt,${summary} FROM runs` +
+            (parent === null ? '' : ' WHERE parentId=?'),
+        )
+        for (const row of parent === null ? statement.all() : statement.all(parent))
+          known.set(row.key, row)
       } finally {
         db.close()
       }
     }
+    // Entries remembered this process stay visible even when the index is missing
+    // or not yet written, and their metadata wins over the index row; the cached
+    // summary still comes from the index so a live entry does not force a ledger read.
+    for (const [key, live] of this.live) {
+      if (parent !== null && live.parentId !== parent) continue
+      const cached = known.get(key)
+      known.set(key, { ...cached, ...live, summary: cached?.summary ?? null, summarySig: cached?.summarySig ?? null })
+    }
     return [...known.values()].sort((a, b) => b.createdAt - a.createdAt || a.key.localeCompare(b.key))
+  }
+
+  // A history row's summary: memory, then the persisted index, then the ledger.
+  // Only a signature change (a write) reopens a ledger, so a settled history is
+  // read once regardless of how many runs the board lists.
+  #cachedSummary(entry, file, indexSummary, indexSignature, signature, coordinator) {
+    if (signature) {
+      const memo = this.cache.get(entry.key)
+      if (memo && memo.signature === signature) return memo.summary
+      if (indexSummary && indexSignature === signature) {
+        const summary = JSON.parse(indexSummary)
+        this.cache.set(entry.key, { signature, summary })
+        return summary
+      }
+    }
+    this.ledgerOpens++
+    const summary = summaryOf(readLedger(file, entry, false, coordinator.maxWorkers))
+    if (signature) this.#storeSummary(entry.key, summary, signature)
+    return summary
+  }
+
+  #storeSummary(key, summary, signature) {
+    this.cache.set(key, { signature, summary })
+    if (!this.index) return
+    try {
+      const db = new DatabaseSync(this.index)
+      try {
+        db.exec('PRAGMA busy_timeout=1000;')
+        this.#ensureCacheColumns(db)
+        db.prepare('UPDATE runs SET summary=?,summarySig=? WHERE key=?').run(
+          JSON.stringify(summary),
+          signature,
+          key,
+        )
+      } finally {
+        db.close()
+      }
+    } catch {
+      // The cache is advisory: a busy index just means the next read recomputes.
+    }
   }
 
   // parent limits the view to runs started by that captain session. captainOf
   // returns a loaded captain's model route; unloaded captains show none.
+  // The selected run's detail is read on demand; every other row is a cached
+  // summary, so an unreadable unrelated ledger cannot hide the selected run.
   read(coordinator, key, parent = null, captainOf = () => undefined) {
-    const known = this.entries().filter((entry) => parent === null || entry.parentId === parent)
+    const known = this.entries(parent)
+    // Runs the attach scan could not recover are listed as unreadable rows so
+    // the user sees the failure with its diagnostic, not only in the host log.
+    const failed = [...this.failures.values()].filter((f) => parent === null || f.parentId === parent)
+    const knownRuns = new Set(known.map((row) => row.parentId + '\u0000' + row.runId))
+    for (const f of failed) {
+      if (knownRuns.has(f.parentId + '\u0000' + f.runId)) continue
+      known.push({
+        key: createHash('sha256')
+          .update(JSON.stringify([f.file ?? 'recovery:' + f.parentId + ':' + f.runId, f.parentId]))
+          .digest('hex'),
+        file: f.file,
+        runId: f.runId,
+        parentId: f.parentId,
+        repoName: f.file ? basename(dirname(dirname(dirname(f.file)))) : '',
+        specId: '',
+        total: 0,
+        createdAt: f.createdAt,
+        summary: null,
+        summarySig: null,
+      })
+    }
+    if (failed.length) known.sort((a, b) => b.createdAt - a.createdAt || a.key.localeCompare(b.key))
+    const failedById = new Map(failed.map((f) => [f.parentId + '\u0000' + f.runId, f]))
     if (key && !known.some((entry) => entry.key === key)) return null
     const selectedKey = key ?? known[0]?.key
     let selected = null
-    const runs = known.map(({ file, ...entry }) => {
+    const now = Date.now()
+    const runs = known.map((row) => {
+      const { file, summary, summarySig, ...entry } = row
       const detail = entry.key === selectedKey
       const attached = coordinator.runs.has(file)
+      // A run that is now attached is live even if an earlier scan failed it.
+      const recovery = attached ? null : failedById.get(entry.parentId + '\u0000' + entry.runId)
       let data
       try {
-        data =
-          attached && detail
-            ? coordinator.peek(file)
-            : readLedger(file, entry, detail, coordinator.maxWorkers)
+        if (attached) {
+          data = coordinator.peek(file, detail ? now : undefined)
+          if (!data) throw new Error('run is no longer attached')
+        } else if (detail) {
+          const signature = ledgerSignature(file)
+          this.ledgerOpens++
+          data = readLedger(file, entry, true, coordinator.maxWorkers, coordinator.agents, now)
+          // Refresh the cache only when the ledger changed since it was last read.
+          if (signature && this.cache.get(entry.key)?.signature !== signature)
+            this.#storeSummary(entry.key, summaryOf(data), signature)
+        } else {
+          data = this.#cachedSummary(entry, file, summary, summarySig, ledgerSignature(file), coordinator)
+        }
       } catch {
         // Keep moved/deleted/unavailable repositories visible without inventing progress.
         data = {
@@ -103,11 +275,23 @@ export class RunCatalog {
           mode: 'unavailable',
           complete: false,
           counts: {},
-          diagnostic: '无法读取这轮任务的 SQLite 记录。请确认原仓库及运行记录仍然可用。',
+          diagnostic: unreadableDiagnostic,
           tickets: [],
         }
       }
-      const summary = {
+      if (recovery) {
+        // A run that could not be recovered is not live even if a read-only
+        // ledger read would succeed (for example another coordinator holds the lock).
+        data = {
+          available: false,
+          mode: 'unavailable',
+          complete: false,
+          counts: {},
+          diagnostic: recovery.diagnostic,
+          tickets: [],
+        }
+      }
+      const summaryRow = {
         ...entry,
         attached,
         available: data.available ?? true,
@@ -116,13 +300,13 @@ export class RunCatalog {
         counts: data.counts,
         verifiedSha: data.verifiedSha ?? null,
         integrationRef: data.integrationRef ?? null,
-        maxWorkers: data.maxWorkers ?? null,
+        maxWorkers: capWorkers(data.rawMaxWorkers ?? data.maxWorkers, coordinator.maxWorkers),
         diagnostic: displayDiagnostic(data.diagnostic),
       }
       const route = detail ? captainOf(entry.parentId) : undefined
       if (detail)
         selected = {
-          ...summary,
+          ...summaryRow,
           captain: route?.model ? { provider: route.provider ?? '', model: route.model } : null,
           // The plan review offers the current presets; approval resolves them on the host.
           // Every other mode only reads them to name each ticket's frozen agent.
@@ -134,9 +318,14 @@ export class RunCatalog {
             model: p?.model ?? '',
             reasoningEffort: p?.reasoningEffort ?? '',
           })),
-          // Commands of the checks the run uses; the plan review shows them for approval.
+          // Every approved or reviewable command; the plan review shows them for approval.
           checks: data.checks ?? {},
           planChecks: data.planChecks ?? [],
+          // The opaque plan version the review shows and approval must echo back.
+          revision: data.revision ?? null,
+          // The server's clock, so a live board can count from timing.runningSince.
+          timing: data.timing ?? null,
+          now,
           tickets: data.tickets.map((t) => ({
             id: t.id,
             title: t.title,
@@ -163,13 +352,16 @@ export class RunCatalog {
             appendedAt: t.appendedAt ?? null,
           })),
         }
-      return summary
+      return summaryRow
     })
     return { runs, selected }
   }
 }
 
-function readLedger(file, entry, detail, globalLimit) {
+// Read one ledger. `detail` also loads each ticket row; otherwise only the run
+// row and status counts are read. Exported so the history benchmark can measure
+// the pre-cache cost without duplicating the queries.
+export function readLedger(file, entry, detail, globalLimit, agents = {}, now = Date.now()) {
   const db = new DatabaseSync(file, { readOnly: true })
   try {
     db.exec('PRAGMA trusted_schema=OFF; PRAGMA query_only=ON; BEGIN')
@@ -191,6 +383,8 @@ function readLedger(file, entry, detail, globalLimit) {
     const result = {
       ...run,
       maxWorkers: Math.min(globalLimit, run.maxWorkers),
+      // Kept raw so a later host-limit change re-applies without reopening the ledger.
+      rawMaxWorkers: run.maxWorkers ?? null,
       total,
       counts,
       complete: total > 0 && counts.INTEGRATED === total,
@@ -201,10 +395,10 @@ function readLedger(file, entry, detail, globalLimit) {
       const cleanup = columns.has('cleanup') && columns.has('cleanupReason')
         ? 'cleanup,cleanupReason'
         : 'NULL AS cleanup,NULL AS cleanupReason'
-      // A ledger from before dag_add has no appended table: nothing was appended.
-      const appended = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='appended'").get()
-        ? new Map(db.prepare('SELECT ticketId,createdAt FROM appended').all().map((r) => [r.ticketId, r.createdAt]))
-        : new Map()
+      // One shared read of the integrity rows: the same rows RunStore.integrity()
+      // returns, so the append list and plan revision cannot drift from the writer.
+      const integrity = readIntegrity(db)
+      const appended = new Map(integrity.appended.map((r) => [r.ticketId, r.createdAt]))
       result.tickets = db
         .prepare(
           `SELECT id,json_extract(definition,'$.title') AS title,
@@ -224,6 +418,23 @@ function readLedger(file, entry, detail, globalLimit) {
           appended: appended.has(row.id),
           appendedAt: appended.get(row.id) ?? null,
         }))
+      // A plan waiting for approval shows the captain's commands even before its captain reopens.
+      if (run.mode === 'staged') {
+        const checks = JSON.parse(integrity.run.manifest).checks ?? {}
+        result.checks = checks
+        result.planChecks = Object.keys(checks)
+        // The same revision RunStore.revision() computes, built from the shared
+        // integrity rows so a plan read without the coordinator still carries
+        // the exact version, including each ticket's effective preset now.
+        result.revision = planRevision({ ...integrity, agents })
+      }
+      result.timing = runTiming(
+        db
+          .prepare('SELECT type,ticketId,attempt,createdAt,details FROM events ORDER BY rowid')
+          .all()
+          .map((row) => ({ ...row, details: JSON.parse(row.details) })),
+        now,
+      )
     }
     return result
   } finally {
@@ -334,6 +545,38 @@ async function checkChoices(choices, getLlm) {
   }
 }
 
+// Validate the routes a staged plan will actually dispatch, not only the ones a
+// user typed: a ticket that keeps its planned preset still inherits that
+// preset's provider/model/effort. The coordinator calls this inside its serial
+// region so every effective route resolves before any worker starts.
+export async function validateTicketRoutes(tickets, getLlm) {
+  let models
+  for (const ticket of tickets) {
+    const spec = ticket?.agentSpec ?? {}
+    const provider = String(spec.provider ?? '').trim()
+    const model = String(spec.model ?? '').trim()
+    const effort = String(spec.reasoningEffort ?? '').trim()
+    if (!model) {
+      if (provider || effort) throw new ChoiceError(ticket.id + ' sets a provider or reasoning effort without a model')
+      continue
+    }
+    models ??= await modelCatalog(getLlm?.())
+    const listed = models.providers.filter((p) => !provider || p.id === provider)
+    const found = listed.flatMap((p) => p.models).find((m) => m.id === model)
+    if (!found) {
+      if (!models.providers.length || (provider ? models.failures.includes(provider) : models.failures.length))
+        throw new ChoiceError('模型目录暂不可用，无法校验 ' + model + '。请稍后重试。', 503)
+      throw new ChoiceError(
+        provider && !listed.length
+          ? 'Unknown provider: ' + provider
+          : 'Unknown model: ' + [provider, model].filter(Boolean).join('/'),
+      )
+    }
+    if (effort && !found.efforts.some((e) => e.id === effort))
+      throw new ChoiceError('Model ' + model + ' does not support reasoning effort ' + effort)
+  }
+}
+
 // The user's decision on a staged plan. Like the dashboard read, the managed
 // dispatcher admits only the owner; the body names the run by its opaque key.
 export function mountApproval(ctx, catalog, coordinator, getLlm = () => undefined) {
@@ -352,13 +595,16 @@ export function mountApproval(ctx, catalog, coordinator, getLlm = () => undefine
       } catch {
         return new Response('Invalid approval request', { status: 400, headers: noStore })
       }
-      const { key, action, choices, maxWorkers } = body ?? {}
+      const { key, action, choices, maxWorkers, revision } = body ?? {}
       if (
         typeof key !== 'string' ||
         !/^[0-9a-f]{64}$/.test(key) ||
         !['approve', 'discard'].includes(action) ||
         (action === 'approve' && !Array.isArray(choices)) ||
-        (maxWorkers !== undefined && (!Number.isInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 32))
+        (maxWorkers !== undefined && (!Number.isInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 32)) ||
+        // An old client sends no revision; the coordinator answers with a
+        // refresh/upgrade diagnostic. A non-string or oversized one is malformed.
+        (revision !== undefined && (typeof revision !== 'string' || revision.length > 512))
       ) {
         return new Response('Invalid approval request', { status: 400, headers: noStore })
       }
@@ -378,11 +624,22 @@ export function mountApproval(ctx, catalog, coordinator, getLlm = () => undefine
       try {
         const snapshot =
           action === 'approve'
-            ? await coordinator.approve(entry.file, choices, maxWorkers === undefined ? {} : { maxWorkers })
+            ? await coordinator.approve(entry.file, choices, {
+                ...(maxWorkers !== undefined && { maxWorkers }),
+                ...(revision !== undefined && { revision }),
+              })
             : await coordinator.discard(entry.file)
         return Response.json(snapshot, { headers: noStore })
       } catch (error) {
-        return new Response(displayDiagnostic(error?.message) || 'Approval failed', { status: 409, headers: noStore })
+        const message = displayDiagnostic(error?.message) || 'Approval failed'
+        // A stale or missing plan revision is the only refusal the board treats
+        // as "review the new plan again"; every other refusal (duplicate or
+        // unknown ticket, a bad route, a tampered ledger) keeps its own message.
+        const code = typeof error?.code === 'string' ? error.code : null
+        return new Response(code ? JSON.stringify({ code, message }) : message, {
+          status: error?.status ?? 409,
+          headers: code ? { ...noStore, 'content-type': 'application/json' } : noStore,
+        })
       }
     },
   })

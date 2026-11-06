@@ -30,21 +30,37 @@ const loadBoard = (seeds) => loadHost(seeds).slots['sidebar.right.pane.tab'].com
 // present. Effects run immediately and fetch only records the URL it was asked for.
 // respond(url) may answer a GET; by default reads never settle. Timers are
 // recorded, not run, so a test fires each scheduled poll itself.
-function loadHost(seeds, { expanded = false, config = { status: 'loading' }, respond, document } = {}) {
+function loadHost(seeds, { expanded = false, config = { status: 'loading' }, respond, postRespond, document, clock } = {}) {
   let definition
   const source = readFileSync(resolve(import.meta.dirname, '..', 'src', 'client.js'), 'utf8')
   const urls = []
   const posts = []
   const postHeaders = []
   const timers = []
+  const intervals = []
+  const cleanups = []
   vm.runInNewContext(source, {
     window: { __ModuleLoader__: { load: (d) => (definition = d) } },
     ...(document && { document }),
+    // clock.now is what the page reads as the current time.
+    ...(clock && {
+      Date: class extends Date {
+        static now() {
+          return clock.now
+        }
+      },
+    }),
+    setInterval: (fn, ms) => intervals.push({ fn, ms, cleared: false }),
+    clearInterval: (id) => {
+      if (intervals[id - 1]) intervals[id - 1].cleared = true
+    },
     fetch: (url, init) => {
       urls.push(url)
       if (init?.method === 'POST') {
-        posts.push([url, JSON.parse(init.body)])
+        const body = JSON.parse(init.body)
+        posts.push([url, body])
         postHeaders.push(init.headers)
+        return postRespond ? postRespond(url, body) : new Promise(() => {})
       }
       return respond && init?.method !== 'POST' ? respond(url) : new Promise(() => {})
     },
@@ -72,9 +88,15 @@ function loadHost(seeds, { expanded = false, config = { status: 'loading' }, res
       ]
     },
     useRef: (current) => ({ current }),
-    useEffect: (fn) => void fn(),
+    useEffect: (fn) => {
+      const cleanup = fn()
+      if (cleanup) cleanups.push(cleanup)
+    },
   }
   const host = {
+    intervals,
+    cleanups,
+    seed: (more) => queue.push(...more),
     tabs: [],
     opened: [],
     slots: {},
@@ -816,6 +838,7 @@ function reviewRun() {
     parentId: 'session-captain',
     mode: 'staged',
     attached: true,
+    revision: 'r'.repeat(64),
     total: 5,
     counts: { PENDING: 5 },
     captain: { provider: 'magpie', model: 'auto/claude-opus-5-5' },
@@ -856,7 +879,37 @@ test('plan review lists each check command, marks the ones the captain wrote and
   assert.deepEqual(rows.map((r) => r.props['data-dag-check']), ['py-test', 'lint'])
   assert.match(text(rows[0]), /队长编写，需你确认.*A、C、T.*uv run pytest -q/)
   assert.match(text(rows[1]), /插件配置.*A.*ruff check \./)
-  assert.match(text(find(block, (n) => n.props['data-dag-unchecked'] !== undefined)), /B、D 不跑验收命令/)
+  assert.match(text(find(block, (n) => n.props['data-dag-unchecked'] !== undefined)), /B、D 没有本票专属验收命令/)
+  assert.match(text(find(block, (n) => n.props['data-dag-unchecked'] !== undefined)), /累计回归检查/)
+})
+
+test('plan review names a check no task uses yet and keeps every argument boundary and control character visible', () => {
+  const selected = {
+    ...reviewRun(),
+    checks: {
+      used: [['node', '--test']],
+      later: [
+        ['node', '', 'a b', 'a\nb', 'a\\nb', '""', 'bell\x07', 'nbsp\u00a0', 'bidi\u202e', 'tag\u{e0001}', '路径/x.js'],
+        ['npm', 'test'],
+      ],
+    },
+    planChecks: ['used', 'later'],
+  }
+  selected.tickets = selected.tickets.map((t) => ({ ...t, verify: t.id === 'A' ? ['used'] : [] }))
+  const host = loadHost([{ runs: [selected], selected }, selected.key])
+  const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  const row = (id) => find(pane, (n) => n.props['data-dag-check'] === id)
+  assert.match(text(row('used')), /队长编写，需你确认.*工单：A/)
+  const later = row('later')
+  assert.match(text(later), /队长编写，需你确认/)
+  assert.equal(text(find(later, (n) => n.props['data-dag-check-users'] !== undefined)), '尚无工单引用，批准后可供追加工单使用')
+  assert.deepEqual(
+    findAll(later, (n) => n.props.className === 'dtd-check-cmd').map(text),
+    [
+      'node "" "a b" "a\\nb" "a\\\\nb" "\\"\\"" "bell\\u0007" "nbsp\\u00a0" "bidi\\u202e" "tag\\u{e0001}" 路径/x.js',
+      'npm test',
+    ],
+  )
 })
 
 test('plan review: named members with their tasks and model, compact task list, map and fixed actions', () => {
@@ -923,6 +976,7 @@ test('plan review: named members with their tasks and model, compact task list, 
       {
         key: selected.key,
         action: 'approve',
+        revision: selected.revision,
         choices: [
           { id: 'A', ...impl },
           { id: 'C', ...impl },
@@ -947,6 +1001,7 @@ function stagedRun(tickets) {
     parentId: 'session-captain',
     mode: 'staged',
     attached: true,
+    revision: 'r'.repeat(64),
     total: tickets.length,
     counts: { PENDING: tickets.length },
     captain: { provider: 'magpie', model: 'auto/claude-opus-5-5' },
@@ -979,6 +1034,209 @@ test('plan review shows the run concurrency and lets the user change it before a
   // Unchanged, the approval carries no concurrency of its own.
   find(review, (n) => n.type === 'button' && text(n) === '确认并启动').props.onClick()
   assert.equal(Object.hasOwn(host.posts[0][1], 'maxWorkers'), false)
+})
+
+test('plan review turns a stale-revision 409 into a refreshed plan and asks for a fresh confirmation', async () => {
+  const selected = reviewRun()
+  const view = { runs: [{ ...selected }], selected }
+  const host = loadHost([{ runs: [selected], selected }, selected.key], {
+    respond: async () => ({ ok: true, status: 200, json: async () => view }),
+    postRespond: async () => ({
+      ok: false,
+      status: 409,
+      text: async () =>
+        JSON.stringify({ code: 'stale-revision', message: 'The plan changed after you reviewed it' }),
+    }),
+  })
+  const flush = () => new Promise((resolve) => setImmediate(resolve))
+  const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  await flush()
+  const readsBefore = host.urls.length
+  const review = find(pane, (n) => n.props['data-dag-review'] !== undefined)
+  find(review, (n) => n.type === 'button' && text(n) === '确认并启动').props.onClick()
+  await flush()
+  await flush()
+  const notice = host.sets.find((v) => typeof v === 'string' && /计划已更新/.test(v))
+  assert.ok(notice, 'the user is told the plan changed')
+  assert.match(notice, /再次确认/)
+  assert.ok(host.urls.length > readsBefore, 'the review re-reads the plan after the 409')
+  assert.equal(host.posts[0][1].revision, selected.revision, 'the approval echoed the revision it showed')
+})
+
+test('plan review keeps the edits that still apply when a ticket is appended', () => {
+  // The user has already changed concurrency and a member route before an
+  // appended ticket arrives; after the refresh the plan shows the new ticket
+  // and the earlier edits still apply.
+  const selected = { ...reviewRun(), maxWorkers: 4 }
+  selected.tickets = [
+    ...selected.tickets,
+    { id: 'E', title: '补丁', status: 'PENDING', dependsOn: [], attempt: 0, agent: 'docs', route: { provider: '', model: '', reasoningEffort: '' } },
+  ]
+  selected.total = 6
+  selected.counts = { PENDING: 6 }
+  const seeds = [
+    { runs: [selected], selected },
+    selected.key,
+    // Dashboard: error, lastRead
+    '',
+    null,
+    // PlanReview: owners, routes, catalog, busy, error, confirmDiscard,
+    // checked, expanded, bulk, hovered, workers
+    { D: 'implementer' },
+    null,
+    null,
+    false,
+    '',
+    false,
+    new Set(),
+    null,
+    null,
+    null,
+    '8',
+  ]
+  const host = loadHost(seeds, { respond: async () => ({ ok: true, status: 200, json: async () => ({ runs: [selected], selected }) }) })
+  const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  const review = find(pane, (n) => n.props['data-dag-review'] !== undefined)
+  const tasks = findAll(review, (n) => n.props['data-dag-task'] !== undefined)
+  assert.deepEqual(tasks.map((t) => t.props['data-dag-task']), ['A', 'C', 'T', 'B', 'D', 'E'])
+  // The appended ticket keeps its planned owner rather than becoming undefined.
+  assert.match(text(tasks[5]), /文档员/)
+  // The edit the user made (D -> implementer) survived the refresh.
+  assert.match(text(tasks[4]), /实现者/)
+  assert.equal(find(review, (n) => n.props['aria-label'] === '同时运行工单数').props.value, '8')
+})
+
+// A plan review opened at `pinned` but now showing a polled plan with an extra
+// ticket. Seeds are the hook order: Dashboard (data, selectedKey, error,
+// lastRead) then PlanReview (owners, routes, catalog, busy, error,
+// confirmDiscard, checked, expanded, bulk, hovered, workers, pinnedRevision,
+// pinnedIds).
+function changedPlanSeeds(selected, { owners = null, pinned, pinnedIds }) {
+  const view = { runs: [selected], selected }
+  return [
+    view,
+    selected.key,
+    '',
+    null,
+    owners,
+    null,
+    catalog,
+    false,
+    '',
+    false,
+    new Set(),
+    null,
+    null,
+    null,
+    null,
+    pinned,
+    pinnedIds,
+  ]
+}
+
+test('plan review pins the version it opened and asks to reconfirm when a poll changes it', () => {
+  const selected = reviewRun()
+  selected.revision = 'n'.repeat(64)
+  selected.tickets = [
+    ...selected.tickets,
+    {
+      id: 'E',
+      title: '补丁',
+      status: 'PENDING',
+      dependsOn: [],
+      attempt: 0,
+      agent: 'docs',
+      route: { provider: '', model: '', reasoningEffort: '' },
+    },
+  ]
+  selected.total = 6
+  selected.counts = { PENDING: 6 }
+  // The review was opened at an older revision holding only A, C, T, B, D.
+  const seeds = changedPlanSeeds(selected, {
+    owners: { D: 'implementer' },
+    pinned: 'o'.repeat(64),
+    pinnedIds: ['A', 'C', 'T', 'B', 'D'],
+  })
+  const host = loadHost(seeds)
+  const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  const review = find(pane, (n) => n.props['data-dag-review'] !== undefined)
+
+  const notice = find(review, (n) => n.props['data-dag-plan-changed'] !== undefined)
+  assert.ok(notice, 'a plan that changed under review is called out')
+  assert.match(text(notice), /计划已更新/)
+  assert.match(text(notice), /新增工单 E/, 'the notice names the appended ticket')
+
+  // The appended ticket is shown with its planned owner, and the edit the user
+  // made before the poll still applies to the ticket it named.
+  const tasks = findAll(review, (n) => n.props['data-dag-task'] !== undefined)
+  assert.deepEqual(tasks.map((t) => t.props['data-dag-task']), ['A', 'C', 'T', 'B', 'D', 'E'])
+  assert.match(text(tasks[5]), /文档员/)
+  assert.match(text(tasks[4]), /实现者/)
+
+  // Approval is refused until the user explicitly reconfirms the new plan.
+  const approve = find(review, (n) => n.type === 'button' && text(n) === '确认并启动')
+  assert.equal(approve.props.disabled, true, 'a changed plan cannot be approved until reconfirmed')
+
+  host.sets.length = 0
+  find(notice, (n) => n.type === 'button' && text(n) === '确认最新计划').props.onClick()
+  assert.ok(host.sets.includes(selected.revision), 'reconfirm pins the polled revision')
+  assert.deepEqual(
+    host.sets.find((v) => Array.isArray(v)),
+    ['A', 'C', 'T', 'B', 'D', 'E'],
+    'reconfirm pins the polled ticket list',
+  )
+})
+
+test('after reconfirming, approval sends the newly pinned revision and is enabled again', () => {
+  const selected = reviewRun()
+  selected.revision = 'n'.repeat(64)
+  // The user has reconfirmed, so the pinned revision now matches the polled one.
+  const seeds = changedPlanSeeds(selected, {
+    pinned: selected.revision,
+    pinnedIds: selected.tickets.map((t) => t.id),
+  })
+  const host = loadHost(seeds)
+  const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  const review = find(pane, (n) => n.props['data-dag-review'] !== undefined)
+  assert.equal(
+    find(review, (n) => n.props['data-dag-plan-changed'] !== undefined),
+    undefined,
+    'no pending-change notice once reconfirmed',
+  )
+  const approve = find(review, (n) => n.type === 'button' && text(n) === '确认并启动')
+  assert.equal(approve.props.disabled, false)
+  approve.props.onClick()
+  assert.equal(host.posts[0][1].revision, selected.revision, 'approval echoes the pinned revision')
+})
+
+test('plan review shows the server message for a non-stale approval refusal', async () => {
+  const selected = reviewRun()
+  const view = { runs: [selected], selected }
+  const host = loadHost([{ runs: [selected], selected }, selected.key], {
+    respond: async () => ({ ok: true, status: 200, json: async () => view }),
+    postRespond: async () => ({
+      ok: false,
+      status: 409,
+      text: async () => JSON.stringify({ code: 'duplicate-ticket', message: 'Duplicate ticket ID in approval: A' }),
+    }),
+  })
+  const flush = () => new Promise((resolve) => setImmediate(resolve))
+  const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  await flush()
+  const review = find(pane, (n) => n.props['data-dag-review'] !== undefined)
+  find(review, (n) => n.type === 'button' && text(n) === '确认并启动').props.onClick()
+  await flush()
+  await flush()
+  const messages = host.sets.filter((v) => typeof v === 'string')
+  assert.ok(
+    messages.some((v) => /Duplicate ticket ID in approval: A/.test(v)),
+    'the server message is shown for a duplicate ticket id',
+  )
+  assert.equal(
+    messages.some((v) => /计划已更新/.test(v)),
+    false,
+    'only a stale revision shows the plan-updated message',
+  )
 })
 
 test('built-in presets saved without a display name still show their Chinese name', () => {
@@ -1373,27 +1631,194 @@ test('each dag_run tool call folds into a conversation card that keeps the run I
   assert.equal(foldCard(definition, dagCall, dagResult('not json')), null)
 })
 
+// RunCard state order: found run, snapshot (false when the read failed), notice.
+// The node is what the dag_run fold stored: the plan at start, not the live roster.
+function runCardNode() {
+  return {
+    data: foldCard(loadHost([]).definitions[0], dagCall, dagResult(dagRunResult)).data,
+    location: { kind: 'turn', turn: { turn: 3, status: 'open' } },
+  }
+}
+const cardKey = 'e'.repeat(64)
+function cardSnapshot(extra = {}) {
+  return {
+    key: cardKey,
+    runId: 'demo-01',
+    mode: 'staged',
+    available: true,
+    complete: false,
+    counts: { PENDING: 4 },
+    presets: [{ id: 'docs', name: '写文档的' }],
+    tickets: dagRunResult.tickets.map((t) => ({ ...t })),
+    ...extra,
+  }
+}
+function renderRunCard(found, snapshot) {
+  const host = loadHost([found, snapshot, ''])
+  const card = host.renderSlot('conversation.chat.node', { sessionId: 's1', node: runCardNode() })
+  return { host, card }
+}
+const openRunCard = (host, card) => find(card, (n) => n.type === 'button').props.onClick()
+const cardState = (card) => find(card, (n) => n.props['data-dag-run-state'] !== undefined).props['data-dag-run-state']
+const cardMembers = (card) => findAll(card, (n) => n.props['data-dag-member'] !== undefined).map(text)
+
 test('the run card names its members, shows the run state and opens the run tab', () => {
-  const key = 'e'.repeat(64)
-  const presets = [{ id: 'docs', name: '写文档的' }]
-  const node = { data: foldCard(loadHost([]).definitions[0], dagCall, dagResult(dagRunResult)).data, location: { kind: 'turn', turn: { turn: 3, status: 'open' } } }
-  // RunCard state order: found run, presets, notice.
-  const host = loadHost([{ key, runId: 'demo-01', mode: 'staged' }, presets, ''])
-  const card = host.renderSlot('conversation.chat.node', { sessionId: 's1', node })
+  const snapshot = cardSnapshot()
+  const { host, card } = renderRunCard(snapshot, snapshot)
   assert.deepEqual(host.urls, ['api/ticket-dag.dashboard?parent=s1'], 'reads this conversation only')
   assert.match(text(card), /工单 · demo-01/)
+  assert.equal(cardState(card), '待确认')
   assert.match(text(card), /待确认 · 4 张工单/)
-  const members = findAll(card, (n) => n.props['data-dag-member'] !== undefined)
-  assert.deepEqual(members.map(text), ['写文档的 · 2 张', '实现者 · 1 张', '默认成员 · 1 张'])
-  find(card, (n) => n.type === 'button').props.onClick()
-  assert.deepEqual(host.opened, [['dsh-resource://ticket-dag/' + key + '/demo-01', 'ticket-dag']])
+  assert.deepEqual(cardMembers(card), ['写文档的 · 2 张', '实现者 · 1 张', '默认成员 · 1 张'])
+  openRunCard(host, card)
+  assert.deepEqual(host.opened, [['dsh-resource://ticket-dag/' + cardKey + '/demo-01', 'ticket-dag']])
 
   // Before the run list answers, or for a run no longer listed, the click explains instead.
   const missing = loadHost([null, null, ''])
-  const lone = missing.renderSlot('conversation.chat.node', { sessionId: 's1', node })
+  const lone = missing.renderSlot('conversation.chat.node', { sessionId: 's1', node: runCardNode() })
   find(lone, (n) => n.type === 'button').props.onClick()
   assert.deepEqual(missing.opened, [])
   assert.match(missing.sets.at(-1), /找不到这轮运行的记录/)
+})
+
+test('the run card uses the same status words as the board and still opens that run', () => {
+  const cases = [
+    [cardSnapshot({ mode: 'active', counts: { RUNNING: 4 } }), '运行中', /运行中 · 4 张工单/],
+    [cardSnapshot({ mode: 'active', counts: { NEEDS_ATTENTION: 1, RUNNING: 3 } }), '运行中 · 有待处理工单', /运行中 · 有待处理工单 · 4 张工单/],
+    [cardSnapshot({ mode: 'paused', counts: { PENDING: 4 } }), '已暂停', /已暂停 · 4 张工单/],
+    [cardSnapshot({ mode: 'cancelled', counts: { CANCELLED: 4 } }), '已取消', /已取消 · 4 张工单/],
+    [cardSnapshot({ mode: 'active', complete: true, counts: { INTEGRATED: 4 } }), '已完成', /已完成 · 4 张工单/],
+  ]
+  for (const [snapshot, state, visible] of cases) {
+    const { host, card } = renderRunCard(snapshot, snapshot)
+    assert.equal(cardState(card), state)
+    assert.match(text(card), visible)
+    assert.doesNotMatch(text(card), /进行中|旧快照/)
+    openRunCard(host, card)
+    assert.deepEqual(host.opened, [['dsh-resource://ticket-dag/' + cardKey + '/demo-01', 'ticket-dag']])
+  }
+  const unread = cardSnapshot({
+    available: false,
+    mode: 'unavailable',
+    complete: false,
+    counts: {},
+    tickets: [],
+    diagnostic: '无法读取这轮任务的 SQLite 记录。请确认原仓库及运行记录仍然可用。',
+  })
+  const { host, card } = renderRunCard(unread, unread)
+  assert.equal(cardState(card), '记录不可读取')
+  assert.match(text(card), /无法读取这轮任务的 SQLite 记录/)
+  assert.equal(cardMembers(card).length, 0, 'an unreadable ledger has no current roster')
+  assert.doesNotMatch(text(card), /4 张工单|旧快照/)
+  openRunCard(host, card)
+  assert.deepEqual(host.opened, [['dsh-resource://ticket-dag/' + cardKey + '/demo-01', 'ticket-dag']])
+})
+
+test('a remounted card shows reassigned and appended tickets from the new snapshot', async () => {
+  const node = runCardNode()
+  const presets = [
+    { id: 'docs', name: '写文档的' },
+    { id: 'implementer', name: '改派后的实现' },
+  ]
+  const updated = cardSnapshot({
+    mode: 'active',
+    counts: { RUNNING: 2, PENDING: 3 },
+    presets,
+    tickets: [
+      { id: 'T1', agent: 'implementer' },
+      { id: 'T2', agent: 'implementer' },
+      { id: 'T3', agent: 'docs' },
+      { id: 'T4', agent: null },
+      { id: 'T5', agent: 'docs' },
+    ],
+  })
+  const mount = (body) => {
+    const host = loadHost([], { respond: async () => answer(200, body) })
+    host.renderSlot('conversation.chat.node', { sessionId: 's1', node })
+    return host
+  }
+  const first = mount({ runs: [cardSnapshot({ mode: 'active' })], selected: cardSnapshot({ mode: 'active' }) })
+  await settle()
+  const again = mount({ runs: [updated], selected: updated })
+  await settle()
+  const stored = (host) => host.indexed.filter(([at]) => at === 1).at(-1)[1]
+  const found = (host) => host.indexed.filter(([at]) => at === 0).at(-1)[1]
+  assert.equal(stored(first).tickets.length, 4, 'the first mount keeps the snapshot it just read')
+  assert.equal(stored(again).tickets.length, 5)
+  assert.equal(stored(again).tickets[0].agent, 'implementer', 'approval reassignment is on the new snapshot')
+  const { host, card } = renderRunCard(found(again), stored(again))
+  assert.equal(cardState(card), '运行中')
+  assert.match(text(card), /运行中 · 5 张工单/)
+  assert.deepEqual(cardMembers(card), ['改派后的实现 · 2 张', '写文档的 · 2 张', '默认成员 · 1 张'])
+  assert.doesNotMatch(text(card), /旧快照/)
+  openRunCard(host, card)
+  assert.deepEqual(host.opened, [['dsh-resource://ticket-dag/' + cardKey + '/demo-01', 'ticket-dag']])
+
+  // The open board may have another run selected; the card still reads its own snapshot.
+  const other = cardSnapshot({ key: 'a'.repeat(64), runId: 'other', tickets: [{ id: 'Z', agent: 'docs' }] })
+  const keyed = loadHost([], {
+    respond: async (url) =>
+      url.includes('key=')
+        ? answer(200, { runs: [other, updated], selected: updated })
+        : answer(200, { runs: [other, updated], selected: other }),
+  })
+  keyed.renderSlot('conversation.chat.node', { sessionId: 's1', node })
+  await settle()
+  assert.equal(stored(keyed).runId, 'demo-01')
+  assert.equal(stored(keyed).tickets.length, 5)
+  assert.ok(keyed.urls.some((url) => url.includes('key=' + cardKey)))
+})
+
+test('a failed read marks the folded plan as an old snapshot and does not invent a live status', async () => {
+  const node = runCardNode()
+  const offline = loadHost([], { respond: async () => { throw new TypeError('offline') } })
+  offline.renderSlot('conversation.chat.node', { sessionId: 's1', node })
+  await settle()
+  assert.equal(offline.indexed.some(([at, value]) => at === 1 && value === false), true)
+  const { host, card } = renderRunCard(null, false)
+  assert.equal(cardState(card), '旧快照')
+  assert.match(text(card), /旧快照 · 4 张工单/)
+  assert.match(text(card), /读取失败，以下是旧快照，不是当前状态。/)
+  assert.deepEqual(cardMembers(card), ['文档员 · 2 张', '实现者 · 1 张', '默认成员 · 1 张'])
+  assert.doesNotMatch(text(card), /待确认|运行中|已暂停|已取消|已完成|进行中|记录不可读取/)
+  openRunCard(host, card)
+  assert.deepEqual(host.opened, [])
+  assert.match(host.sets.at(-1), /找不到这轮运行的记录/)
+
+  // The run is listed, but its detail never arrives: still an old snapshot, and the button opens that run.
+  const hit = { key: cardKey, runId: 'demo-01', mode: 'paused', complete: false, counts: { PENDING: 4 }, available: true }
+  const listed = loadHost([], {
+    respond: async (url) => (url.includes('key=') ? answer(500, {}) : answer(200, { runs: [hit], selected: null })),
+  })
+  listed.renderSlot('conversation.chat.node', { sessionId: 's1', node })
+  await settle()
+  const kept = listed.indexed.filter(([at]) => at === 0).at(-1)[1]
+  assert.equal(kept.key, cardKey)
+  assert.equal(listed.indexed.filter(([at]) => at === 1).at(-1)[1], false)
+  const opened = renderRunCard(kept, false)
+  assert.equal(cardState(opened.card), '旧快照')
+  assert.match(text(opened.card), /不是当前状态/)
+  assert.doesNotMatch(text(opened.card), /已暂停|运行中/)
+  openRunCard(opened.host, opened.card)
+  assert.deepEqual(opened.host.opened, [['dsh-resource://ticket-dag/' + cardKey + '/demo-01', 'ticket-dag']])
+})
+
+test('a run missing from the board list is marked an old snapshot, not a live ticket count', async () => {
+  const node = runCardNode()
+  // The run list answers, but this run is no longer in it. That is a read
+  // failure for the card, so its folded plan must not look live.
+  const gone = loadHost([], { respond: async () => answer(200, { runs: [], selected: null }) })
+  gone.renderSlot('conversation.chat.node', { sessionId: 's1', node })
+  await settle()
+  assert.equal(gone.indexed.filter(([at]) => at === 1).at(-1)[1], false, 'a missing run sets the snapshot to failed')
+  const { host, card } = renderRunCard(null, false)
+  assert.equal(cardState(card), '旧快照')
+  assert.match(text(card), /旧快照 · 4 张工单/)
+  assert.match(text(card), /读取失败，以下是旧快照，不是当前状态。/)
+  assert.deepEqual(cardMembers(card), ['文档员 · 2 张', '实现者 · 1 张', '默认成员 · 1 张'])
+  assert.doesNotMatch(text(card), /待确认|运行中|已暂停|已取消|已完成|记录不可读取/)
+  openRunCard(host, card)
+  assert.deepEqual(host.opened, [])
 })
 
 test('a closed turn shows its run cards in the turn tail instead of at the folded tool call', () => {
@@ -1639,4 +2064,190 @@ test('appended tickets carry a 追加 tag with their time on hover, on the board
   const tasks = findAll(review, (n) => n.props['data-dag-task'] !== undefined)
   assert.deepEqual(tasks.map((t) => Boolean(tagOf(t))), [false, false, false, false, true])
   assert.equal(tagOf(tasks[4]).props.title, tag.props.title)
+})
+const startedAt = 1_700_000_000_000
+const timingOf = (over = {}) => ({
+  startedAt,
+  endedAt: null,
+  accumulatedMs: 754_000,
+  runningSince: startedAt,
+  attentionMs: 0,
+  tickets: {},
+  totals: { workerMs: 0, queueMs: null, verifyMs: null, checkRuns: 0, checkFailures: 0, conflicts: 0, attempts: 0 },
+  ...over,
+})
+
+// Paints a board on a clock the test moves; the elapsed number counts from clock.now
+// at the time of the reading. Each paint() renders it again, as a tick would.
+function elapsedBoard(timing, over = {}) {
+  const clock = { now: startedAt + 3_600_000 }
+  const run = {
+    key: 'k'.repeat(64),
+    runId: 'hello-01',
+    mode: 'active',
+    complete: false,
+    total: sample.length,
+    counts: {},
+    tickets: sample.map((t) => ({ dependsOn: [], attempt: 0, ...t })),
+    timing,
+    now: clock.now,
+    receivedAt: clock.now,
+    ...over,
+  }
+  const seeds = [{ runs: [run], selected: run }, run.key]
+  const host = loadHost([], { clock })
+  const Dashboard = host.slots['sidebar.right.pane.tab'].component
+  const paint = () => (host.seed(seeds), render({ type: Dashboard, props: {}, children: [] }))
+  return { clock, host, paint }
+}
+const elapsedOf = (root) => find(root, (n) => n.props['data-dag-elapsed'] !== undefined)
+const blockOf = (root) => find(root, (n) => n.props['aria-label'] === '运行概况')
+function definitions(node) {
+  const cells = findAll(node, (n) => n.type === 'dt' || n.type === 'dd').map(text)
+  return Object.fromEntries(cells.flatMap((c, i) => (i % 2 ? [] : [[c, cells[i + 1]]])))
+}
+
+test('a running board counts each second locally, without another request or double counting', () => {
+  // A pause earlier in the run: runningSince is far back, but accumulatedMs already
+  // holds the open segment, so now - runningSince must not be added on top.
+  const { clock, host, paint } = elapsedBoard(timingOf())
+  const root = paint()
+  const value = elapsedOf(root)
+  assert.equal(text(value), '12:34')
+  assert.match(text(blockOf(root)), /累计用时/)
+  assert.ok(find(blockOf(root), (n) => n === value))
+  assert.ok(cssFor(root, '.dtd-elapsed [data-dag-elapsed]')[0].includes('font-variant-numeric:tabular-nums'))
+  assert.equal(host.intervals.length, 1)
+  assert.equal(host.intervals[0].ms, 1000)
+
+  clock.now += 5_000
+  const requests = host.urls.length
+  const updates = host.sets.length
+  host.intervals[0].fn()
+  assert.equal(host.urls.length, requests)
+  assert.equal(host.sets.length, updates + 1)
+  assert.equal(text(elapsedOf(paint())), '12:39')
+})
+
+test('the elapsed time counts on from the local moment the reading arrived', async () => {
+  const run = {
+    key: 'k'.repeat(64),
+    runId: 'hello-01',
+    mode: 'active',
+    total: 0,
+    counts: {},
+    tickets: [],
+    timing: timingOf(),
+    // A server clock an hour off the page's must not change anything.
+    now: startedAt + 7_200_000,
+  }
+  const clock = { now: startedAt + 3_600_000 }
+  const host = loadHost([], {
+    clock,
+    respond: async () => ({ ok: true, status: 200, json: async () => ({ runs: [run], selected: run }) }),
+  })
+  render({ type: host.slots['sidebar.right.pane.tab'].component, props: {}, children: [] })
+  await new Promise((done) => setImmediate(done))
+  const view = host.sets.find((value) => value?.selected)
+  assert.equal(view.selected.receivedAt, clock.now)
+})
+
+test('elapsed time reads minutes under an hour and hours from an hour up', () => {
+  const shown = (accumulatedMs) =>
+    text(elapsedOf(elapsedBoard(timingOf({ accumulatedMs, runningSince: null })).paint()))
+  assert.equal(shown(0), '0:00')
+  assert.equal(shown(7_999), '0:07')
+  assert.equal(shown(3_599_000), '59:59')
+  assert.equal(shown(3_600_000), '1:00:00')
+  assert.equal(shown(3_754_000), '1:02:34')
+})
+
+test('a paused, completed or cancelled run freezes its elapsed time', () => {
+  const frozen = timingOf({ runningSince: null, endedAt: startedAt + 754_000 })
+  for (const [over, note] of [
+    [{ mode: 'paused' }, true],
+    [{ mode: 'active', complete: true }, false],
+    // A pause holds across a completion, and the board then says the run is done.
+    [{ mode: 'paused', complete: true }, false],
+    [{ mode: 'cancelled' }, false],
+  ]) {
+    const { clock, host, paint } = elapsedBoard(frozen, over)
+    assert.equal(text(elapsedOf(paint())), '12:34')
+    clock.now += 60_000
+    const root = paint()
+    assert.equal(text(elapsedOf(root)), '12:34')
+    assert.equal(host.intervals.length, 0)
+    assert.equal(/已暂停/.test(text(find(root, (n) => n.props.className === 'dtd-elapsed'))), note)
+  }
+})
+
+test('a run without timing shows no elapsed time', () => {
+  const { host, paint } = elapsedBoard(null)
+  const root = paint()
+  assert.equal(elapsedOf(root), undefined)
+  assert.doesNotMatch(text(root), /累计用时|用时分解/)
+  assert.equal(host.intervals.length, 0)
+  const selected = reviewRun()
+  selected.timing = null
+  const review = loadHost([{ runs: [selected], selected }, selected.key])
+  assert.equal(elapsedOf(review.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })), undefined)
+})
+
+test('unmounting the elapsed time clears its interval', () => {
+  const { host, paint } = elapsedBoard(timingOf())
+  paint()
+  assert.equal(host.intervals[0].cleared, false)
+  for (const cleanup of host.cleanups) cleanup()
+  assert.equal(host.intervals[0].cleared, true)
+})
+
+test('the breakdown shows a dash for what is unknown and keeps a measured zero', () => {
+  const breakdown = (timing) =>
+    definitions(find(elapsedBoard(timing).paint(), (n) => n.props['data-dag-elapsed-breakdown'] !== undefined))
+  // Folded by default.
+  const folded = find(elapsedBoard(timingOf()).paint(), (n) => n.props['data-dag-elapsed-breakdown'] !== undefined)
+  assert.equal(folded.type, 'details')
+  assert.equal(folded.props.open, undefined)
+  // An old ledger has no verification events, so its check count of 0 means nothing either.
+  assert.deepEqual(breakdown(timingOf()), {
+    工单工作合计: '0:00',
+    集成排队: '—',
+    验收: '—',
+    等待处理: '0:00',
+    验收命令次数: '—',
+    冲突次数: '0',
+  })
+  assert.deepEqual(
+    breakdown(
+      timingOf({
+        attentionMs: 65_000,
+        totals: { workerMs: 3_754_000, queueMs: 0, verifyMs: 12_000, checkRuns: 3, checkFailures: 1, conflicts: 2, attempts: 4 },
+      }),
+    ),
+    {
+      工单工作合计: '1:02:34',
+      集成排队: '0:00',
+      验收: '0:12',
+      等待处理: '1:05',
+      验收命令次数: '3',
+      冲突次数: '2',
+    },
+  )
+})
+
+test('a ticket row lists its own durations and attempts in its details', () => {
+  const tickets = {
+    A: { attempts: 2, workerMs: 125_000, queueMs: 3_000, verifyMs: 40_000, attentionMs: 0 },
+    C: { attempts: 1, workerMs: 9_000, queueMs: null, verifyMs: null, attentionMs: 0 },
+  }
+  const root = elapsedBoard(timingOf({ tickets }), {
+    // A ticket ID that names an Object.prototype member has no row of its own.
+    tickets: [...sample, { id: 'constructor', status: 'PENDING' }].map((t) => ({ dependsOn: [], attempt: 0, ...t })),
+  }).paint()
+  const row = (id) => find(root, (n) => n.props['data-dag-ticket'] === id)
+  const details = (id) => definitions(find(row(id), (n) => n.type === 'details'))
+  assert.deepEqual(details('A'), { 工作时长: '2:05', 排队时长: '0:03', 验收时长: '0:40', 尝试次数: '2' })
+  assert.deepEqual(details('C'), { 工作时长: '0:09', 排队时长: '—', 验收时长: '—', 尝试次数: '1' })
+  assert.equal(find(row('B'), (n) => n.type === 'details'), undefined)
+  assert.equal(find(row('constructor'), (n) => n.type === 'details'), undefined)
 })

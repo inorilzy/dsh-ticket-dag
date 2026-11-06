@@ -1,6 +1,93 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+
+/**
+ * The raw ledger arrays that decide what a plan approves: the run row, every
+ * ticket definition, the dependency edges, the dag_add batches and the approval
+ * records. Kept in one place so the coordinator's ledger digest, the plan
+ * revision and the read-only dashboard all hash the same rows.
+ */
+export function ledgerSnapshot({ run, tickets, dependencies, appended, approvals }) {
+  return {
+    run: [run.runId, run.repo, run.ref, run.baseSha, run.parentId, run.policyHash, run.manifest],
+    tickets: tickets.map((t) => [t.id, t.position, t.definition]),
+    dependencies: dependencies.map((d) => [d.ticketId, d.upstream]),
+    appended: appended.map((a) => [a.ticketId, a.batch, a.definition, a.policyHash, a.createdAt]),
+    approvals: approvals.map((a) => a.details),
+  }
+}
+
+// The preset fields approval resolves for a ticket right now: the preset named
+// by its definition, resolved from the live settings, or the copy frozen at
+// dag_run when that preset has since been removed (approve's own fallback). A
+// settings edit that changes any of these must change the plan revision, so a
+// review of the old preset cannot be approved as if nothing changed.
+function effectivePreset(ticket, agents) {
+  let definition = ticket?.definition
+  if (typeof definition === 'string') {
+    try {
+      definition = JSON.parse(definition)
+    } catch {
+      return null
+    }
+  }
+  const agent = definition?.agent
+  if (typeof agent !== 'string' || !agent) return null
+  if (agents && Object.hasOwn(agents, agent)) return agentSpec(agents, agent)
+  const frozen = definition.agentSpec
+  return frozen && typeof frozen === 'object' && !Array.isArray(frozen) ? frozen : {}
+}
+
+/**
+ * The opaque revision the plan review carries for a staged run. It covers every
+ * ledger field that decides what the user is approving: each ticket definition,
+ * the effective preset fields approval would freeze for that ticket now, the
+ * dependency edges, the dag_add batches and their frozen commands, the
+ * submission (manifest, which holds the command registry) and the approval
+ * records. A stale approval names an older revision.
+ *
+ * Both the live coordinator (RunStore.revision) and the read-only dashboard
+ * (readLedger) build the same digest from raw ledger rows so a refresh shows the
+ * exact revision the coordinator checks in its serial region.
+ */
+export function planRevision({ run, tickets, dependencies, appended, approvals, agents = {} }) {
+  const snapshot = ledgerSnapshot({ run, tickets, dependencies, appended, approvals })
+  return createHash('sha256')
+    .update(
+      JSON.stringify([
+        run.mode,
+        snapshot.run,
+        tickets.map((t, i) => [...snapshot.tickets[i], effectivePreset(t, agents)]),
+        snapshot.dependencies,
+        snapshot.appended,
+        snapshot.approvals,
+      ]),
+    )
+    .digest('hex')
+}
+
+/**
+ * Run the ledger integrity queries against any open connection, so the writer
+ * (RunStore.integrity) and the read-only dashboard (readLedger) read the same
+ * rows instead of keeping two copies that can drift.
+ */
+export function readIntegrity(db) {
+  const hasAppended = Boolean(
+    db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='appended'").get(),
+  )
+  return {
+    run: db
+      .prepare('SELECT runId,repo,ref,baseSha,manifest,parentId,policyHash,mode FROM run WHERE singleton=1')
+      .get(),
+    tickets: db.prepare('SELECT id,position,definition FROM tickets ORDER BY position').all(),
+    dependencies: db.prepare('SELECT ticketId,upstream FROM dependencies ORDER BY ticketId,upstream').all(),
+    appended: hasAppended
+      ? db.prepare('SELECT ticketId,batch,definition,policyHash,createdAt FROM appended ORDER BY batch,rowid').all()
+      : [],
+    approvals: db.prepare("SELECT details FROM events WHERE type='run_approved' ORDER BY rowid").all(),
+  }
+}
 
 const STATUSES = [
   'PENDING',
@@ -149,7 +236,8 @@ function normalizeTickets(list, checkRegistry, agentRegistry) {
     const title = text(raw.title, id + '.title')
     const prompt = text(raw.prompt ?? raw.description ?? title, id + '.prompt')
     const dependsOn = strings(raw.dependsOn ?? raw.depends_on, id + '.dependsOn', safeId)
-    // Optional: a ticket without checks integrates after a clean trial merge.
+    // Optional: an empty list means no check of the ticket's own; checks of tickets
+    // already integrated still run on its candidate.
     const verify = strings(raw.verify, id + '.verify', safeId)
     verify.forEach((name) => commandExists(checkRegistry, name))
     const acceptance = strings(raw.acceptance, id + '.acceptance')
@@ -407,7 +495,8 @@ export class RunStore {
       const edge = this.#db.prepare('INSERT INTO dependencies(ticketId, upstream) VALUES (?, ?)')
       manifest.tickets.forEach((t, i) => insert.run(t.id, JSON.stringify(t), i))
       for (const t of manifest.tickets) for (const upstream of t.dependsOn) edge.run(t.id, upstream)
-      this.#event('run_started', null, 'Run started', { ref, baseSha })
+      // The mode tells timing whether this start waits for an approval.
+      this.#event('run_started', null, 'Run started', { ref, baseSha, mode })
       return this.meta()
     })
   }
@@ -461,15 +550,23 @@ export class RunStore {
     text(message, 'diagnostic')
     return this.#transaction(() => {
       const run = this.meta()
-      if (!run || run.mode === 'cancelled' || (run.mode !== 'active' && run.diagnostic === message))
-        return false
-      // A staged run keeps waiting for approval; it only records the diagnostic.
+      if (!run || (run.mode !== 'active' && run.diagnostic === message)) return false
+      // A staged run keeps waiting for approval and a cancelled run stays final;
+      // both only record the diagnostic.
       this.#db
         .prepare(
-          "UPDATE run SET mode=CASE WHEN mode='staged' OR ? THEN 'staged' ELSE 'paused' END,diagnostic=? WHERE singleton=1",
+          "UPDATE run SET mode=CASE WHEN mode='cancelled' THEN 'cancelled' WHEN mode='staged' OR ? THEN 'staged' ELSE 'paused' END,diagnostic=? WHERE singleton=1",
         )
         .run(staged ? 1 : 0, message)
       this.#event('run_blocked', null, message, { previousMode: run.mode }, true)
+      return true
+    })
+  }
+
+  /** The caller has settled what the diagnostic reported. Its run_blocked event stays in the log. */
+  clearDiagnostic() {
+    return this.#transaction(() => {
+      this.#db.prepare('UPDATE run SET diagnostic=NULL WHERE singleton=1').run()
       return true
     })
   }
@@ -503,13 +600,12 @@ export class RunStore {
       const update = this.#db.prepare('UPDATE tickets SET definition=? WHERE id=?')
       for (const t of approved) update.run(JSON.stringify(t), t.id)
       this.#db.prepare("UPDATE run SET mode='active', diagnostic=NULL WHERE singleton=1").run()
-      this.#event(
-        'run_approved',
-        null,
-        'Plan approved by the user; dispatch started',
-        maxWorkers === undefined ? {} : { maxWorkers },
-        true,
-      )
+      // The review shows every manifest check, so approval covers each of them.
+      // An approval without this record predates that and covers none on its own.
+      // maxWorkers, when the user chose one, is the concurrency cap for this run.
+      const planChecks = Object.keys(run.manifest.checks ?? {})
+      const details = maxWorkers === undefined ? { planChecks } : { planChecks, maxWorkers }
+      this.#event('run_approved', null, 'Plan approved by the user; dispatch started', details, true)
       return true
     })
   }
@@ -521,6 +617,15 @@ export class RunStore {
       .get()
     const chosen = row ? JSON.parse(row.details).maxWorkers : undefined
     return Number.isInteger(chosen) && chosen >= 1 && chosen <= 32 ? chosen : this.meta().manifest.maxWorkers
+  }
+
+  /** The manifest check IDs the user saw and approved; empty before approval and for older approvals. */
+  approvedChecks() {
+    return this.#approvals().flatMap((row) => JSON.parse(row.details).planChecks ?? [])
+  }
+
+  #approvals() {
+    return this.#db.prepare("SELECT details FROM events WHERE type='run_approved' ORDER BY rowid").all()
   }
 
   /**
@@ -613,20 +718,22 @@ export class RunStore {
   /**
    * The raw ledger fields that decide what may run and how it is accepted:
    * the run row (including mode), every ticket definition, the dependency
-   * edges and the append records. The coordinator pins a digest of them
-   * against outside edits.
+   * edges, the append records and the approval records. The coordinator pins
+   * a digest of them against outside edits.
    */
   integrity() {
-    return {
-      run: this.#db
-        .prepare('SELECT runId,repo,ref,baseSha,manifest,parentId,policyHash,mode FROM run WHERE singleton=1')
-        .get(),
-      tickets: this.#db.prepare('SELECT id,position,definition FROM tickets ORDER BY position').all(),
-      dependencies: this.#db.prepare('SELECT ticketId,upstream FROM dependencies ORDER BY ticketId,upstream').all(),
-      appended: this.#db
-        .prepare('SELECT ticketId,batch,definition,policyHash,createdAt FROM appended ORDER BY batch,rowid')
-        .all(),
-    }
+    return readIntegrity(this.#db)
+  }
+
+  /**
+   * The opaque plan revision a staged plan is approved against. It is derived
+   * from integrity(), so any change that would alter what runs or how it is
+   * accepted (an appended ticket, a frozen command, an approval record, or the
+   * effective preset a ticket would resolve now) makes an earlier snapshot's
+   * revision stale.
+   */
+  revision(agents = {}) {
+    return planRevision({ ...this.integrity(), agents })
   }
 
   get(id) {
@@ -919,6 +1026,19 @@ export class RunStore {
   /** Record the result of reporting an integrated ticket back to its tracker issue. */
   recordWriteback(id, status, message, details = {}) {
     this.#transaction(() => this.#event('writeback_' + status, this.get(id), message, details))
+  }
+
+  /** The integration lane starts on this ticket. Timing only; the captain is not notified. */
+  recordVerifyStart(id, checks) {
+    this.#transaction(() => this.#event('verify_started', this.get(id), id + ' verification started', { checks }))
+  }
+
+  /** One check command ended. Timing only; the captain is not notified. */
+  recordCheck(id, { checkId, ms, ok, aborted = false }) {
+    const details = aborted ? { checkId, ms, ok, aborted } : { checkId, ms, ok }
+    this.#transaction(() =>
+      this.#event('check_finished', this.get(id), checkId + (ok ? ' passed' : ' did not pass'), details),
+    )
   }
 
   events() {

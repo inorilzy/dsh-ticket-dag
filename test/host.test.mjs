@@ -158,6 +158,53 @@ test('nine captain tools bind identity and trusted checks, existing and new root
   await h.close()
 })
 
+test('a recovery scan logs each failed run by its runId', async () => {
+  const h = harness()
+  const warnings = []
+  h.ctx.logger.warn = (line) => warnings.push(line)
+  h.controller.attach = async () => ({
+    attached: ['good'],
+    failures: [
+      { runId: 'locked', error: 'Another DSH coordinator owns this run: x' },
+      { runId: 'corrupt', error: 'Cannot read the run ledger x: file is not a database' },
+    ],
+  })
+  await afterPublication()
+  await afterPublication()
+  assert.deepEqual(warnings, [
+    'DAG recovery scan, run locked: Another DSH coordinator owns this run: x',
+    'DAG recovery scan, run corrupt: Cannot read the run ledger x: file is not a database',
+  ])
+  await h.close()
+})
+
+test('a recovery scan reports each failed run to the captain, not only the host log', async () => {
+  const h = harness()
+  h.controller.attach = async () => ({
+    attached: [],
+    failures: [
+      { runId: 'locked', error: 'Another DSH coordinator owns this run: x', file: '/repo/runs/locked/state.sqlite' },
+      {
+        runId: 'corrupt',
+        error: 'Cannot read the run ledger x: file is not a database',
+        file: '/repo/runs/corrupt/state.sqlite',
+      },
+    ],
+  })
+  await afterPublication()
+  await afterPublication()
+  await afterPublication()
+  const inbox = h.logs
+    .get('root')
+    .events.filter((event) => event.type === 'agent/inbox/spliced')
+    .map((event) => event.data.inserted[0])
+  const byId = new Map(inbox.map((message) => [message.source.eventId, message]))
+  assert.deepEqual([...byId.keys()].sort(), ['recovery-failed:corrupt', 'recovery-failed:locked'])
+  assert.match(byId.get('recovery-failed:locked').content[0].text, /恢复失败：Another DSH coordinator owns this run/)
+  assert.match(byId.get('recovery-failed:corrupt').content[0].text, /Cannot read the run ledger/)
+  await h.close()
+})
+
 test('dag_cleanup is a captain-only run tool and autoCleanup defaults on', async () => {
   const h = harness()
   assert.deepEqual(h.tools.get('dag_cleanup').parameters, { runId: h.tools.get('dag_status').parameters.runId })

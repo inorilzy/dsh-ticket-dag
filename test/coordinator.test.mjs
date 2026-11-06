@@ -8,6 +8,7 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { Coordinator } from '../src/coordinator.mjs'
+import { RunCatalog, mountApproval, mountDashboard } from '../src/dashboard.mjs'
 
 const exec = promisify(execFile)
 const env = {
@@ -516,12 +517,17 @@ test(
       await co.pause(q)
       assert.equal((await co.status(q)).mode, 'staged')
       const [file] = co.runs.keys()
-      await assert.rejects(co.approve(file, [{ id: 'A', agent: 'ghost' }]), /unknown agent preset/)
-      await assert.rejects(co.approve(file, [{ id: 'A', agent: 'docs', provider: 'acme' }]), /without a model/)
-      const approved = await co.approve(file, [
-        { id: 'A', agent: 'docs', provider: 'acme', model: 'deep-2', reasoningEffort: 'high' },
-        { id: 'B', agent: 'impl', provider: '', model: '', reasoningEffort: '' },
-      ])
+      const rev = (await co.status(q)).revision
+      await assert.rejects(co.approve(file, [{ id: 'A', agent: 'ghost' }], { revision: rev }), /unknown agent preset/)
+      await assert.rejects(co.approve(file, [{ id: 'A', agent: 'docs', provider: 'acme' }], { revision: rev }), /without a model/)
+      const approved = await co.approve(
+        file,
+        [
+          { id: 'A', agent: 'docs', provider: 'acme', model: 'deep-2', reasoningEffort: 'high' },
+          { id: 'B', agent: 'impl', provider: '', model: '', reasoningEffort: '' },
+        ],
+        { revision: rev },
+      )
       assert.equal(approved.mode, 'active')
       // The captain may resubmit the original manifest: approval is not a manifest change.
       const again = await co.start({ ...q, manifest: plan })
@@ -553,6 +559,77 @@ test(
     } finally {
       await co.close()
       await reopened?.close()
+    }
+  },
+)
+
+test(
+  'approval is bound to the reviewed plan revision; stale, missing, duplicate and unknown selections start nothing',
+  { timeout: limit(90000) },
+  async (t) => {
+    const cwd = await repo(t)
+    const jobs = []
+    const seenRoutes = []
+    const co = new Coordinator({
+      checks: noopChecks,
+      requireApproval: true,
+      agents: { docs: { instructions: 'Docs.', provider: 'acme', model: 'fast-1' } },
+      validateRoutes: async (tickets) => {
+        seenRoutes.push(tickets.map((x) => [x.id, x.agent ?? null]))
+      },
+      launch: async (job) => {
+        jobs.push(job)
+        return {
+          dispose: async () => {},
+          result: (async () => {
+            await commit(job)
+            return { ok: true }
+          })(),
+        }
+      },
+    })
+    const q = { cwd, parentId: 'captain', runId: 'rev' }
+    try {
+      const started = await co.start({
+        ...q,
+        manifest: { spec_id: 'rev', tickets: [{ ...ticket('A'), agent: 'docs' }, ticket('B', ['A'])] },
+      })
+      assert.match(started.revision, /^[0-9a-f]{64}$/)
+      const [file] = co.runs.keys()
+      // A request with no revision is the old-client path: a clear diagnostic, no start.
+      await assert.rejects(co.approve(file, [{ id: 'A', agent: 'docs' }]), /revision|refresh/i)
+      assert.equal((await co.status(q)).mode, 'staged')
+      // A plan appended after review has a new revision; approving the old one is stale.
+      const before = (await co.status(q)).revision
+      const added = await co.add({ ...q, tickets: [{ id: 'C', title: 'C', depends_on: ['B'] }] })
+      assert.notEqual(added.revision, before)
+      await assert.rejects(co.approve(file, [{ id: 'A', agent: 'docs' }], { revision: before }), /plan changed/i)
+      assert.equal((await co.status(q)).mode, 'staged')
+      // Duplicate or unknown ticket IDs are malformed requests, refused before dispatch.
+      await assert.rejects(
+        co.approve(file, [{ id: 'A', agent: 'docs' }, { id: 'A', agent: 'docs' }], { revision: added.revision }),
+        /Duplicate ticket ID/,
+      )
+      await assert.rejects(co.approve(file, [{ id: 'Z' }], { revision: added.revision }), /Unknown ticket ID/)
+      assert.equal(jobs.length, 0, 'nothing was dispatched by the refused approvals')
+      // A current revision resolves every effective route before dispatch, and
+      // only one of two concurrent approvals of the same plan can win.
+      const racers = await Promise.allSettled([
+        co.approve(file, [{ id: 'A', agent: 'docs' }], { revision: added.revision }),
+        co.approve(file, [{ id: 'A', agent: 'docs' }], { revision: added.revision }),
+      ])
+      assert.equal(racers.filter((r) => r.status === 'fulfilled').length, 1, 'one concurrent approval wins')
+      assert.match(String(racers.find((r) => r.status === 'rejected')?.reason), /not waiting for approval/)
+      const approved = racers.find((r) => r.status === 'fulfilled').value
+      assert.equal(approved.mode, 'active')
+      assert.deepEqual(seenRoutes.at(-1), [
+        ['A', 'docs'],
+        ['B', null],
+        ['C', null],
+      ])
+      await until(async () => (await co.status(q)).complete, 'the approved plan integrates')
+    } finally {
+      await co.close()
     }
   },
 )
@@ -602,7 +679,7 @@ test(
       assert.equal(held.tickets[0].status, 'PENDING')
       await assert.rejects(co.resume(q), /approv/)
       // The user can still approve the plan from the board.
-      const approved = await co.approve(file, [{ id: 'A' }], { maxWorkers: 1 })
+      const approved = await co.approve(file, [{ id: 'A' }], { maxWorkers: 1, revision: after.revision })
       assert.equal(approved.maxWorkers, 1, 'the user concurrency applies to the run')
       await until(async () => (await co.status(q)).complete, 'approved run integrates', 30000)
       assert.equal(jobs.length, 1)
@@ -681,11 +758,13 @@ test(
     })
     const q = { cwd, parentId: 'captain', runId: 'deleted-preset' }
     try {
-      await co.start({ ...q, manifest: { spec_id: 'deleted', tickets: [{ ...ticket('A'), agent: 'docs' }] } })
+      const started = await co.start({ ...q, manifest: { spec_id: 'deleted', tickets: [{ ...ticket('A'), agent: 'docs' }] } })
       co.updateSettings({ checks: noopChecks, maxWorkers: 16, checkTimeoutMs: 20000, agents: {} })
       const [file] = co.runs.keys()
-      await assert.rejects(co.approve(file, [{ id: 'A', agent: 'ghost' }]), /unknown agent preset/)
-      const approved = await co.approve(file, [{ id: 'A', agent: 'docs', provider: 'acme', model: 'fast-1' }])
+      await assert.rejects(co.approve(file, [{ id: 'A', agent: 'ghost' }], { revision: started.revision }), /unknown agent preset/)
+      const approved = await co.approve(file, [{ id: 'A', agent: 'docs', provider: 'acme', model: 'fast-1' }], {
+        revision: started.revision,
+      })
       assert.equal(approved.mode, 'active')
       await until(async () => (await co.status(q)).complete, 'approved run integrates', 30000)
       assert.match(jobs[0].prompt, /Role \(docs\): Docs only\./)
@@ -969,6 +1048,170 @@ test(
   },
 )
 
+test(
+  'a reconciliation error or a throwing dispose cannot keep cancel from stopping workers and a running check',
+  { timeout: limit(60000) },
+  async (t) => {
+    const cwd = await repo(t)
+    const pidFile = join(cwd, '..', 'check-pid').replaceAll('\\', '/')
+    const signals = new Map()
+    const co = new Coordinator({
+      maxWorkers: 3,
+      checkTimeoutMs: limit(120000),
+      checks: {
+        verify: [
+          [
+            process.execPath,
+            '-e',
+            `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000)`,
+          ],
+        ],
+      },
+      launch: async (job) => {
+        signals.set(job.ticketId, job.signal)
+        return {
+          // The first worker's release entry fails before it can return a promise.
+          dispose: () => {
+            if (job.ticketId === 'B') throw Error('dispose failed')
+            return Promise.resolve()
+          },
+          result:
+            job.ticketId === 'A'
+              ? commit(job).then(() => ({ ok: true }))
+              : new Promise((resolve) => {
+                  job.signal.addEventListener('abort', () => resolve({ ok: false, detail: 'stopped' }))
+                }),
+        }
+      },
+    })
+    const q = { cwd, parentId: 'captain', runId: 'cancel-signals' }
+    try {
+      await co.start({
+        ...q,
+        manifest: {
+          spec_id: 'cancel-signals',
+          tickets: [ticket('A'), { id: 'B', title: 'B' }, { id: 'C', title: 'C' }],
+        },
+      })
+      await until(async () => {
+        const s = await co.status(q)
+        return s.tickets[0].livePhase?.stage === 'verify' && signals.size === 3
+      }, 'the check and both workers are running')
+      const pid = Number(await until(() => readFile(pidFile, 'utf8').catch(() => ''), 'the check process started'))
+      const [run] = co.runs.values()
+      const integration = run.integration
+      let aborted
+      co._reconcile = async () => {
+        aborted = [signals.get('B').aborted, signals.get('C').aborted, integration.ctrl.signal.aborted]
+        throw Error('git exploded')
+      }
+      const after = await co.cancel(q)
+      assert.deepEqual(aborted, [true, true, true], 'stop signals precede reconciliation')
+      assert.equal(after.mode, 'cancelled')
+      assert.equal(after.reconcileError, 'git exploded')
+      assert.equal(after.diagnostic, 'git exploded')
+      assert.equal(after.tickets.find((x) => x.id === 'A').livePhase, null)
+      assert.equal(after.tickets.find((x) => x.id === 'A').status, 'CANCELLED')
+      assert.equal(after.tickets.find((x) => x.id === 'C').status, 'CANCELLED')
+      // B's stop could not be proven, so it stays for inspection instead of counting as cancelled.
+      assert.equal(after.tickets.find((x) => x.id === 'B').status, 'NEEDS_ATTENTION')
+      await until(() => {
+        try {
+          process.kill(pid, 0)
+          return false
+        } catch {
+          return true
+        }
+      }, 'the check process is gone')
+    } finally {
+      await co.close()
+    }
+  },
+)
+
+for (const mode of ['automatic', 'manual'])
+  test(
+    mode + ' cleanup keeps local files, reports why through status and the board, then cleans once they are gone',
+    { timeout: limit(120000) },
+    async (t) => {
+      const cwd = await repo(t)
+      await writeFile(join(cwd, '.git', 'info', 'exclude'), '*.env\n')
+      const settings = { checks: noopChecks, maxWorkers: 16, checkTimeoutMs: 20000 }
+      const catalog = new RunCatalog()
+      const co = new Coordinator({
+        ...settings,
+        autoCleanup: false,
+        notify: async () => true,
+        rememberRun: (file, meta, startedAt) => catalog.remember(file, meta, startedAt),
+        launch: async (job) => ({
+          dispose: async () => {},
+          result: (async () => {
+            await commit(job)
+            return { ok: true }
+          })(),
+        }),
+      })
+      let board
+      mountDashboard({ connection: { fetch: { register: (r) => (board = r) } } }, catalog, co)
+      const q = { cwd, parentId: 'captain', runId: 'keep-' + mode }
+      try {
+        const ids = ['Ignored', 'Untracked', 'Tracked', 'Clean']
+        await co.start({ ...q, manifest: { spec_id: 'keep', tickets: ids.map((id) => ticket(id)) } })
+        const done = await until(async () => {
+          const s = await co.status(q)
+          if (s.counts.NEEDS_ATTENTION) throw Error(JSON.stringify(s))
+          return s.complete && s.pendingNotifications === 0 && s
+        }, 'complete and notified')
+        const paths = Object.fromEntries(done.tickets.map((r) => [r.id, r.path]))
+        const local = [
+          [join(paths.Ignored, 'local.env'), 'ignored data', /ignored: "local\.env"/],
+          [join(paths.Untracked, 'notes.txt'), 'untracked data', /untracked: "notes\.txt"/],
+          [join(paths.Tracked, 'Tracked.txt'), 'edited data', /tracked changes: "Tracked\.txt"/],
+        ]
+        for (const [file, data] of local) await writeFile(file, data)
+
+        let status
+        if (mode === 'automatic') {
+          co.updateSettings({ ...settings, autoCleanup: true })
+          status = await until(async () => {
+            const s = await co.status(q)
+            return s.tickets.every((r) => r.cleanup) && s
+          }, 'automatic cleanup')
+        } else status = await co.cleanup(q)
+
+        assert.deepEqual(status.cleanup, { cleaned: 1, skipped: 3 })
+        const row = (rows, id) => rows.find((r) => r.id === id)
+        const selected = (await (await board.fetch(new Request('http://localhost' + board.path))).json()).selected
+        for (const [index, [file, data, reason]] of local.entries()) {
+          assert.equal(await readFile(file, 'utf8'), data)
+          for (const rows of [status.tickets, selected.tickets]) {
+            assert.equal(row(rows, ids[index]).cleanup, 'skipped')
+            assert.match(row(rows, ids[index]).cleanupReason, reason)
+          }
+        }
+        assert.equal(row(selected.tickets, 'Clean').cleanup, 'cleaned')
+        assert.equal(await exists(paths.Clean), false)
+        assert.equal((await ticketBranches(cwd)).length, 3)
+
+        // Retrying by hand while the files remain keeps them; once tidied, the same call cleans.
+        const retried = await co.cleanup(q)
+        assert.deepEqual(retried.results.map((r) => r.status), ['skipped', 'skipped', 'skipped', 'cleaned'])
+        for (const [file, data] of local) assert.equal(await readFile(file, 'utf8'), data)
+        await rm(local[0][0])
+        await rm(local[1][0])
+        await git(paths.Tracked, 'checkout', '--', 'Tracked.txt')
+        for (let i = 0; i < 2; i++) {
+          const cleaned = await co.cleanup(q)
+          assert.deepEqual(cleaned.results.map((r) => r.status), ['cleaned', 'cleaned', 'cleaned', 'cleaned'])
+          assert.deepEqual(cleaned.cleanup, { cleaned: 4, skipped: 0 })
+          assert.deepEqual(await ticketBranches(cwd), [])
+        }
+      } finally {
+        await co.close()
+      }
+    },
+  )
+
 test('a cancelled run is never cleaned', { timeout: limit(60000) }, async (t) => {
   const cwd = await repo(t)
   const co = new Coordinator({
@@ -1073,7 +1316,10 @@ test(
     try {
       await co.start({ ...q, manifest: plan })
       const [file] = co.runs.keys()
-      await co.approve(file, [{ id: 'A', agent: 'docs', provider: 'acme', model: 'deep-2', reasoningEffort: 'high' }])
+      const rev = (await co.status(q)).revision
+      await co.approve(file, [{ id: 'A', agent: 'docs', provider: 'acme', model: 'deep-2', reasoningEffort: 'high' }], {
+        revision: rev,
+      })
       await assert.rejects(co.add({ ...q, tickets: [{ ...ticket('X'), verify: ['nope'] }] }), /unknown verification/)
       await assert.rejects(co.add({ ...q, tickets: [ticket('X', ['Y']), ticket('Y', ['X'])] }), /cycle/)
       const batch = [
@@ -1150,7 +1396,7 @@ test('tickets appended to a staged run wait for the user and are approved with t
     assert.equal(jobs.length, 0)
     assert.equal((await co.status(q)).diagnostic, null)
     const [file] = co.runs.keys()
-    await co.approve(file, [{ id: 'A' }, { id: 'B', agent: 'docs', model: 'deep-2' }])
+    await co.approve(file, [{ id: 'A' }, { id: 'B', agent: 'docs', model: 'deep-2' }], { revision: added.revision })
     await until(async () => (await co.status(q)).complete, 'approved plan with appended ticket integrates', 30000)
     assert.deepEqual(jobs.find((j) => j.ticketId === 'B').agentOptions, { model: 'deep-2' })
     await co.cancel(q)
@@ -1486,7 +1732,7 @@ test('checks the captain writes into the manifest wait for approval even without
     )
     await co.add({ ...q, tickets: [{ id: 'B', title: 'B', depends_on: ['A'], verify: ['own-test'] }] })
     const [file] = co.runs.keys()
-    await co.approve(file, [])
+    await co.approve(file, [], { revision: (await co.status(q)).revision })
     const done = await until(async () => {
       const s = await co.status(q)
       if (s.counts.NEEDS_ATTENTION) throw Error(JSON.stringify(s))
@@ -1562,6 +1808,116 @@ test(
       assert.equal(after.mode, 'active')
       assert.equal(after.diagnostic, null)
       assert.deepEqual(after.tickets.map((r) => r.appended), [false, true])
+    } finally {
+      await co.close()
+      await reopened?.close()
+    }
+  },
+)
+
+test(
+  'the registered board shows every manifest command with exact argv; dag_add may first use one only after approval',
+  { timeout: limit(120000) },
+  async (t) => {
+    const cwd = await repo(t)
+    const recorder = "require('node:fs').writeFileSync(process.argv[1], JSON.stringify(process.argv.slice(2)))"
+    const usedRan = join(cwd, '..', 'used-ran')
+    const laterRan = join(cwd, '..', 'later-ran')
+    const evilRan = join(cwd, '..', 'evil-ran')
+    const laterArgs = ['', 'a b', 'tab\tnew\nline\x07']
+    const checks = {
+      used: [[process.execPath, '-e', recorder, usedRan]],
+      later: [[process.execPath, '-e', recorder, laterRan, ...laterArgs]],
+    }
+    const manifest = { spec_id: 'shown', checks, tickets: [{ id: 'A', title: 'A', verify: ['used'] }] }
+    const catalog = new RunCatalog()
+    const launched = []
+    const options = {
+      checks: noopChecks,
+      requireApproval: false,
+      rememberRun: (...args) => catalog.remember(...args),
+      launch: async (job) => {
+        launched.push(job.ticketId)
+        return {
+          dispose: async () => {},
+          result: (async () => {
+            await commit(job)
+            return { ok: true }
+          })(),
+        }
+      },
+    }
+    const handlers = (coordinator) => {
+      const routes = {}
+      const ctx = { connection: { fetch: { register: (r) => (routes[r.path] = r) } } }
+      mountDashboard(ctx, catalog, coordinator, () => undefined)
+      mountApproval(ctx, catalog, coordinator)
+      return {
+        board: async () =>
+          (await routes['/api/ticket-dag.dashboard'].fetch(new Request('http://x/api/ticket-dag.dashboard'))).json(),
+        post: (body) =>
+          routes['/api/ticket-dag.approve'].fetch(
+            new Request('http://x/api/ticket-dag.approve', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', 'x-dsh-ticket-dag': '1' },
+              body: JSON.stringify(body),
+            }),
+          ),
+      }
+    }
+    const q = { cwd, parentId: 'captain', runId: 'shown' }
+    const settled = async (coordinator, label) =>
+      until(async () => {
+        const s = await coordinator.status(q)
+        if (s.counts.NEEDS_ATTENTION) throw Error(JSON.stringify(s))
+        return s.complete && s
+      }, label)
+    const co = new Coordinator(options)
+    let reopened
+    try {
+      await co.start({ ...q, manifest })
+      const { board, post } = handlers(co)
+      const { selected } = await board()
+      assert.equal(selected.mode, 'staged')
+      assert.deepEqual(selected.checks, checks, 'the unused command is listed with its exact argv')
+      assert.deepEqual(selected.planChecks, ['used', 'later'])
+      assert.deepEqual(selected.tickets[0].verify, ['used'])
+      assert.equal((await post({ key: selected.key, action: 'approve', revision: selected.revision, choices: [] })).status, 200)
+      await settled(co, 'A integrated')
+      assert.equal(await readFile(laterRan, 'utf8').catch(() => null), null, 'an unused command does not run')
+
+      // Approved: no ticket used this command yet, and the batch still cannot bring a new one.
+      await assert.rejects(
+        co.add({ ...q, tickets: [{ id: 'X', title: 'X', verify: ['sneaky'] }] }),
+        /unknown verification check: sneaky/,
+      )
+      const batch = [{ id: 'B', title: 'B', depends_on: ['A'], verify: ['later'] }]
+      const added = await co.add({ ...q, tickets: batch })
+      assert.deepEqual(added.unapprovedChecks, [])
+      assert.equal((await settled(co, 'B integrated')).diagnostic, null)
+      assert.deepEqual(JSON.parse(await readFile(laterRan, 'utf8')), laterArgs, 'the approved argv reaches the program')
+      assert.equal((await co.add({ ...q, tickets: batch })).tickets.length, 2, 'a repeated batch adds nothing')
+      assert.equal((await co.start({ ...q, manifest })).mode, 'active', 'resubmitting the manifest stays idempotent')
+      await co.close()
+
+      // A later profile check with the same ID cannot displace the approved command.
+      await rm(laterRan)
+      reopened = new Coordinator({
+        ...options,
+        checks: {
+          ...noopChecks,
+          later: [[process.execPath, '-e', "require('node:fs').writeFileSync(process.argv[1], 'evil')", evilRan]],
+        },
+      })
+      const loaded = await reopened.status(q)
+      assert.equal(loaded.diagnostic, null)
+      assert.deepEqual(loaded.checks.later, checks.later)
+      assert.equal((await reopened.add({ ...q, tickets: batch })).tickets.length, 2, 'still idempotent once reopened')
+      await reopened.add({ ...q, tickets: [{ id: 'C', title: 'C', depends_on: ['B'], verify: ['later'] }] })
+      assert.equal((await settled(reopened, 'C integrated')).diagnostic, null)
+      assert.deepEqual(JSON.parse(await readFile(laterRan, 'utf8')), laterArgs)
+      assert.equal(await readFile(evilRan, 'utf8').catch(() => null), null)
+      assert.deepEqual(launched, ['A', 'B', 'C'])
     } finally {
       await co.close()
       await reopened?.close()
