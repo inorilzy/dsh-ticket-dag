@@ -1,10 +1,51 @@
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, statSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
 const route = '/api/ticket-dag.dashboard'
 const noStore = { 'cache-control': 'no-store' }
+const unreadableDiagnostic = '无法读取这轮任务的 SQLite 记录。请确认原仓库及运行记录仍然可用。'
+
+// A ledger writes recent pages to its -wal file, so both files decide whether a
+// cached summary is current. A settled run never changes and stays cached; only
+// an active run's growing WAL invalidates it. A missing file returns null so the
+// caller still reports that run as unavailable instead of trusting stale data.
+function ledgerSignature(file) {
+  try {
+    const main = statSync(file)
+    let signature = main.mtimeMs + ':' + main.size
+    try {
+      const wal = statSync(file + '-wal')
+      signature += '|' + wal.mtimeMs + ':' + wal.size
+    } catch {
+      // No WAL file: the main file alone is the signature.
+    }
+    return signature
+  } catch {
+    return null
+  }
+}
+
+// The summary fields a history row needs, without its ticket detail. rawMaxWorkers
+// keeps the ledger's own cap so the caller can re-apply a changed host limit.
+function summaryOf(data) {
+  return {
+    available: data.available ?? true,
+    mode: data.mode,
+    complete: data.complete,
+    counts: data.counts,
+    verifiedSha: data.verifiedSha ?? null,
+    integrationRef: data.integrationRef ?? null,
+    maxWorkers: data.rawMaxWorkers ?? data.maxWorkers ?? null,
+    diagnostic: displayDiagnostic(data.diagnostic),
+  }
+}
+
+function capWorkers(value, limit) {
+  if (value == null) return null
+  return Number.isInteger(limit) && limit >= 1 ? Math.min(limit, value) : value
+}
 
 function displayDiagnostic(value) {
   if (!value) return null
@@ -17,11 +58,25 @@ function displayDiagnostic(value) {
 }
 
 // Only the coordinator can enroll a ledger. The browser supplies an opaque key,
-// never a path or a repository to scan. A dashboard read never opens a writer.
+// never a path or a repository to scan. A dashboard read never opens a run ledger
+// as a writer; only the small summary cache index is written.
 export class RunCatalog {
   constructor(profileDir) {
     this.index = profileDir ? join(profileDir, 'dsh-ticket-dag', 'catalog.sqlite') : null
     this.live = new Map()
+    // key -> { signature, summary }: this process's already-read history rows.
+    this.cache = new Map()
+    // Files this instance opened. A detail request must open the selected ledger
+    // only; settled history comes from the cache, so the count stays constant.
+    this.ledgerOpens = 0
+  }
+
+  // Add the cache columns to an index created before them. Old rows read as NULL
+  // (nothing cached) and are migrated incrementally on the next read.
+  #ensureCacheColumns(db) {
+    const columns = new Set(db.prepare('PRAGMA table_info(runs)').all().map((c) => c.name))
+    if (!columns.has('summary')) db.exec('ALTER TABLE runs ADD COLUMN summary TEXT')
+    if (!columns.has('summarySig')) db.exec('ALTER TABLE runs ADD COLUMN summarySig TEXT')
   }
 
   remember(file, meta, createdAt) {
@@ -39,6 +94,7 @@ export class RunCatalog {
       createdAt,
     }
     this.live.set(key, row)
+    this.cache.delete(key)
     if (!this.index) return
     mkdirSync(dirname(this.index), { recursive: true, mode: 0o700 })
     const db = new DatabaseSync(this.index)
@@ -46,56 +102,126 @@ export class RunCatalog {
       db.exec(`PRAGMA busy_timeout=1000;
         CREATE TABLE IF NOT EXISTS runs (
           key TEXT PRIMARY KEY, file TEXT NOT NULL, runId TEXT NOT NULL, parentId TEXT NOT NULL,
-          repoName TEXT NOT NULL, specId TEXT NOT NULL, total INTEGER NOT NULL, createdAt INTEGER NOT NULL
+          repoName TEXT NOT NULL, specId TEXT NOT NULL, total INTEGER NOT NULL, createdAt INTEGER NOT NULL,
+          summary TEXT, summarySig TEXT
         )`)
-      db.prepare('INSERT OR REPLACE INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
-        key,
-        file,
-        row.runId,
-        row.parentId,
-        row.repoName,
-        row.specId,
-        row.total,
-        row.createdAt,
-      )
+      this.#ensureCacheColumns(db)
+      // Keep any cached summary on re-open; its signature decides whether it is
+      // still current, so a restart does not need to reread every settled ledger.
+      db.prepare(
+        `INSERT INTO runs(key,file,runId,parentId,repoName,specId,total,createdAt,summary,summarySig)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+        ON CONFLICT(key) DO UPDATE SET
+          file=excluded.file, runId=excluded.runId, parentId=excluded.parentId,
+          repoName=excluded.repoName, specId=excluded.specId, total=excluded.total,
+          createdAt=excluded.createdAt`,
+      ).run(key, file, row.runId, row.parentId, row.repoName, row.specId, row.total, row.createdAt)
     } finally {
       db.close()
     }
   }
 
-  entries() {
-    const known = new Map(this.live)
+  // A session filter runs inside the index query, so one conversation's board
+  // never loads another conversation's rows. Rows carry their cached summary
+  // when available; an index from before the cache columns reads them as NULL.
+  entries(parent = null) {
+    const known = new Map()
     if (this.index && existsSync(this.index)) {
       const db = new DatabaseSync(this.index, { readOnly: true })
       try {
-        for (const row of db
-          .prepare('SELECT key,file,runId,parentId,repoName,specId,total,createdAt FROM runs')
-          .all()) {
-          if (!known.has(row.key)) known.set(row.key, row)
-        }
+        const columns = new Set(db.prepare('PRAGMA table_info(runs)').all().map((c) => c.name))
+        const summary =
+          columns.has('summary') && columns.has('summarySig')
+            ? 'summary,summarySig'
+            : 'NULL AS summary,NULL AS summarySig'
+        const statement = db.prepare(
+          `SELECT key,file,runId,parentId,repoName,specId,total,createdAt,${summary} FROM runs` +
+            (parent === null ? '' : ' WHERE parentId=?'),
+        )
+        for (const row of parent === null ? statement.all() : statement.all(parent))
+          known.set(row.key, row)
       } finally {
         db.close()
       }
     }
+    // Entries remembered this process but not yet in the index stay visible and
+    // win over the index row, as before.
+    for (const [key, live] of this.live) {
+      if (parent !== null && live.parentId !== parent) continue
+      const cached = known.get(key)
+      known.set(key, { ...cached, ...live, summary: cached?.summary ?? null, summarySig: cached?.summarySig ?? null })
+    }
     return [...known.values()].sort((a, b) => b.createdAt - a.createdAt || a.key.localeCompare(b.key))
+  }
+
+  // A history row's summary: memory, then the persisted index, then the ledger.
+  // Only a signature change (a write) reopens a ledger, so a settled history is
+  // read once regardless of how many runs the board lists.
+  #cachedSummary(entry, file, indexSummary, indexSignature, signature, coordinator) {
+    if (signature) {
+      const memo = this.cache.get(entry.key)
+      if (memo && memo.signature === signature) return memo.summary
+      if (indexSummary && indexSignature === signature) {
+        const summary = JSON.parse(indexSummary)
+        this.cache.set(entry.key, { signature, summary })
+        return summary
+      }
+    }
+    this.ledgerOpens++
+    const summary = summaryOf(readLedger(file, entry, false, coordinator.maxWorkers))
+    if (signature) this.#storeSummary(entry.key, summary, signature)
+    return summary
+  }
+
+  #storeSummary(key, summary, signature) {
+    this.cache.set(key, { signature, summary })
+    if (!this.index) return
+    try {
+      const db = new DatabaseSync(this.index)
+      try {
+        db.exec('PRAGMA busy_timeout=1000;')
+        this.#ensureCacheColumns(db)
+        db.prepare('UPDATE runs SET summary=?,summarySig=? WHERE key=?').run(
+          JSON.stringify(summary),
+          signature,
+          key,
+        )
+      } finally {
+        db.close()
+      }
+    } catch {
+      // The cache is advisory: a busy index just means the next read recomputes.
+    }
   }
 
   // parent limits the view to runs started by that captain session. captainOf
   // returns a loaded captain's model route; unloaded captains show none.
+  // The selected run's detail is read on demand; every other row is a cached
+  // summary, so an unreadable unrelated ledger cannot hide the selected run.
   read(coordinator, key, parent = null, captainOf = () => undefined) {
-    const known = this.entries().filter((entry) => parent === null || entry.parentId === parent)
+    const known = this.entries(parent)
     if (key && !known.some((entry) => entry.key === key)) return null
     const selectedKey = key ?? known[0]?.key
     let selected = null
-    const runs = known.map(({ file, ...entry }) => {
+    const runs = known.map((row) => {
+      const { file, summary, summarySig, ...entry } = row
       const detail = entry.key === selectedKey
       const attached = coordinator.runs.has(file)
       let data
       try {
-        data =
-          attached && detail
-            ? coordinator.peek(file)
-            : readLedger(file, entry, detail, coordinator.maxWorkers)
+        if (attached) {
+          data = coordinator.peek(file)
+          if (!data) throw new Error('run is no longer attached')
+        } else if (detail) {
+          const signature = ledgerSignature(file)
+          this.ledgerOpens++
+          data = readLedger(file, entry, true, coordinator.maxWorkers)
+          // Refresh the cache only when the ledger changed since it was last read.
+          if (signature && this.cache.get(entry.key)?.signature !== signature)
+            this.#storeSummary(entry.key, summaryOf(data), signature)
+        } else {
+          data = this.#cachedSummary(entry, file, summary, summarySig, ledgerSignature(file), coordinator)
+        }
       } catch {
         // Keep moved/deleted/unavailable repositories visible without inventing progress.
         data = {
@@ -103,11 +229,11 @@ export class RunCatalog {
           mode: 'unavailable',
           complete: false,
           counts: {},
-          diagnostic: '无法读取这轮任务的 SQLite 记录。请确认原仓库及运行记录仍然可用。',
+          diagnostic: unreadableDiagnostic,
           tickets: [],
         }
       }
-      const summary = {
+      const summaryRow = {
         ...entry,
         attached,
         available: data.available ?? true,
@@ -116,13 +242,13 @@ export class RunCatalog {
         counts: data.counts,
         verifiedSha: data.verifiedSha ?? null,
         integrationRef: data.integrationRef ?? null,
-        maxWorkers: data.maxWorkers ?? null,
+        maxWorkers: capWorkers(data.rawMaxWorkers ?? data.maxWorkers, coordinator.maxWorkers),
         diagnostic: displayDiagnostic(data.diagnostic),
       }
       const route = detail ? captainOf(entry.parentId) : undefined
       if (detail)
         selected = {
-          ...summary,
+          ...summaryRow,
           captain: route?.model ? { provider: route.provider ?? '', model: route.model } : null,
           // The plan review offers the current presets; approval resolves them on the host.
           // Every other mode only reads them to name each ticket's frozen agent.
@@ -163,13 +289,16 @@ export class RunCatalog {
             appendedAt: t.appendedAt ?? null,
           })),
         }
-      return summary
+      return summaryRow
     })
     return { runs, selected }
   }
 }
 
-function readLedger(file, entry, detail, globalLimit) {
+// Read one ledger. `detail` also loads each ticket row; otherwise only the run
+// row and status counts are read. Exported so the history benchmark can measure
+// the pre-cache cost without duplicating the queries.
+export function readLedger(file, entry, detail, globalLimit) {
   const db = new DatabaseSync(file, { readOnly: true })
   try {
     db.exec('PRAGMA trusted_schema=OFF; PRAGMA query_only=ON; BEGIN')
@@ -191,6 +320,8 @@ function readLedger(file, entry, detail, globalLimit) {
     const result = {
       ...run,
       maxWorkers: Math.min(globalLimit, run.maxWorkers),
+      // Kept raw so a later host-limit change re-applies without reopening the ledger.
+      rawMaxWorkers: run.maxWorkers ?? null,
       total,
       counts,
       complete: total > 0 && counts.INTEGRATED === total,
