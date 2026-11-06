@@ -163,7 +163,7 @@ DeepSeek Harness 的本地 Git 工单调度插件。队长交给它一个已确�
 
 1. **只删账本记录**：只用账本里该工单自己的路径和分支，路径必须位于插件的 worktree 根目录之内，主 worktree 一律拒绝。
 2. **拒绝集成 / base 分支**：分支名等于本轮集成分支或清单 `base_ref` 指向的本地分支时拒绝；另一 worktree 检出了该分支、或该路径检出的是别的分支时也拒绝。
-3. **先确认已合入且无未提交改动**：工单分支不是集成分支的祖先时跳过（“not merged”）；worktree 有未提交改动时跳过（“uncommitted changes”）；路径存在但不是已登记的 worktree 时也跳过。跳过不报错，原因记在该工单上。
+3. **先确认已合入且无本地文件**：工单分支不是集成分支的祖先时跳过（“not merged”）；worktree 有 tracked 改动、未跟踪文件或被 Git 忽略的文件时跳过并保留现场（“uncommitted local files”，原因列出类别和文件名）；路径存在但不是已登记的 worktree 时也跳过。自动和手动清理规则相同，所以留有 `node_modules` 等被忽略目录的 worktree 也会保留，处理后可用 `dag_cleanup` 重试。跳过不报错，原因记在该工单上。
 4. **不强制删除**：依次执行 `git worktree remove`（不带 `--force`）、以集成分支为上游的 `git branch -d`（不用 `-D`）和 `git worktree prune`。
 5. **集成分支永不删除**：`integration/<runId>` 是交付分支，清理只读取它来判断是否已合入。
 
