@@ -791,6 +791,27 @@ function reviewRun() {
   }
 }
 
+test('plan review lists each check command, marks the ones the captain wrote and names unchecked tasks', () => {
+  const selected = {
+    ...reviewRun(),
+    checks: { 'py-test': [['uv', 'run', 'pytest', '-q']], lint: [['ruff', 'check', '.']] },
+    planChecks: ['py-test'],
+  }
+  selected.tickets = selected.tickets.map((t) => ({
+    ...t,
+    verify: { A: ['py-test', 'lint'], C: ['py-test'], T: ['py-test'] }[t.id] ?? [],
+  }))
+  const host = loadHost([{ runs: [selected], selected }, selected.key])
+  const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  const block = find(pane, (n) => n.props['aria-label'] === '验收命令')
+  assert.ok(block, 'the review has a check block')
+  const rows = findAll(block, (n) => n.props['data-dag-check'] !== undefined)
+  assert.deepEqual(rows.map((r) => r.props['data-dag-check']), ['py-test', 'lint'])
+  assert.match(text(rows[0]), /队长编写，需你确认.*A、C、T.*uv run pytest -q/)
+  assert.match(text(rows[1]), /插件配置.*A.*ruff check \./)
+  assert.match(text(find(block, (n) => n.props['data-dag-unchecked'] !== undefined)), /B、D 不跑验收命令/)
+})
+
 test('plan review: named members with their tasks and model, compact task list, map and fixed actions', () => {
   const selected = reviewRun()
   const host = loadHost([{ runs: [selected], selected }, selected.key])

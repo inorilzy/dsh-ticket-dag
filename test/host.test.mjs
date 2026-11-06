@@ -354,11 +354,16 @@ test('the captain section says when to use the plugin, names Agent Teams, lists 
   assert.match(text, /two or more tickets/i, 'used only when the work splits into 2+ tickets')
   assert.match(text, /explicitly/i)
   assert.match(text, /\/dag/)
+  assert.match(text, /contains "Agent Teams".*always activates/i, 'the keyword is a forced trigger')
   assert.match(text, /lint.*unit-tests|unit-tests.*lint/s, 'the configured check IDs are listed by name')
-  assert.match(text, /no .*check|configure/i, 'the captain is told what to do when no check fits')
+  assert.match(text, /verification is optional/i, 'verify may be left empty')
+  assert.match(text, /"checks"/, 'the captain may write its own checks into the manifest')
+  assert.match(text, /approves these commands/i, 'and the user approves them')
   // The live settings are read each time, so a newly saved check shows up.
   const none = harness({ checks: {} }).sections.find((s) => s.name === 'tool:dsh-ticket-dag')
-  assert.match(typeof none.text === 'function' ? none.text() : none.text, /no verification checks are configured/i)
+  const noneText = typeof none.text === 'function' ? none.text() : none.text
+  assert.match(noneText, /no checks configured/i)
+  assert.doesNotMatch(noneText, /stop and ask the user/i, 'an empty profile no longer blocks the captain')
   await h.close()
 })
 
@@ -402,5 +407,30 @@ test('a user message starting with /dag adds a captain directive with the goal; 
   assert.equal(await run([user('/dag A'), { id: 'a', source: { kind: 'assistant' }, content: [] }, user('继续')]), enter)
   // Workers never receive the captain directive.
   assert.notEqual((await run([user('/dag X')], h.child)).messages?.at(-1)?.source?.kind, 'dsh-ticket-dag-command')
+  await h.close()
+})
+
+test('a user message containing Agent Teams anywhere adds the captain directive with the whole message as the goal', async () => {
+  const h = harness()
+  const step = h.events.get('agent/pre-step')
+  const user = (text) => ({ id: 'u', source: { kind: 'user' }, content: [{ type: 'text', text }] })
+  const enter = { kind: 'enter', messages: [] }
+  const run = (messages, agent = h.root) => step({ agent, messages, signal: new AbortController().signal }, async () => enter)
+
+  for (const text of ['帮我用 Agent Teams 重构登录模块', 'agent teams：补测试', '组建一个 agent team 做这个', '用AgentTeams做', 'use agent-teams here']) {
+    const directive = (await run([user(text)])).messages.at(-1)
+    assert.equal(directive?.source?.kind, 'dsh-ticket-dag-command', text)
+    assert.match(directive.content[0].text, /Agent Teams keyword/, text)
+    assert.ok(directive.content[0].text.includes('Goal: ' + text), text)
+  }
+  // Other words that only contain the letters, and other team words, are left to the model.
+  for (const text of ['subagent team', 'agentteamsx', '组建团队', 'ticket DAG 跑一下']) assert.equal(await run([user(text)]), enter, text)
+  // /dag wins over the keyword, so one message adds exactly one directive.
+  const both = await run([user('/dag 用 Agent Teams 做 X')])
+  assert.equal(both.messages.length, 1)
+  assert.match(both.messages[0].content[0].text, /\/dag command[\s\S]*Goal: 用 Agent Teams 做 X/)
+  // Only the latest user message counts, and workers never receive the directive.
+  assert.equal(await run([user('Agent Teams A'), { id: 'a', source: { kind: 'assistant' }, content: [] }, user('继续')]), enter)
+  assert.notEqual((await run([user('Agent Teams X')], h.child)).messages?.at(-1)?.source?.kind, 'dsh-ticket-dag-command')
   await h.close()
 })

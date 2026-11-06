@@ -180,6 +180,9 @@ window.__ModuleLoader__.load({
 .dtd-panel .dtd-task-row:hover {background:color-mix(in srgb,currentColor 5%,transparent)}
 .dtd-chip {display:inline-grid;place-items:center;min-width:1.75rem;height:1.6rem;padding:0 .3rem;border-radius:.35rem;background:color-mix(in srgb,currentColor 14%,transparent);font-weight:700;font-size:.84rem}
 .dtd-task-title {font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dtd-checks {list-style:none;margin:0;padding:0;display:grid}
+.dtd-check {display:flex;flex-wrap:wrap;align-items:center;gap:.4rem .75rem;border-top:1px solid var(--dtd-line);padding:.5rem .15rem}
+.dtd-check-cmd {flex-basis:100%;font-family:ui-monospace,monospace;font-size:.84rem;white-space:pre-wrap;word-break:break-all}
 .dtd-chevron {opacity:.6;font-size:1.15rem;line-height:1;transition:transform .15s}.dtd-task-row[aria-expanded=true] .dtd-chevron {transform:rotate(90deg)}
 .dtd-task-edit {padding:.1rem .15rem .75rem 2.5rem}.dtd-task-edit select {width:100%}
 .dtd-panel .dtd-node.dtd-node-compact {padding:.55rem .7rem;border-radius:.6rem;gap:.3rem;background:color-mix(in srgb,currentColor 4%,var(--dsw-alias-bg-layer-1,Canvas))}
@@ -1703,6 +1706,15 @@ window.__ModuleLoader__.load({
       const edges = run.tickets.reduce((n, t) => n + t.dependsOn.length, 0)
       const byId = new Map(run.tickets.map((t) => [t.id, t]))
       const rows = run.tickets.map((ticket) => ({ ticket, view: ticketView(ticket, byId, 'staged') }))
+      // Every check the plan runs, with its commands and the tasks that use it.
+      const ownChecks = new Set(run.planChecks ?? [])
+      const checkRows = Object.entries(run.checks ?? {}).map(([id, commands]) => ({
+        id,
+        commands,
+        own: ownChecks.has(id),
+        users: run.tickets.filter((t) => (t.verify ?? []).includes(id)).map((t) => t.id),
+      }))
+      const unchecked = run.tickets.filter((t) => !(t.verify ?? []).length).map((t) => t.id)
       const changed = owners !== null || routes !== null
       const allChecked = memberIds.length > 0 && memberIds.every((id) => checked.has(id))
       const toggle = (id) =>
@@ -1909,6 +1921,34 @@ window.__ModuleLoader__.load({
               )
             }),
           ),
+        ),
+        h(
+          'section',
+          { className: 'dtd-block', 'aria-label': '验收命令' },
+          h('h4', null, '验收命令'),
+          checkRows.length
+            ? h(
+                'ul',
+                { className: 'dtd-checks' },
+                ...checkRows.map(({ id, commands, own, users }) =>
+                  h(
+                    'li',
+                    { key: id, className: 'dtd-check', 'data-dag-check': id },
+                    h('span', { className: 'dtd-chip' }, id),
+                    h('span', { className: 'dtd-hint' }, own ? '队长编写，需你确认' : '插件配置'),
+                    h('span', { className: 'dtd-hint' }, users.join('、')),
+                    ...commands.map((argv, i) => h('code', { key: i, className: 'dtd-check-cmd' }, argv.join(' '))),
+                  ),
+                ),
+              )
+            : null,
+          unchecked.length
+            ? h(
+                'p',
+                { className: 'dtd-hint', 'data-dag-unchecked': true },
+                unchecked.join('、') + ' 不跑验收命令，干净合并即集成。',
+              )
+            : null,
         ),
         h(
           'section',

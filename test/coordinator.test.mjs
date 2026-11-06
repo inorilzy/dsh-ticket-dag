@@ -1159,6 +1159,108 @@ test('tickets appended to a staged run wait for the user and are approved with t
   }
 })
 
+test('a ticket without checks integrates after a clean merge, with an empty profile registry', { timeout: limit(60000) }, async (t) => {
+  const cwd = await repo(t)
+  const prompts = []
+  const co = new Coordinator({
+    checks: {},
+    launch: async (job) => {
+      prompts.push(job.prompt)
+      return {
+        dispose: async () => {},
+        result: (async () => {
+          await commit(job)
+          return { ok: true }
+        })(),
+      }
+    },
+  })
+  const q = { cwd, parentId: 'captain', runId: 'no-checks' }
+  try {
+    const started = await co.start({
+      ...q,
+      manifest: { spec_id: 'nochk', tickets: [{ id: 'A', title: 'A' }, { id: 'B', title: 'B', depends_on: ['A'], verify: [] }] },
+    })
+    assert.equal(started.mode, 'active', 'no captain-written commands, so nothing waits for approval')
+    const done = await until(async () => {
+      const s = await co.status(q)
+      if (s.counts.NEEDS_ATTENTION) throw Error(JSON.stringify(s))
+      return s.complete && s
+    }, 'unchecked tickets integrated')
+    assert.deepEqual(done.tickets.map((r) => r.verify), [[], []])
+    assert.equal(await git(cwd, 'show', 'integration/no-checks:B.txt'), 'B')
+    assert.match(prompts[0], /No automatic check is attached/)
+  } finally {
+    await co.close()
+  }
+})
+
+test('checks the captain writes into the manifest wait for approval even without requireApproval, then run', { timeout: limit(60000) }, async (t) => {
+  const cwd = await repo(t)
+  const ran = join(cwd, '..', 'captain-check-ran')
+  let launched = 0
+  const co = new Coordinator({
+    checks: noopChecks,
+    requireApproval: false,
+    launch: async (job) => {
+      launched++
+      return {
+        dispose: async () => {},
+        result: (async () => {
+          await commit(job)
+          return { ok: true }
+        })(),
+      }
+    },
+  })
+  const q = { cwd, parentId: 'captain', runId: 'own-checks' }
+  const own = { 'own-test': [[process.execPath, '-e', "require('node:fs').writeFileSync(process.argv[1], 'ok')", ran]] }
+  try {
+    // A manifest check may not reuse a profile check ID.
+    await assert.rejects(
+      co.start({ ...q, runId: 'clash', manifest: { spec_id: 'clash', checks: { verify: own['own-test'] }, tickets: [ticket('A')] } }),
+      /already a profile check/,
+    )
+    const started = await co.start({
+      ...q,
+      manifest: { spec_id: 'own', checks: own, tickets: [{ id: 'A', title: 'A', verify: ['own-test', 'verify'] }] },
+    })
+    assert.equal(started.mode, 'staged', 'captain-written commands always wait for the user')
+    assert.deepEqual(started.planChecks, ['own-test'])
+    assert.deepEqual(started.checks['own-test'], own['own-test'], 'the review sees the exact commands')
+    await sleep(300)
+    assert.equal(launched, 0)
+    // dag_add may reuse the manifest's check but cannot bring a new command past the review.
+    await assert.rejects(
+      co.add({ ...q, tickets: [{ id: 'X', title: 'X', verify: ['sneaky'] }] }),
+      /unknown verification check: sneaky/,
+    )
+    await co.add({ ...q, tickets: [{ id: 'B', title: 'B', depends_on: ['A'], verify: ['own-test'] }] })
+    const [file] = co.runs.keys()
+    await co.approve(file, [])
+    const done = await until(async () => {
+      const s = await co.status(q)
+      if (s.counts.NEEDS_ATTENTION) throw Error(JSON.stringify(s))
+      return s.complete && s
+    }, 'approved own checks ran and integrated')
+    assert.equal(done.diagnostic, null)
+    assert.equal(await readFile(ran, 'utf8'), 'ok', 'the captain-written command ran in the candidate')
+    await co.close()
+    // A new coordinator restores the run's own commands from the manifest and stays trusted.
+    const reopened = new Coordinator({ checks: noopChecks, launch: async () => ({ dispose: async () => {}, result: new Promise(() => {}) }) })
+    try {
+      const after = await reopened.status(q)
+      await sleep(300)
+      assert.equal((await reopened.status(q)).diagnostic, null)
+      assert.equal(after.complete, true)
+    } finally {
+      await reopened.close()
+    }
+  } finally {
+    await co.close()
+  }
+})
+
 test(
   'a completed run reopened by dag_add notifies completion again and cleans only the new tickets',
   { timeout: limit(90000) },

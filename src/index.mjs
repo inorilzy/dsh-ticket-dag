@@ -59,41 +59,50 @@ const sourceKind = 'dsh-ticket-dag'
 const commandSource = 'dsh-ticket-dag-command'
 // /dag alone or followed by whitespace; /dagger and mid-sentence mentions do not count.
 const commandPattern = /^\/dag(?=$|\s)/u
+// Agent Teams, agent team, AgentTeams, agent-teams in any case, also right next to Chinese text;
+// "agentteamsx" or "subagent team" do not count.
+const keywordPattern = /(?<![a-z0-9])agent[\s_-]*teams?(?![a-z0-9])/i
 
+// How the captain verifies tickets: verify is optional, profile checks are
+// listed by ID, and the manifest may carry its own commands for the user to approve.
 function checkList(checks) {
   const ids = Object.keys(checks ?? {})
-  if (!ids.length)
-    return 'No verification checks are configured in this profile. Do not invent check IDs: stop and ask the user to add one under Plugins > dsh-ticket-dag > Configure (for example a test command), then continue.'
-  return (
-    'Verification check IDs you may use in each ticket verify list (each runs a trusted command in the candidate checkout): ' +
-    ids.map((id) => id + ' = ' + checks[id].map((argv) => argv.join(' ')).join(' && ')).join('; ') +
-    '. If none of them checks the work, stop and ask the user to configure a suitable one instead of picking an unrelated ID.'
-  )
+  return [
+    'Verification is optional per ticket. A ticket with an empty or omitted verify list integrates after its commit merges cleanly, with no command run; use that for docs or other work no command can check.',
+    ids.length
+      ? 'Profile check IDs (trusted, no approval needed): ' +
+        ids.map((id) => id + ' = ' + checks[id].map((argv) => argv.join(' ')).join(' && ')).join('; ') +
+        '.'
+      : 'This profile has no checks configured.',
+    'When code needs a check none of those cover, add your own to the manifest: "checks": {"<id>": [["program", "arg", ...], ...]}, each argv run in order without a shell in the candidate checkout, then name the id in verify. Derive the command from this repository (its test runner, lockfile, CI), never assume one; prefer a fast, targeted command; IDs must differ from profile IDs. The user sees and approves these commands with the plan (a manifest with its own checks always waits for approval). Never invent a check that only pretends to verify.',
+  ].join(' ')
 }
 
 export function captainSection({ checks, agents }) {
   const presets = Object.keys(agents ?? {})
   return [
     'dsh-ticket-dag is this profile’s Agent Teams plugin: it runs a coding goal as a DAG of tickets, one worker per ticket in its own git worktree, verified and merged into an integration branch.',
-    'Use it only when the user explicitly asks for it (Agent Teams, agent team, teams, 工单团队, ticket DAG, or the /dag command) and the work splits into two or more tickets. Mentioning, discussing or declining it is not a request. A single small change is done directly, without dag_run.',
+    'A user message that starts with /dag or contains "Agent Teams" (any case, also agent team or AgentTeams) always activates it, and the host then adds a directive for that step. Otherwise use it only when the user explicitly asks for it (teams, 工单团队, ticket DAG) and the work splits into two or more tickets; mentioning, discussing or declining it is not a request, and a single small change is done directly, without dag_run.',
     'As captain: read the code first, split the goal into tickets with id, title, a self-contained prompt, depends_on for genuine prerequisites, acceptance, verify and agent' +
       (presets.length ? ' (presets: ' + presets.join(', ') + ')' : '') +
       ', then call dag_run in the current repository. ' +
       checkList(checks),
-    'Only the top-level captain may use dag_* tools. Keep the runId. When dag_run returns mode staged, tell the user to review and approve the plan in the 「工单 · <runId>」 tab of the right sidebar, then end the turn; after starting, end the turn when only waiting remains. The host schedules work and notifies you. Use dag_status for inspection, dag_resume after a host restart, and dag_retry only after addressing the specified ticket blocker. dag_cleanup removes the worktrees and branches of integrated tickets in a run. dag_add appends tickets to a run: they need no user approval but must still pass their verification checks. Workers complete their own assignment and leave orchestration to the captain.',
+    'Only the top-level captain may use dag_* tools. Keep the runId. When dag_run returns mode staged, tell the user to review and approve the plan in the 「工单 · <runId>」 tab of the right sidebar, then end the turn; after starting, end the turn when only waiting remains. The host schedules work and notifies you. Use dag_status for inspection, dag_resume after a host restart, and dag_retry only after addressing the specified ticket blocker. dag_cleanup removes the worktrees and branches of integrated tickets in a run. dag_add appends tickets to a run: they need no user approval, may use profile checks or the checks already in the run manifest, and cannot add new commands. Workers complete their own assignment and leave orchestration to the captain.',
   ].join('\n')
 }
 
-// The goal of the latest user message when it starts with /dag; undefined otherwise.
-function invokedGoal(messages) {
+// The latest user message activates the plugin when it starts with /dag or names Agent Teams anywhere.
+function invocation(messages) {
   const last = [...(messages ?? [])].reverse().find((m) => m?.source?.kind === 'user')
-  const text = last?.content?.find((block) => block.type === 'text')?.text?.trimStart() ?? ''
-  return commandPattern.test(text) ? text.slice(4).trim() : undefined
+  const text = last?.content?.find((block) => block.type === 'text')?.text?.trim() ?? ''
+  if (commandPattern.test(text)) return { trigger: 'the /dag command', goal: text.slice(4).trim() }
+  if (keywordPattern.test(text)) return { trigger: 'the Agent Teams keyword', goal: text }
+  return undefined
 }
 
-function commandDirective(goal, checks) {
+function commandDirective({ trigger, goal }, checks) {
   return [
-    'The user invoked /dag, the Agent Teams command. Follow the dsh-ticket-dag captain rules in your system instructions.',
+    'The user activated dsh-ticket-dag, this profile’s Agent Teams plugin, with ' + trigger + '. Follow the dsh-ticket-dag captain rules in your system instructions.',
     'Inspect the repository, split the goal into two or more tickets with genuine dependencies only, and call dag_run in this repository. If it returns staged, ask the user to review the plan in the right sidebar and end the turn; do not approve it yourself.',
     checkList(checks),
     goal ? 'Goal: ' + goal : 'No goal was given: ask the user what the team should accomplish.',
@@ -303,14 +312,14 @@ export function apply(ctx, config = {}) {
     if (!(await mayRun(agent))) return { kind: 'reject' }
     const decision = await next()
     if (decision?.kind !== 'enter' || !topLevel(agent)) return decision
-    const goal = invokedGoal(messages)
-    if (goal === undefined) return decision
+    const invoked = invocation(messages)
+    if (invoked === undefined) return decision
     return {
       ...decision,
       messages: [
         ...decision.messages,
         createUserMessage({
-          content: [{ type: 'text', text: commandDirective(goal, settings().checks) }],
+          content: [{ type: 'text', text: commandDirective(invoked, settings().checks) }],
           source: { kind: commandSource },
         }),
       ],
@@ -375,7 +384,7 @@ export function apply(ctx, config = {}) {
 
   register(
     'run',
-    'Start the approved spec manifest and return its runId. Reusing a runId with the same manifest is idempotent. Only trusted host check IDs are supported. A ticket may set agent to a configured agent preset ID (for example implementer, test-writer or docs) to give its worker that role and model; omit it for the default worker. When the result mode is staged, nothing has started: the user reviews each ticket preset and model in the 「工单 · <runId>」 tab of the conversation right sidebar and approves or discards the plan there. Tell the user that and end the turn; you are notified once it is approved. dag_resume cannot start a staged run. To add work to this run later, use dag_add instead of a new dag_run.',
+    'Start the approved spec manifest and return its runId. Reusing a runId with the same manifest is idempotent. Each ticket verify list is optional and names check IDs: a profile check, or one defined in the manifest checks object ({"<id>": [["program", "arg"]]}), which the user approves with the plan; a ticket without checks integrates after a clean merge. A ticket may set agent to a configured agent preset ID (for example implementer, test-writer or docs) to give its worker that role and model; omit it for the default worker. When the result mode is staged, nothing has started: the user reviews each ticket preset and model in the 「工单 · <runId>」 tab of the conversation right sidebar and approves or discards the plan there. Tell the user that and end the turn; you are notified once it is approved. dag_resume cannot start a staged run. To add work to this run later, use dag_add instead of a new dag_run.',
     {
       manifest: { type: 'json', required: true, description: 'Ticket DAG manifest object or JSON string.' },
       runId: {
@@ -403,7 +412,7 @@ export function apply(ctx, config = {}) {
   }
   register(
     'add',
-    'Append tickets to an existing run; existing tickets cannot be changed or removed. Each ticket follows the dag_run manifest ticket rules (id, title, prompt, depends_on, verify with trusted check IDs, optional agent); depends_on may name tickets already in the run or in this batch. Appended tickets need no user approval and are dispatched at once, but must still pass their verification checks; a run still waiting for approval takes them into the plan under review. An agent preset already approved in this run keeps the model the user chose. Repeating an identical batch is harmless. A cancelled run refuses, and a run takes at most the configured number of appended tickets; beyond that start a new run.',
+    'Append tickets to an existing run; existing tickets cannot be changed or removed. Each ticket follows the dag_run manifest ticket rules (id, title, prompt, depends_on, optional verify, optional agent); depends_on may name tickets already in the run or in this batch. verify may name profile checks or checks the run manifest defined; a batch cannot define new commands. Appended tickets need no user approval and are dispatched at once; a run still waiting for approval takes them into the plan under review. An agent preset already approved in this run keeps the model the user chose. Repeating an identical batch is harmless. A cancelled run refuses, and a run takes at most the configured number of appended tickets; beyond that start a new run.',
     {
       runId,
       tickets: {

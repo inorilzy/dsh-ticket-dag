@@ -78,7 +78,10 @@ function strings(value, field, validator = text) {
 
 function commandExists(registry, name) {
   if (!Object.hasOwn(registry, name)) throw new TypeError('unknown verification check: ' + name)
-  const commands = registry[name]
+  argvList(registry[name], name)
+}
+
+function argvList(commands, name) {
   if (
     !Array.isArray(commands) ||
     commands.length === 0 ||
@@ -129,8 +132,8 @@ function normalizeTickets(list, checkRegistry, agentRegistry) {
     const title = text(raw.title, id + '.title')
     const prompt = text(raw.prompt ?? raw.description ?? title, id + '.prompt')
     const dependsOn = strings(raw.dependsOn ?? raw.depends_on, id + '.dependsOn', safeId)
+    // Optional: a ticket without checks integrates after a clean trial merge.
     const verify = strings(raw.verify, id + '.verify', safeId)
-    if (!verify.length) throw new TypeError(id + ': at least one verification check is required')
     verify.forEach((name) => commandExists(checkRegistry, name))
     const acceptance = strings(raw.acceptance, id + '.acceptance')
     const ticket = { id, title, prompt, dependsOn, verify, acceptance }
@@ -193,9 +196,46 @@ export function normalizeManifest(input, checkRegistry = {}, agentRegistry = {})
   if (!Array.isArray(input.tickets) || !input.tickets.length)
     throw new TypeError('tickets must be a non-empty array')
   const externalInputs = strings(input.externalInputs ?? input.external_inputs, 'externalInputs')
-  const tickets = normalizeTickets(input.tickets, checkRegistry, agentRegistry)
+  const checks = planChecks(input.checks, checkRegistry)
+  const tickets = normalizeTickets(input.tickets, { ...checkRegistry, ...checks }, agentRegistry)
   checkGraph(tickets, externalInputs)
-  return { specId, baseRef, maxWorkers, tickets, ...(externalInputs.length ? { externalInputs } : {}) }
+  return {
+    specId,
+    baseRef,
+    maxWorkers,
+    tickets,
+    ...(externalInputs.length ? { externalInputs } : {}),
+    ...(Object.keys(checks).length ? { checks } : {}),
+  }
+}
+
+const planCheckLimit = 20
+const planCommandLimit = 10
+const planArgLimit = 4096
+
+/**
+ * Checks the captain writes into the manifest: { id: [argv, ...] }. They run
+ * only after the user approves the plan, and may not reuse a profile check ID,
+ * so a ticket's verify ID names exactly one command list.
+ */
+function planChecks(value, profileChecks) {
+  if (value === undefined) return {}
+  record(value, 'checks')
+  const ids = Object.keys(value)
+  if (ids.length > planCheckLimit) throw new RangeError('checks takes at most ' + planCheckLimit + ' IDs')
+  const checks = {}
+  for (const id of ids) {
+    safeId(id, 'check ID')
+    if (Object.hasOwn(profileChecks, id))
+      throw new TypeError('check ' + id + ' is already a profile check; use it by ID or pick another ID')
+    argvList(value[id], id)
+    if (value[id].length > planCommandLimit)
+      throw new RangeError('check ' + id + ' takes at most ' + planCommandLimit + ' commands')
+    if (value[id].some((argv) => argv.some((arg) => arg.length > planArgLimit)))
+      throw new RangeError('check ' + id + ' has an argument longer than ' + planArgLimit + ' characters')
+    checks[id] = value[id].map((argv) => [...argv])
+  }
+  return checks
 }
 
 /**

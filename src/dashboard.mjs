@@ -134,6 +134,9 @@ export class RunCatalog {
             model: p?.model ?? '',
             reasoningEffort: p?.reasoningEffort ?? '',
           })),
+          // Commands of the checks the run uses; the plan review shows them for approval.
+          checks: data.checks ?? {},
+          planChecks: data.planChecks ?? [],
           tickets: data.tickets.map((t) => ({
             id: t.id,
             title: t.title,
@@ -142,6 +145,7 @@ export class RunCatalog {
             model: t.model ?? null,
             route: t.route ?? null,
             dependsOn: t.dependsOn,
+            verify: t.verify ?? [],
             attempt: t.attempt,
             path: t.path,
             branch: t.branch,
@@ -204,15 +208,17 @@ function readLedger(file, entry, detail, globalLimit) {
       result.tickets = db
         .prepare(
           `SELECT id,json_extract(definition,'$.title') AS title,
-        json_extract(definition,'$.dependsOn') AS deps,status,attempt,baseSha,sourceSha,landedSha,
+        json_extract(definition,'$.dependsOn') AS deps,json_extract(definition,'$.verify') AS checkIds,
+        status,attempt,baseSha,sourceSha,landedSha,
         path,branch,childId,message,autoRetries,retryAt,${cleanup},json_extract(definition,'$.agent') AS agent,
         json_extract(definition,'$.agentSpec.provider') AS provider,
         json_extract(definition,'$.agentSpec.model') AS modelId FROM tickets ORDER BY position`,
         )
         .all()
-        .map(({ deps, provider, modelId, ...row }) => ({
+        .map(({ deps, checkIds, provider, modelId, ...row }) => ({
           ...row,
           dependsOn: JSON.parse(deps),
+          verify: checkIds ? JSON.parse(checkIds) : [],
           model: modelId ? [provider, modelId].filter(Boolean).join('/') : null,
           livePhase: null,
           appended: appended.has(row.id),

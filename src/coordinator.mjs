@@ -48,6 +48,11 @@ function copyChecks(manifest, registry) {
   }
   return Object.freeze(copy)
 }
+// Profile checks plus the checks the captain wrote into the manifest; a
+// manifest check cannot reuse a profile ID, so neither shadows the other.
+function registryOf(profile, manifest) {
+  return { ...profile, ...(manifest?.checks ?? {}) }
+}
 // Every ticket a run will verify: the submitted manifest plus each dag_add batch.
 function runTickets(db, meta = db.meta()) {
   return { tickets: [...meta.manifest.tickets, ...db.appended().flatMap((b) => b.tickets)] }
@@ -96,7 +101,10 @@ function specPrompt(meta, row, upstream) {
     'Ticket: ' + row.id + ' — ' + row.title,
     row.agentSpec?.instructions ? 'Role (' + row.agent + '): ' + row.agentSpec.instructions : '',
     row.prompt,
-    'Acceptance: ' + JSON.stringify(row.acceptance) + '. Required check IDs: ' + JSON.stringify(row.verify),
+    'Acceptance: ' + JSON.stringify(row.acceptance) + '. ' +
+      (row.verify.length
+        ? 'Required check IDs: ' + JSON.stringify(row.verify) + ' (the coordinator runs them after you commit).'
+        : 'No automatic check is attached: the coordinator only trial-merges your commit, so test your own change before committing.'),
     'When work is complete, commit all intended changes on this branch and leave git status clean. The final commit message must end with these four separate Git trailers (in a final paragraph). A WIP commit is not a completion receipt:',
     stamp.join('\n'),
     'After the commit, return the commit SHA and a short report.',
@@ -244,17 +252,17 @@ export class Coordinator {
     )
     const manifest = normalizeManifest(input, checks, this.agents)
     const id = safeId(runId ?? 'r-' + hash(parentId + '\0' + manifest.specId).slice(0, 20))
-    const run = await this._open(
-      { cwd, parentId, runId: id },
-      { manifest, checks, mode: this.requireApproval ? 'staged' : 'active' },
-    )
+    // Commands the captain wrote run only after the user approves them, even
+    // with requireApproval off.
+    const mode = this.requireApproval || manifest.checks ? 'staged' : 'active'
+    const run = await this._open({ cwd, parentId, runId: id }, { manifest, checks, mode })
     const meta = run.db.meta()
     requireValue(
       JSON.stringify(meta.manifest) === JSON.stringify(manifest),
       'runId already has a different immutable manifest',
     )
     requireValue(
-      meta.policyHash === policyHash(manifest, checks),
+      meta.policyHash === policyHash(manifest, registryOf(checks, manifest)),
       'Verification registry changed for this run',
     )
     run.limit = Math.min(maxWorkers ?? manifest.maxWorkers, manifest.maxWorkers)
@@ -306,7 +314,7 @@ export class Coordinator {
           repo,
           baseSha,
           manifest: seed.manifest,
-          policyHash: policyHash(seed.manifest, seed.checks),
+          policyHash: policyHash(seed.manifest, registryOf(seed.checks, seed.manifest)),
           mode: seed.mode,
         })
       }
@@ -323,7 +331,7 @@ export class Coordinator {
           'runId already has a different immutable manifest',
         )
         requireValue(
-          policyHash(seed.manifest, seed.checks) === meta.policyHash,
+          policyHash(seed.manifest, registryOf(seed.checks, seed.manifest)) === meta.policyHash,
           'Verification registry changed for this run',
         )
       }
@@ -347,7 +355,7 @@ export class Coordinator {
         owner,
         file,
         root,
-        checks: copyChecks(runTickets(db, meta), seed?.checks ?? this.checks),
+        checks: copyChecks(runTickets(db, meta), registryOf(seed?.checks ?? this.checks, meta.manifest)),
         limit: meta.manifest.maxWorkers,
         serial: Promise.resolve(),
         pump: null,
@@ -570,6 +578,9 @@ export class Coordinator {
         skipped: tickets.filter((t) => t.cleanup === 'skipped').length,
       },
       diagnostic: run.haltError || m.diagnostic || null,
+      // What the user approves: the captain's own check commands, and each ticket's check IDs.
+      checks: run.checks,
+      planChecks: Object.keys(m.manifest.checks ?? {}),
       tickets: tickets.map(
         ({
           id,
@@ -577,6 +588,7 @@ export class Coordinator {
           status,
           attempt,
           dependsOn,
+          verify,
           baseSha,
           sourceSha,
           landedSha,
@@ -609,6 +621,7 @@ export class Coordinator {
                 : null,
           attempt,
           dependsOn,
+          verify,
           baseSha,
           sourceSha,
           landedSha,
@@ -754,7 +767,10 @@ export class Coordinator {
       requireValue(run.db.meta().mode !== 'cancelled', 'A cancelled run cannot take more tickets; start a new run')
       this._checkLedger(run)
       // Frozen commands win over the current settings for check IDs the run already uses.
-      const tickets = normalizeAppend(q.tickets, { ...this.checks, ...run.checks }, this.agents)
+      // A batch may reuse the manifest's own checks but cannot bring new commands:
+      // appended tickets skip the user's review.
+      const registry = registryOf(this.checks, run.db.meta().manifest)
+      const tickets = normalizeAppend(q.tickets, { ...registry, ...run.checks }, this.agents)
       const approval = run.db.events().find((e) => e.type === 'run_approved')
       if (approval) {
         const late = new Set(
@@ -773,7 +789,7 @@ export class Coordinator {
           t.agentSpec = spec
         }
       }
-      const checks = Object.freeze({ ...copyChecks({ tickets }, this.checks), ...run.checks })
+      const checks = Object.freeze({ ...copyChecks({ tickets }, registry), ...run.checks })
       const result = run.db.append(tickets, {
         policyHash: policyHash({ tickets }, checks),
         limit: this.maxAppendedTickets,
