@@ -2068,7 +2068,8 @@ window.__ModuleLoader__.load({
             ? h(
                 'p',
                 { className: 'dtd-hint', 'data-dag-unchecked': true },
-                unchecked.join('、') + ' 不跑验收命令，干净合并即集成。',
+                unchecked.join('、') +
+                  ' 没有本票专属验收命令；候选仍会执行已集成工单的累计回归检查，通过后干净合并即集成。',
               )
             : null,
         ),

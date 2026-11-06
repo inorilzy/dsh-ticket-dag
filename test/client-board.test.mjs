@@ -809,7 +809,8 @@ test('plan review lists each check command, marks the ones the captain wrote and
   assert.deepEqual(rows.map((r) => r.props['data-dag-check']), ['py-test', 'lint'])
   assert.match(text(rows[0]), /队长编写，需你确认.*A、C、T.*uv run pytest -q/)
   assert.match(text(rows[1]), /插件配置.*A.*ruff check \./)
-  assert.match(text(find(block, (n) => n.props['data-dag-unchecked'] !== undefined)), /B、D 不跑验收命令/)
+  assert.match(text(find(block, (n) => n.props['data-dag-unchecked'] !== undefined)), /B、D 没有本票专属验收命令/)
+  assert.match(text(find(block, (n) => n.props['data-dag-unchecked'] !== undefined)), /累计回归检查/)
 })
 
 test('plan review: named members with their tasks and model, compact task list, map and fixed actions', () => {
