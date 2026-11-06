@@ -499,12 +499,46 @@ async function baseBranch(repo, baseRef) {
 }
 
 /**
+ * Why a worktree must stay, or null when nothing local would be lost. A plain
+ * git worktree remove deletes ignored files without complaint, and user config
+ * can hide untracked files or submodule changes, so every option is explicit.
+ */
+async function localFilesReason(wt) {
+  const status = await git(
+    wt,
+    'status',
+    '--porcelain=v1',
+    '--ignored=matching',
+    '--untracked-files=all',
+    '--ignore-submodules=none',
+    '--no-renames',
+    '-z',
+  )
+  if (!status) return null
+  const kinds = { 'tracked changes': [], untracked: [], ignored: [] }
+  for (const entry of status.split('\0').filter(Boolean)) {
+    const code = entry.slice(0, 2)
+    kinds[code === '!!' ? 'ignored' : code === '??' ? 'untracked' : 'tracked changes'].push(entry.slice(3))
+  }
+  // Names only, bounded, and quoted so a hostile file name stays one inert token in the diagnostic.
+  const parts = Object.entries(kinds)
+    .filter(([, names]) => names.length)
+    .map(([kind, names]) => {
+      const shown = names.slice(0, 5).map((name) => JSON.stringify(name.slice(0, 120)))
+      const more = names.length > shown.length ? ', and ' + (names.length - shown.length) + ' more' : ''
+      return kind + ': ' + shown.join(', ') + more
+    })
+  return 'worktree has uncommitted local files (' + parts.join('; ') + '): ' + wt
+}
+
+/**
  * Remove one integrated ticket's recorded worktree and branch. Refuses (throws)
  * a protected branch, a path outside the plugin worktree root, the main
  * worktree, or a branch checked out elsewhere. Skips (with a reason) work not
- * merged into the integration branch or a worktree with local changes. Never
- * forces: git worktree remove, then git branch -d against the integration
- * branch as its upstream, then git worktree prune. Repeating it is harmless.
+ * merged into the integration branch or a worktree holding tracked changes,
+ * untracked or ignored files. Never forces: git worktree remove, then git
+ * branch -d against the integration branch as its upstream, then git worktree
+ * prune. Repeating it is harmless.
  */
 export async function cleanupWorktree(repo, { path, branch, target, baseRef, root }) {
   await checkedRef(repo, target, targetPattern)
@@ -536,8 +570,8 @@ export async function cleanupWorktree(repo, { path, branch, target, baseRef, roo
   if (hasBranch && !(await isAncestor(repo, await resolveRef(repo, ref), await resolveRef(repo, target))))
     return { status: 'skipped', reason: 'ticket branch is not merged into ' + target }
   if (own) {
-    if (await git(wt, 'status', '--porcelain'))
-      return { status: 'skipped', reason: 'worktree has uncommitted changes: ' + wt }
+    const reason = await localFilesReason(wt)
+    if (reason) return { status: 'skipped', reason }
     await git(repo, 'worktree', 'remove', '--', wt)
   }
   if (hasBranch) {

@@ -80,7 +80,7 @@ DeepSeek Harness 的本地 Git 工单调度插件。队长交给它一个已确�
 | `dag_pause` | `runId` | 暂停新工单和新的发布动作；在途 worker 可以提交成果 |
 | `dag_resume` | `runId` | 核对发布记录和真实 Git 后继续就绪队列 |
 | `dag_retry` | `runId, id`，可选 `isolated` | 对指定阻塞工单核对旧现场，接回带当前代次完成标记的新提交（包括队长解决冲突后的提交），否则启动新尝试。无法确认旧 worker 退出时可显式选择 `isolated: true` |
-| `dag_cancel` | `runId` | 终止运行、请求停止已知 worker、保留证据，并对已发出的 Git 发布做对账。取消后的 run 为终态 |
+| `dag_cancel` | `runId` | 终止运行、请求停止已知 worker 和验收进程、保留证据，并对已发出的 Git 发布做对账。取消一落盘就发停止信号，对账失败也不例外：错误写入 `reconcileError` 和 `diagnostic` 并通知队长，未决意图保留在 `pendingPublications`，工单保持 `PUBLISHING`。取消后的 run 为终态。可重复调用：再次发出停止信号并重试对账，目标分支已是候选提交则记为已集成，仍是旧提交则放弃发布，都不是则继续保留 |
 | `dag_cleanup` | `runId` | 手动删除该轮已集成工单的 worktree 和分支（包括已结束的运行），返回每张工单的结果。重复调用无害，见下文“清理” |
 | `dag_add` | `runId, tickets` | 向已有运行追加工单，`tickets` 为工单数组或其 JSON 字符串。无需再次人工确认，但同样要通过验收，见下文“追加工单” |
 | `dag_import` | `spec`，可选 `repo` | 只读：把 GitHub issue 或本地 `.scratch` 中的 spec 和工单转成清单草稿，并给出 `dependencyMode`，见下文“从 spec 和工单导入” |
@@ -160,7 +160,7 @@ DeepSeek Harness 的本地 Git 工单调度插件。队长交给它一个已确�
 
 1. **只删账本记录**：只用账本里该工单自己的路径和分支，路径必须位于插件的 worktree 根目录之内，主 worktree 一律拒绝。
 2. **拒绝集成 / base 分支**：分支名等于本轮集成分支或清单 `base_ref` 指向的本地分支时拒绝；另一 worktree 检出了该分支、或该路径检出的是别的分支时也拒绝。
-3. **先确认已合入且无未提交改动**：工单分支不是集成分支的祖先时跳过（“not merged”）；worktree 有未提交改动时跳过（“uncommitted changes”）；路径存在但不是已登记的 worktree 时也跳过。跳过不报错，原因记在该工单上。
+3. **先确认已合入且无本地文件**：工单分支不是集成分支的祖先时跳过（“not merged”）；worktree 有 tracked 改动、未跟踪文件或被 Git 忽略的文件时跳过并保留现场（“uncommitted local files”，原因列出类别和文件名）；路径存在但不是已登记的 worktree 时也跳过。自动和手动清理规则相同，所以留有 `node_modules` 等被忽略目录的 worktree 也会保留，处理后可用 `dag_cleanup` 重试。跳过不报错，原因记在该工单上。
 4. **不强制删除**：依次执行 `git worktree remove`（不带 `--force`）、以集成分支为上游的 `git branch -d`（不用 `-D`）和 `git worktree prune`。
 5. **集成分支永不删除**：`integration/<runId>` 是交付分支，清理只读取它来判断是否已合入。
 

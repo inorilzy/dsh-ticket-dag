@@ -2,6 +2,10 @@
 
 版本号以 `package.json` 为准。条目整理自 Git 提交记录。
 
+## 未发布
+
+- `dag_cancel`：取消一落盘就向在途 worker 发停止并调用释放入口、取消验收进程，Git 发布对账失败或释放入口抛错都不再跳过。对账错误写入 `reconcileError` 和 `diagnostic` 并通知队长，未决发布意图保留在新增的 `pendingPublications`；重复取消会重试对账，已发布的记为集成，未发布的放弃。
+
 ## 0.14.0
 
 - 试合并内容冲突自动退回：插件中止试合并、清掉候选目录，把工单退回原 worker 在同一 worktree 续做，提示词列出冲突文件并要求合入集成分支。每张工单最多自动退回 2 次（`conflict_requeued` 事件），之后才通知队长。
@@ -11,6 +15,8 @@
 - 新增内置预设 `frontend`（前端）、`verifier`（验收员，同时运行上限 1，如实记录 PASS / FAIL / NOT RUN）、`merger`（合并员）；`implementer` 要求新测试写进按工单命名的新文件，减少并行冲突。
 - 执行前计划审查新增“并行”区块：显示并可修改这轮的同时运行工单数，说明成员是角色而不是并发数。修改值随批准写入账本（`run_approved` 事件），重启后保持。
 - 队长提示词写出当前验收超时和插件并发上限，要求按工单性质分配预设、显式设置并说明 `max_workers`，并说明冲突的处理方式。
+
+## 0.13.0
 
 - 新增只读工具 `dag_import`：读取 `/to-spec`、`/to-tickets` 发布的 spec 和工单，生成 `dag_run` 清单草稿。
   - 支持 GitHub（父 issue 的 sub-issues 或 `Part of #N`；依赖取原生 blocked-by 和 `Blocked by` 行）和本地 `.scratch/<slug>`。

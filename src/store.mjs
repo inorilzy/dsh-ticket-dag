@@ -461,15 +461,23 @@ export class RunStore {
     text(message, 'diagnostic')
     return this.#transaction(() => {
       const run = this.meta()
-      if (!run || run.mode === 'cancelled' || (run.mode !== 'active' && run.diagnostic === message))
-        return false
-      // A staged run keeps waiting for approval; it only records the diagnostic.
+      if (!run || (run.mode !== 'active' && run.diagnostic === message)) return false
+      // A staged run keeps waiting for approval and a cancelled run stays final;
+      // both only record the diagnostic.
       this.#db
         .prepare(
-          "UPDATE run SET mode=CASE WHEN mode='staged' OR ? THEN 'staged' ELSE 'paused' END,diagnostic=? WHERE singleton=1",
+          "UPDATE run SET mode=CASE WHEN mode='cancelled' THEN 'cancelled' WHEN mode='staged' OR ? THEN 'staged' ELSE 'paused' END,diagnostic=? WHERE singleton=1",
         )
         .run(staged ? 1 : 0, message)
       this.#event('run_blocked', null, message, { previousMode: run.mode }, true)
+      return true
+    })
+  }
+
+  /** The caller has settled what the diagnostic reported. Its run_blocked event stays in the log. */
+  clearDiagnostic() {
+    return this.#transaction(() => {
+      this.#db.prepare('UPDATE run SET diagnostic=NULL WHERE singleton=1').run()
       return true
     })
   }

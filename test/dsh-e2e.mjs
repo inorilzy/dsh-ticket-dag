@@ -41,6 +41,158 @@ function runManifest(workers) {
   return { specId: smokeId, baseRef: 'main', maxWorkers: workers, tickets }
 }
 
+test(
+  'real DSH ' + hostVersion + ' SDK: dag_cancel stops an in-flight worker',
+  { skip: binPath ? false : 'Set DSH_TEST_BIN to the locally installed @deepseek-ai/dsh/lib/bin.js', timeout: 180000 },
+  async (t) => {
+    const bin = realpathSync(binPath)
+    const runId = 'dsh-cancel-fixture'
+    const root = mkdtempSync(join(tmpdir(), 'dsh-ticket-dag-cancel-'))
+    t.after(() => rmSync(root, { recursive: true, force: true }))
+    const repo = join(root, 'repo'),
+      home = join(root, 'dsh')
+    mkdirSync(repo)
+    mkdirSync(home)
+    const git = (...args) =>
+      execFileSync('git', args, { cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+    git('init', '-q', '-b', 'main')
+    git('config', 'user.name', 'Local Fixture')
+    git('config', 'user.email', 'fixture@example.invalid')
+    git('commit', '-q', '--allow-empty', '-m', 'base')
+    const main = git('rev-parse', 'main')
+    let captainRequests = 0,
+      childHeld = false,
+      fixtureError
+    const server = createServer(async (req, res) => {
+      try {
+        let raw = ''
+        for await (const chunk of req) raw += chunk
+        if (!JSON.stringify(JSON.parse(raw).messages).includes('ROOT-DAG-CANCEL')) {
+          // The worker's model turn stays open: only the host's abort can end it.
+          childHeld = true
+          return
+        }
+        captainRequests++
+        if (captainRequests === 1)
+          return reply(res, 'dag_run', {
+            runId,
+            manifest: {
+              specId: runId,
+              baseRef: 'main',
+              tickets: [{ id: 'A', title: 'Held worker', prompt: 'CHILD-FIXTURE-A' }],
+            },
+          })
+        if (captainRequests === 2) {
+          for (let i = 0; i < 600 && !childHeld; i++) await delay(50)
+          return reply(res, 'dag_cancel', { runId })
+        }
+        reply(res)
+      } catch (err) {
+        fixtureError = err
+        res.writeHead(500)
+        res.end('fixture failed')
+      }
+    })
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    t.after(() => {
+      server.closeAllConnections()
+      server.close()
+    })
+    const env = {
+      PATH: process.env.PATH,
+      HOME: root,
+      DSH_HOME: home,
+      DEEPSEEK_API_KEY: 'local-fixture-only',
+      DEEPSEEK_BASE_URL: 'http://127.0.0.1:' + server.address().port,
+      DSH_TELEMETRY_MODE: 'OFF',
+      DSH_PERMISSION_MODE: 'danger-full-access',
+      NO_PROXY: '127.0.0.1',
+      TERM: 'dumb',
+    }
+    const tarball =
+      process.env.DSH_TEST_TARBALL ??
+      join(
+        root,
+        execFileSync('npm', ['pack', project, '--pack-destination', root, '--silent'], {
+          cwd: root,
+          env,
+          encoding: 'utf8',
+        }).trim(),
+      )
+    execFileSync(process.execPath, [bin, 'plugin', '--profile', 'sdk', 'add', resolve(tarball)], {
+      env,
+      cwd: repo,
+      stdio: 'pipe',
+    })
+    writeFileSync(
+      join(home, 'profiles', 'sdk', 'cordis.patch.yml'),
+      JSON.stringify([
+        { id: 'dsh-ticket-dag', config: { requireApproval: false } },
+        { id: 'session-telemetry-otel', disabled: true },
+      ]),
+    )
+    const cp = spawn(process.execPath, [bin, '--profile', 'sdk'], { cwd: repo, env, stdio: ['pipe', 'pipe', 'pipe'] })
+    const exit = once(cp, 'exit')
+    t.after(async () => {
+      if (cp.exitCode === null && cp.signalCode === null) cp.kill()
+      await exit
+    })
+    let stderr = '',
+      next = 0
+    cp.stderr.on('data', (d) => {
+      stderr = (stderr + d).slice(-6000)
+    })
+    const pending = new Map(),
+      results = [],
+      finished = []
+    createInterface({ input: cp.stdout }).on('line', (line) => {
+      let frame
+      try {
+        frame = JSON.parse(line)
+      } catch {
+        return
+      }
+      if (frame.id != null) {
+        const slot = pending.get(frame.id)
+        pending.delete(frame.id)
+        if (slot) frame.error ? slot.reject(Error(JSON.stringify(frame.error))) : slot.resolve(frame.result)
+      } else if (frame.method === 'session.event' && frame.params.event.type === 'tool/result') {
+        results.push(JSON.stringify(frame.params.event.data))
+      } else if (frame.method === 'subagent.finished') finished.push(frame.params)
+    })
+    const ask = (method, params) =>
+      new Promise((resolve, reject) => {
+        const id = ++next
+        pending.set(id, { resolve, reject })
+        cp.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
+      })
+    await ask('initialize', {
+      cwd: repo,
+      provider: 'deepseek-official',
+      model: 'deepseek-v4-pro',
+      reasoningEffort: 'off',
+      maxTokens: 2000,
+    })
+    await ask('session/prompt', {
+      sessionId: 'captain',
+      contentBlocks: [{ type: 'text', text: 'ROOT-DAG-CANCEL approved. Run and cancel the fixture.' }],
+    })
+    for (let i = 0; i < 1200 && !(finished.length && captainRequests >= 3); i++) {
+      if (fixtureError) throw fixtureError
+      if (cp.exitCode !== null) throw Error('DSH exited: ' + stderr)
+      await delay(75)
+    }
+    const diagnostics = JSON.stringify({ captainRequests, childHeld, finished, results: results.slice(-4), stderr })
+    assert.ok(childHeld, diagnostics)
+    assert.ok(results.some((r) => r.includes('cancelled')), diagnostics)
+    assert.equal(finished.length, 1, diagnostics)
+    assert.notEqual(finished[0].stopReason, 'completed', diagnostics)
+    assert.equal(git('rev-parse', 'integration/' + runId), main)
+    await ask('shutdown', {})
+  },
+)
+
 const cases = [
   { workers: 1, title: 'one ticket and idle captain wake' },
   { workers: 16, title: '16 workers, rolling refill and a dependent ticket' },

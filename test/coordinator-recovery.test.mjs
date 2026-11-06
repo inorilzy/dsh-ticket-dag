@@ -198,6 +198,15 @@ test('unexpected external advancement during recovery is preserved and never acc
   assert.equal(await git.resolveRef(f.repo, f.ref), foreign)
   assert.equal(snapshot.tickets[0].status, 'PUBLISHING')
   assert.equal(f.evidence.launches, 0)
+  // The same unreconcilable tip cannot keep a cancel from landing or erase the evidence.
+  const stopped = await f.coordinator.cancel(f.query)
+  assert.equal(stopped.mode, 'cancelled')
+  assert.match(stopped.reconcileError, /unrecognized target/i)
+  assert.match(stopped.diagnostic, /unrecognized target/i)
+  assert.equal(stopped.tickets[0].status, 'PUBLISHING')
+  assert.equal(stopped.pendingPublications.length, 1)
+  assert.equal(await git.resolveRef(f.repo, f.ref), foreign)
+  assert.equal(f.evidence.launches, 0)
 })
 
 test('an already-executed CAS is accounted even if the restored run is cancelled', async (t) => {

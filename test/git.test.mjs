@@ -261,6 +261,68 @@ test('cleanup removes only merged clean ticket worktrees and branches; integrati
   assert.equal(await g(main, 'config', '--get-regexp', '^branch\\.ticket/test-run/A\\.').catch(() => ''), '')
 })
 
+test('cleanup keeps a worktree with tracked changes, untracked or ignored files and names them', async (t) => {
+  const { root, repo, base, main } = await fixture(t)
+  await initIntegration(repo, target, base)
+  // Local settings must not hide anything from the guard.
+  await g(main, 'config', 'status.showUntrackedFiles', 'no')
+  const owned = join(root, 'worktrees')
+  const slot = (id) => join(owned, 'tickets', id)
+  const branch = (id) => 'ticket/test-run/' + id
+  const tips = []
+  for (const id of ['tracked', 'untracked', 'ignored', 'ignoredDir', 'mixed', 'many', 'clean']) {
+    await prepareWorktree(repo, slot(id), branch(id), base)
+    await finish(slot(id), '.gitignore', '*.env\ncache/\n', 'Ignore local data ' + id)
+    tips.push(await finish(slot(id), id + '.txt', id, 'Finish ' + id))
+  }
+  await land(repo, root, tips)
+  const request = (id) => ({ path: slot(id), branch: branch(id), target, baseRef: 'main', root: owned })
+  const skipped = async (id, ...patterns) => {
+    const result = await cleanupWorktree(repo, request(id))
+    assert.equal(result.status, 'skipped', id)
+    for (const pattern of patterns) assert.match(result.reason, pattern)
+    assert.equal(await localRefExists(repo, 'refs/heads/' + branch(id)), true)
+    return result.reason
+  }
+
+  await writeFile(join(slot('tracked'), 'tracked.txt'), 'edited')
+  await skipped('tracked', /tracked changes: "tracked\.txt"/)
+  assert.equal(await readFile(join(slot('tracked'), 'tracked.txt'), 'utf8'), 'edited')
+
+  await writeFile(join(slot('untracked'), 'notes.txt'), 'draft')
+  await skipped('untracked', /untracked: "notes\.txt"/)
+  assert.equal(await readFile(join(slot('untracked'), 'notes.txt'), 'utf8'), 'draft')
+
+  await writeFile(join(slot('ignored'), 'local.env'), 'keep me')
+  await skipped('ignored', /ignored: "local\.env"/)
+  assert.equal(await readFile(join(slot('ignored'), 'local.env'), 'utf8'), 'keep me')
+
+  await mkdir(join(slot('ignoredDir'), 'cache'))
+  await writeFile(join(slot('ignoredDir'), 'cache', 'data.bin'), 'keep me too')
+  await skipped('ignoredDir', /ignored: "cache\/"/)
+  assert.equal(await readFile(join(slot('ignoredDir'), 'cache', 'data.bin'), 'utf8'), 'keep me too')
+
+  await writeFile(join(slot('mixed'), 'mixed.txt'), 'edited')
+  await writeFile(join(slot('mixed'), 'notes.txt'), 'draft')
+  await writeFile(join(slot('mixed'), 'local.env'), 'secret')
+  const mixed = await skipped('mixed', /tracked changes: "mixed\.txt"/, /untracked: "notes\.txt"/, /ignored: "local\.env"/)
+  assert.doesNotMatch(mixed, /secret/)
+
+  // A long list stays short enough to read and to survive the board's diagnostic limit.
+  for (let i = 0; i < 40; i++) await writeFile(join(slot('many'), 'file-' + i + '.env'), 'x')
+  const many = await skipped('many', /ignored: /, /and 35 more/)
+  assert.ok(many.length < 2200, many)
+
+  // A skipped worktree is cleaned once it is tidied, and repeating that stays harmless.
+  await rm(join(slot('ignored'), 'local.env'))
+  assert.deepEqual(await cleanupWorktree(repo, request('ignored')), { status: 'cleaned' })
+  await assert.rejects(access(slot('ignored')))
+  assert.deepEqual(await cleanupWorktree(repo, request('ignored')), { status: 'cleaned' })
+  assert.deepEqual(await cleanupWorktree(repo, request('clean')), { status: 'cleaned' })
+  assert.equal(await localRefExists(repo, 'refs/heads/' + branch('clean')), false)
+  assert.equal(await readFile(join(slot('mixed'), 'local.env'), 'utf8'), 'secret')
+})
+
 test('cleanup refuses the integration branch, the base branch, foreign checkouts and paths outside its root', async (t) => {
   const { root, repo, base, main } = await fixture(t)
   await initIntegration(repo, target, base)

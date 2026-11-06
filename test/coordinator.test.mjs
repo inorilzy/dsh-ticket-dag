@@ -8,6 +8,7 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { Coordinator } from '../src/coordinator.mjs'
+import { RunCatalog, mountDashboard } from '../src/dashboard.mjs'
 
 const exec = promisify(execFile)
 const env = {
@@ -968,6 +969,170 @@ test(
     }
   },
 )
+
+test(
+  'a reconciliation error or a throwing dispose cannot keep cancel from stopping workers and a running check',
+  { timeout: limit(60000) },
+  async (t) => {
+    const cwd = await repo(t)
+    const pidFile = join(cwd, '..', 'check-pid').replaceAll('\\', '/')
+    const signals = new Map()
+    const co = new Coordinator({
+      maxWorkers: 3,
+      checkTimeoutMs: limit(120000),
+      checks: {
+        verify: [
+          [
+            process.execPath,
+            '-e',
+            `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000)`,
+          ],
+        ],
+      },
+      launch: async (job) => {
+        signals.set(job.ticketId, job.signal)
+        return {
+          // The first worker's release entry fails before it can return a promise.
+          dispose: () => {
+            if (job.ticketId === 'B') throw Error('dispose failed')
+            return Promise.resolve()
+          },
+          result:
+            job.ticketId === 'A'
+              ? commit(job).then(() => ({ ok: true }))
+              : new Promise((resolve) => {
+                  job.signal.addEventListener('abort', () => resolve({ ok: false, detail: 'stopped' }))
+                }),
+        }
+      },
+    })
+    const q = { cwd, parentId: 'captain', runId: 'cancel-signals' }
+    try {
+      await co.start({
+        ...q,
+        manifest: {
+          spec_id: 'cancel-signals',
+          tickets: [ticket('A'), { id: 'B', title: 'B' }, { id: 'C', title: 'C' }],
+        },
+      })
+      await until(async () => {
+        const s = await co.status(q)
+        return s.tickets[0].livePhase?.stage === 'verify' && signals.size === 3
+      }, 'the check and both workers are running')
+      const pid = Number(await until(() => readFile(pidFile, 'utf8').catch(() => ''), 'the check process started'))
+      const [run] = co.runs.values()
+      const integration = run.integration
+      let aborted
+      co._reconcile = async () => {
+        aborted = [signals.get('B').aborted, signals.get('C').aborted, integration.ctrl.signal.aborted]
+        throw Error('git exploded')
+      }
+      const after = await co.cancel(q)
+      assert.deepEqual(aborted, [true, true, true], 'stop signals precede reconciliation')
+      assert.equal(after.mode, 'cancelled')
+      assert.equal(after.reconcileError, 'git exploded')
+      assert.equal(after.diagnostic, 'git exploded')
+      assert.equal(after.tickets.find((x) => x.id === 'A').livePhase, null)
+      assert.equal(after.tickets.find((x) => x.id === 'A').status, 'CANCELLED')
+      assert.equal(after.tickets.find((x) => x.id === 'C').status, 'CANCELLED')
+      // B's stop could not be proven, so it stays for inspection instead of counting as cancelled.
+      assert.equal(after.tickets.find((x) => x.id === 'B').status, 'NEEDS_ATTENTION')
+      await until(() => {
+        try {
+          process.kill(pid, 0)
+          return false
+        } catch {
+          return true
+        }
+      }, 'the check process is gone')
+    } finally {
+      await co.close()
+    }
+  },
+)
+
+for (const mode of ['automatic', 'manual'])
+  test(
+    mode + ' cleanup keeps local files, reports why through status and the board, then cleans once they are gone',
+    { timeout: limit(120000) },
+    async (t) => {
+      const cwd = await repo(t)
+      await writeFile(join(cwd, '.git', 'info', 'exclude'), '*.env\n')
+      const settings = { checks: noopChecks, maxWorkers: 16, checkTimeoutMs: 20000 }
+      const catalog = new RunCatalog()
+      const co = new Coordinator({
+        ...settings,
+        autoCleanup: false,
+        notify: async () => true,
+        rememberRun: (file, meta, startedAt) => catalog.remember(file, meta, startedAt),
+        launch: async (job) => ({
+          dispose: async () => {},
+          result: (async () => {
+            await commit(job)
+            return { ok: true }
+          })(),
+        }),
+      })
+      let board
+      mountDashboard({ connection: { fetch: { register: (r) => (board = r) } } }, catalog, co)
+      const q = { cwd, parentId: 'captain', runId: 'keep-' + mode }
+      try {
+        const ids = ['Ignored', 'Untracked', 'Tracked', 'Clean']
+        await co.start({ ...q, manifest: { spec_id: 'keep', tickets: ids.map((id) => ticket(id)) } })
+        const done = await until(async () => {
+          const s = await co.status(q)
+          if (s.counts.NEEDS_ATTENTION) throw Error(JSON.stringify(s))
+          return s.complete && s.pendingNotifications === 0 && s
+        }, 'complete and notified')
+        const paths = Object.fromEntries(done.tickets.map((r) => [r.id, r.path]))
+        const local = [
+          [join(paths.Ignored, 'local.env'), 'ignored data', /ignored: "local\.env"/],
+          [join(paths.Untracked, 'notes.txt'), 'untracked data', /untracked: "notes\.txt"/],
+          [join(paths.Tracked, 'Tracked.txt'), 'edited data', /tracked changes: "Tracked\.txt"/],
+        ]
+        for (const [file, data] of local) await writeFile(file, data)
+
+        let status
+        if (mode === 'automatic') {
+          co.updateSettings({ ...settings, autoCleanup: true })
+          status = await until(async () => {
+            const s = await co.status(q)
+            return s.tickets.every((r) => r.cleanup) && s
+          }, 'automatic cleanup')
+        } else status = await co.cleanup(q)
+
+        assert.deepEqual(status.cleanup, { cleaned: 1, skipped: 3 })
+        const row = (rows, id) => rows.find((r) => r.id === id)
+        const selected = (await (await board.fetch(new Request('http://localhost' + board.path))).json()).selected
+        for (const [index, [file, data, reason]] of local.entries()) {
+          assert.equal(await readFile(file, 'utf8'), data)
+          for (const rows of [status.tickets, selected.tickets]) {
+            assert.equal(row(rows, ids[index]).cleanup, 'skipped')
+            assert.match(row(rows, ids[index]).cleanupReason, reason)
+          }
+        }
+        assert.equal(row(selected.tickets, 'Clean').cleanup, 'cleaned')
+        assert.equal(await exists(paths.Clean), false)
+        assert.equal((await ticketBranches(cwd)).length, 3)
+
+        // Retrying by hand while the files remain keeps them; once tidied, the same call cleans.
+        const retried = await co.cleanup(q)
+        assert.deepEqual(retried.results.map((r) => r.status), ['skipped', 'skipped', 'skipped', 'cleaned'])
+        for (const [file, data] of local) assert.equal(await readFile(file, 'utf8'), data)
+        await rm(local[0][0])
+        await rm(local[1][0])
+        await git(paths.Tracked, 'checkout', '--', 'Tracked.txt')
+        for (let i = 0; i < 2; i++) {
+          const cleaned = await co.cleanup(q)
+          assert.deepEqual(cleaned.results.map((r) => r.status), ['cleaned', 'cleaned', 'cleaned', 'cleaned'])
+          assert.deepEqual(cleaned.cleanup, { cleaned: 4, skipped: 0 })
+          assert.deepEqual(await ticketBranches(cwd), [])
+        }
+      } finally {
+        await co.close()
+      }
+    },
+  )
 
 test('a cancelled run is never cleaned', { timeout: limit(60000) }, async (t) => {
   const cwd = await repo(t)
