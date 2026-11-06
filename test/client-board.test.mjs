@@ -1240,6 +1240,16 @@ test('settings carry the approval switch, on by default', () => {
   assert.equal(find(off, (n) => n.props['aria-label'] === '启动前需要我确认').props.checked, false)
 })
 
+test('settings carry the GitHub writeback choice, off by default', () => {
+  const pick = (root) => find(root, (n) => n.props['aria-label'] === '集成后回写 GitHub 工单')
+  assert.equal(pick(editorFor({}, catalog)).props.value, 'off')
+  assert.equal(pick(editorFor({ trackerWriteback: 'close' }, catalog)).props.value, 'close')
+  assert.equal(pick(editorFor({ trackerWriteback: 'bogus' }, catalog)).props.value, 'off')
+  const review = (root) => find(root, (n) => n.props['aria-label'] === '完成后审查一轮')
+  assert.equal(review(editorFor({}, catalog)).props.checked, false)
+  assert.equal(review(editorFor({ reviewOnComplete: true }, catalog)).props.checked, true)
+})
+
 test('the conversation header shows 查看工单 only when this conversation has runs, and opens the tab', () => {
   const none = loadHost([[]])
   assert.equal(none.renderSlot('conversation.session.header.actions', { sessionId: 's1' }), null)

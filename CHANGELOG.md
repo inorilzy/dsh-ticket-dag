@@ -2,6 +2,17 @@
 
 版本号以 `package.json` 为准。条目整理自 Git 提交记录。
 
+## 0.13.0
+
+- 新增只读工具 `dag_import`：读取 `/to-spec`、`/to-tickets` 发布的 spec 和工单，生成 `dag_run` 清单草稿。
+  - 支持 GitHub（父 issue 的 sub-issues 或 `Part of #N`；依赖取原生 blocked-by 和 `Blocked by` 行）和本地 `.scratch/<slug>`。
+  - 返回 `dependencyMode`：`declared` 时队长原样保留依赖；`none` 和 `no-tickets` 时队长自行推断依赖，并写明理由。
+  - 已关闭的工单跳过；已关闭的阻塞项视为已满足；spec 之外仍未关闭的阻塞项报错。
+- 工单新增可选字段 `source`，记录工单来源，写入账本并在 `dag_status` 中返回。
+- 新增配置 `trackerWriteback`（`off` | `comment` | `close`，默认 `off`）：从 GitHub 导入的工单集成后，在对应 issue 下评论集成分支和提交，可选同时关闭。失败只记事件，不阻塞运行。
+- 队长提示词：目标指向 spec 或工单时先调用 `dag_import`；依赖已声明时不得改动。
+- 新增配置 `reviewOnComplete`（配置页“完成后审查一轮”，默认关闭）：一轮运行首次全部集成时，“运行完成”通知附带审查指令，要求队长用 `code-review` 审查从基线到集成分支的改动，并用 `dag_add` 追加修复工单。修复集成后的完成通知说明不再审查。审查由队长执行，插件不新增审查节点。
+
 ## 0.12.0
 
 - 验收改为可选：工单的 `verify` 可以留空或不写，这样的工单试合并干净即集成，不跑命令。之前每张工单必须引用一个已配置的验收项，配置为空时队长只能停下来。

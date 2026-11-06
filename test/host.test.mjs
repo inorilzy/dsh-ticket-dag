@@ -29,7 +29,7 @@ const hook = registerHooks({
 const { apply } = await import('../src/index.mjs')
 hook.deregister()
 
-function harness(extra = {}, { commands } = {}) {
+function harness(extra = {}, { commands, importer } = {}) {
   const calls = [],
     roster = new Map(),
     logs = new Map(),
@@ -106,7 +106,7 @@ function harness(extra = {}, { commands } = {}) {
     }),
   }
   const checks = { lint: [['node', '--check', 'index.js']] }
-  apply(ctx, { checks, maxWorkers: 3, checkTimeoutMs: 500, ...extra })
+  apply(ctx, { checks, maxWorkers: 3, checkTimeoutMs: 500, ...extra }, importer ? { importer } : undefined)
   const invoke = (key, args, agent = root) =>
     tools.get(key).execute(args, { agent, signal: new AbortController().signal })
   return {
@@ -127,13 +127,13 @@ function harness(extra = {}, { commands } = {}) {
   }
 }
 
-test('eight captain tools bind identity and trusted checks, existing and new root sessions auto-attach', async () => {
+test('nine captain tools bind identity and trusted checks, existing and new root sessions auto-attach', async () => {
   const h = harness()
   await afterPublication()
   assert.deepEqual(h.calls, [['attach', { cwd: '/repo', parentId: 'root' }]])
   assert.deepEqual(
     [...h.tools.keys()],
-    ['dag_run', 'dag_status', 'dag_pause', 'dag_resume', 'dag_retry', 'dag_cancel', 'dag_cleanup', 'dag_add'],
+    ['dag_run', 'dag_status', 'dag_pause', 'dag_resume', 'dag_retry', 'dag_cancel', 'dag_cleanup', 'dag_add', 'dag_import'],
   )
   await h.invoke('dag_run', {
     manifest: '{"specId":"x"}',
@@ -343,6 +343,30 @@ test('dag_add is a captain-only tool that appends tickets; its cap defaults to 2
   assert.equal(h.calls.length, before)
   assert.match(h.tools.get('dag_run').description, /dag_add/)
   assert.match(h.sections.map((s) => (typeof s.text === 'function' ? s.text() : s.text)).join('\n'), /dag_add.*approval/)
+  await h.close()
+})
+
+test('dag_import is captain-only, reads in the captain cwd, and the captain is told to keep declared edges', async () => {
+  const seen = []
+  const h = harness({}, { importer: async (q) => (seen.push(q), { dependencyMode: 'declared', manifest: { tickets: [] } }) })
+  const tool = h.tools.get('dag_import')
+  assert.deepEqual(Object.keys(tool.parameters), ['spec', 'repo'])
+  assert.equal(tool.parameters.spec.required, true)
+  const out = await h.invoke('dag_import', { spec: '#1', repo: 'o/r', cwd: '/etc' })
+  assert.equal(out.dependencyMode, 'declared')
+  assert.deepEqual(seen, [{ cwd: '/repo', spec: '#1', repo: 'o/r' }])
+  await assert.rejects(h.invoke('dag_import', { spec: '#1' }, h.child), /top-level/)
+  assert.equal(seen.length, 1)
+  const text = h.sections.find((s) => s.name === 'tool:dsh-ticket-dag').text()
+  assert.match(text, /dag_import/)
+  assert.match(text, /declared, keep every ticket and its depends_on exactly/)
+  assert.match(text, /does not report back to GitHub/)
+  const on = harness({ trackerWriteback: 'close' }).sections.find((s) => s.name === 'tool:dsh-ticket-dag').text()
+  assert.match(on, /reports each integrated GitHub ticket on its issue \(close\)/)
+  assert.doesNotMatch(text, /reviews each run once/)
+  const review = harness({ reviewOnComplete: true })
+  assert.equal(review.api.reviewOnComplete, true)
+  assert.match(review.sections.find((s) => s.name === 'tool:dsh-ticket-dag').text(), /reviews each run once.*code-review/)
   await h.close()
 })
 

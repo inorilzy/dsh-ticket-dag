@@ -2,13 +2,13 @@
 
 DeepSeek Harness 的本地 Git 工单调度插件。队长交给它一个已确认的 JSON 清单。插件为每张开发工单创建独立分支、worktree 和 DSH 子会话，并行执行就绪工单，将测试通过的候选逐个合入本轮集成分支。运行完成或需要处理时，插件给原队长发送持久消息。
 
-**版本 0.12.0** · DSH `0.2.1-rc.2` 或 `0.2.1-rc.5` · Node.js `^22.19.0 || >=24` · Git **2.43+**。包内含可直接执行的原生 ESM 源码和测试，无须编译。Git 仓库需要已有本地提交、可用的提交身份，以及创建同级 worktree 目录的权限。
+**版本 0.13.0** · DSH `0.2.1-rc.2` 或 `0.2.1-rc.5` · Node.js `^22.19.0 || >=24` · Git **2.43+**。包内含可直接执行的原生 ESM 源码和测试，无须编译。Git 仓库需要已有本地提交、可用的提交身份，以及创建同级 worktree 目录的权限。
 
 ## 安装与首次运行
 
-1. 下载 `dsh-ticket-dag-0.12.0.tgz`，保存在运行 DSH 的电脑上。打开侧栏 **插件 → 添加插件 → 安装第三方插件**，输入该文件的本地绝对路径，例如 `D:\DSH-Plugins\dsh-ticket-dag-0.12.0.tgz`，然后安装并启用。使用命令行也可以在目标 profile 安装同一个文件：
+1. 下载 `dsh-ticket-dag-0.13.0.tgz`，保存在运行 DSH 的电脑上。打开侧栏 **插件 → 添加插件 → 安装第三方插件**，输入该文件的本地绝对路径，例如 `D:\DSH-Plugins\dsh-ticket-dag-0.13.0.tgz`，然后安装并启用。使用命令行也可以在目标 profile 安装同一个文件：
    ```powershell
-   dsh plugin --profile web add "$HOME\Downloads\dsh-ticket-dag-0.12.0.tgz"
+   dsh plugin --profile web add "$HOME\Downloads\dsh-ticket-dag-0.13.0.tgz"
    ```
    旧版用户可以等当前工单结束后，在同一 profile 使用上面的命令升级。SDK profile 将 `web` 换为 `sdk`。安装后重新打开插件详情；若宿主提示需要重启，则重启该 profile。
 2. 在 **插件 → 已安装 → dsh-ticket-dag** 中找到同名组件，点 **配置**。先运行示例时，点 **补入示例验收项**，再点 **保存配置**；已设置的同名验收项会保留。没有图形界面的 SDK 环境仍可将 `examples/profile.patch.yml` 中的配置合入当前 profile 的 `cordis.patch.yml`，并保留其他现有配置。
@@ -53,6 +53,8 @@ DeepSeek Harness 的本地 Git 工单调度插件。队长交给它一个已确�
 | 预设 Agent | `implementer`（实现者）、`test-writer`（测试员）、`docs`（文档员） | 每个预设有显示名、简介、角色说明、模型和推理强度。模型与推理强度从宿主已配置的 provider 模型目录中选择，选“宿主默认”则沿用宿主路由。“同时运行上限”限制用该预设的工单最多同时跑几个，0 表示不单独限制。工单用 `agent` 引用预设 ID |
 | `autoCleanup` | 开启 | 运行完成后自动删除已集成工单的 worktree 和分支，见下文“清理”。实时生效 |
 | `maxAppendedTickets` | 20 | 单轮运行经 `dag_add` 累计最多追加的工单数，见下文“追加工单”。实时生效 |
+| `trackerWriteback` | `off` | 从 GitHub 导入的工单集成后，是否在对应 issue 下评论（`comment`）或评论并关闭（`close`），见“从 spec 和工单导入”。实时生效 |
+| `reviewOnComplete` | 关闭 | 配置页“完成后审查一轮”。一轮运行首次全部集成时，“运行完成”通知要求队长用 `code-review` 审查集成分支，并把要修的发现用 `dag_add` 追加为修复工单；修复集成后的完成通知会说明不再重复审查。实时生效 |
 
 预设保存在配置键 `agents` 中。profile 一旦保存了自己的预设，就以保存的这一组为准，内置预设可以修改或删除，“补入内置预设”可以把缺少的内置项加回来。角色说明会写进工单提示词，只约束模型行为，不做文件范围检查；真正的把关仍是验收命令。冻结分两个时点：`dag_run` 时，所用预设的角色说明和模型按当时的配置冻结进这轮运行的清单；开启启动前确认时，用户点 **确认并启动** 的那一刻，插件再按当时的配置重新解析每张工单负责人的预设（取其角色说明），并把用户在审查面板上选定的模型和推理强度一起冻结进各工单的定义。计划中的预设若在这期间已从配置删除，仍沿用 `dag_run` 时冻结的那份。批准后再修改预设，只影响新的运行。同一 `runId` 在预设修改后重新提交，会因清单不同而被拒绝；用原清单重新提交（包括批准之后）则返回已有运行。同时运行上限例外：它和最大 Agent 数量一样实时生效，保存后立即用于后续派工，不中断已在运行的工单；某个预设满额时，只暂缓它的工单，其他就绪工单照常派发。
 
@@ -62,7 +64,7 @@ DeepSeek Harness 的本地 Git 工单调度插件。队长交给它一个已确�
 
 ## 工单与控制工具
 
-清单字段为 `spec_id`、`base_ref`、`max_workers`、`tickets[]`，可选清单级 `checks`。工单至少需要 `id` 和 `title`。建议显式填写 `prompt`、`acceptance`、`depends_on`，可选 `verify`、`produces`、`consumes`、`agent` 和清单级 `external_inputs`。导入时校验重复、未知依赖、环、验收项、预设 Agent 及已声明产物关系。
+清单字段为 `spec_id`、`base_ref`、`max_workers`、`tickets[]`，可选清单级 `checks`。工单至少需要 `id` 和 `title`。建议显式填写 `prompt`、`acceptance`、`depends_on`，可选 `verify`、`produces`、`consumes`、`agent`、`source`（由 `dag_import` 填写的工单来源）和清单级 `external_inputs`。导入时校验重复、未知依赖、环、验收项、预设 Agent 及已声明产物关系。
 
 **验收（可选）。** 每张工单的 `verify` 可以留空或不写：这样的工单在试合并干净、复核候选后直接集成，不跑任何命令，适合文档这类没有命令能检查的工作。写了 `verify` 时，ID 可以来自两处：
 
@@ -81,8 +83,50 @@ DeepSeek Harness 的本地 Git 工单调度插件。队长交给它一个已确�
 | `dag_cancel` | `runId` | 终止运行、请求停止已知 worker、保留证据，并对已发出的 Git 发布做对账。取消后的 run 为终态 |
 | `dag_cleanup` | `runId` | 手动删除该轮已集成工单的 worktree 和分支（包括已结束的运行），返回每张工单的结果。重复调用无害，见下文“清理” |
 | `dag_add` | `runId, tickets` | 向已有运行追加工单，`tickets` 为工单数组或其 JSON 字符串。无需再次人工确认，但同样要通过验收，见下文“追加工单” |
+| `dag_import` | `spec`，可选 `repo` | 只读：把 GitHub issue 或本地 `.scratch` 中的 spec 和工单转成清单草稿，并给出 `dependencyMode`，见下文“从 spec 和工单导入” |
 
-这 8 个工具限定给原顶层队长。
+这 9 个工具限定给原顶层队长。
+
+## 从 spec 和工单导入（`dag_import`）
+
+插件可以直接读取 `/to-spec` 和 `/to-tickets` 发布的 spec 和工单，生成一份 `dag_run` 清单草稿。这一步只读：不启动运行，不写 GitHub，也不改文件。
+
+| 来源 | spec | 工单 | 依赖 |
+| --- | --- | --- | --- |
+| GitHub | 父 issue（`#1`、`1` 或 issue URL，可用 `repo` 指定 `owner/name`） | 父 issue 的 sub-issues；仓库不支持 sub-issues 时，取正文以 `Part of #1` 开头的 issue | GitHub 原生依赖（blocked-by），以及正文中的 `Blocked by: #n` 行或 `## Blocked by` 段落 |
+| 本地 | `.scratch/<slug>/spec.md` | `.scratch/<slug>/issues/NN-*.md` | 文件中的 `Blocked by: 01, 02` 行 |
+
+本地来源可以传 `.scratch/<slug>` 目录、其中的 `spec.md`，或 `issues` 目录。读取 GitHub 需要本机已安装并登录 `gh`。
+
+草稿中每张工单的字段：
+
+- `id`：取标题里的 `[T01]` 标签。标签缺失或重复时，GitHub 工单用 `gh-<编号>`，本地工单用 `T<文件编号>`。
+- `title`：去掉标签后的标题。
+- `prompt`：工单正文，前面加上工单和 spec 的位置。
+- `acceptance`：`Acceptance criteria` 下的复选框。
+- `depends_on`：来自上表的依赖。
+- `source`：工单来源，跟着工单写进账本。
+
+返回值中的 `dependencyMode` 决定队长接下来怎么做：
+
+- `declared`：跟踪器给出了依赖。队长原样保留工单和 `depends_on`，只补 `verify`、`agent` 和清单 `checks`。觉得某条依赖不对时，向用户报告，不自行修改。
+- `none`：有工单，但没有任何依赖声明。队长保留工单，自己推断 `depends_on`，并把每条推断出的依赖的理由写进下游工单的 `prompt`，方便在计划审查里核对。
+- `no-tickets`：只有 spec。队长自己拆票并推断依赖，同样写明理由。
+
+依赖的边界情况：
+
+- 已关闭的 issue，以及 `Status` 为 done、resolved、closed 等的本地工单，会被跳过，并列在 `skipped` 中。
+- 指向已关闭 issue 的依赖视为已满足。
+- 指向 spec 之外、仍未关闭的 issue 的依赖直接报错，插件不猜测。
+
+用户消息里提到 spec、issue 或 `.scratch` 路径时，队长提示词要求先调用 `dag_import`。之后照常走 `dag_run`、右侧栏审查和批准。
+
+**回写 GitHub（`trackerWriteback`，默认关闭）。** 配置项“集成后回写 GitHub 工单”有三档：`off`（不回写）、`comment`（评论）、`close`（评论并关闭）。开启后，一张从 GitHub 导入的工单集成到本轮集成分支时，插件用 `gh issue comment` 在对应 issue 下写明运行 ID、集成分支和落地提交；选 `close` 时再执行 `gh issue close`。
+
+- 每张工单只回写一次。
+- 失败时只在账本中记录 `writeback_failed` 事件，不阻塞运行，也不自动重试。
+- 本地工单不回写。
+- 集成分支此时还没有合入默认分支。选 `close` 前，请确认提前关闭 issue 符合你的流程。
 
 **怎么触发。** 插件就是这个 profile 的 Agent Teams，有两个强制入口：消息以 `/dag` 开头，或消息中任意位置出现 “Agent Teams”（不分大小写，`agent team`、`AgentTeams`、`agent-teams` 也算，可以紧挨中文）。命中时插件在这一步给队长追加一条明确指令，整条消息作为目标；`subagent team`、`agentteamsx` 这类只是包含这几个字母的词不算。其他说法（teams、工单团队、ticket DAG）仍由模型判断：用户明确要求，并且任务能拆成 2 张以上工单时，才由当前对话担任队长调用 `dag_run`；只是提到、讨论或拒绝都不算，单张小改动直接做。提示词同时列出 profile 中已配置的验收项 ID 及其命令（保存配置后即时更新），并告诉队长：验收可选，配置里没有合适的验收项时，可以按仓库实际情况（测试框架、锁文件、CI）在清单里写自己的 `checks`，交给你审批。最稳定的入口是斜杠命令 `/dag <目标>`：消息以 `/dag` 开头时，插件在这一步给队长追加一条明确指令，要求它拆票、调用 `dag_run`，并在待确认时请你到右侧栏审查。`/dagger` 之类或句中提到 `/dag` 不会触发，工单 worker 也收不到这条指令。若同一 profile 还启用了其他 Agent Teams 插件，它们会争用同一说法，建议只保留一个。
 

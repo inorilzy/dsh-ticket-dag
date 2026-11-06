@@ -114,6 +114,23 @@ export function agentSpec(registry, name) {
   return spec
 }
 
+// Where dag_import found the ticket; a GitHub source lets the run report back
+// on that issue. Only these exact shapes are kept.
+function trackerSource(value, field) {
+  record(value, field)
+  if (value.kind === 'github') {
+    if (typeof value.repo !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value.repo))
+      throw new TypeError(field + '.repo must look like owner/name')
+    if (!Number.isSafeInteger(value.number) || value.number < 1)
+      throw new TypeError(field + '.number must be an issue number')
+    const source = { kind: 'github', repo: value.repo, number: value.number }
+    if (value.url !== undefined) source.url = text(value.url, field + '.url')
+    return source
+  }
+  if (value.kind === 'local') return { kind: 'local', path: text(value.path, field + '.path') }
+  throw new TypeError(field + '.kind must be github or local')
+}
+
 // Each ticket's own fields; IDs must differ case-insensitively within the list.
 function normalizeTickets(list, checkRegistry, agentRegistry) {
   if (!Array.isArray(list) || !list.length) throw new TypeError('tickets must be a non-empty array')
@@ -144,6 +161,7 @@ function normalizeTickets(list, checkRegistry, agentRegistry) {
       ticket.agent = safeId(raw.agent, id + '.agent')
       ticket.agentSpec = agentSpec(agentRegistry, ticket.agent)
     }
+    if (raw.source !== undefined) ticket.source = trackerSource(raw.source, id + '.source')
     return ticket
   })
 }
@@ -852,6 +870,11 @@ export class RunStore {
       })
       return true
     })
+  }
+
+  /** Record the result of reporting an integrated ticket back to its tracker issue. */
+  recordWriteback(id, status, message, details = {}) {
+    this.#transaction(() => this.#event('writeback_' + status, this.get(id), message, details))
   }
 
   events() {

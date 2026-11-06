@@ -5,6 +5,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { builtinAgents } from './agents.mjs'
 import { Coordinator } from './coordinator.mjs'
 import { RunCatalog, mountApproval, mountDashboard, mountModels } from './dashboard.mjs'
+import { importTickets, writeback } from './tracker.mjs'
 
 export const name = 'dsh-ticket-dag'
 export const inject = [
@@ -41,6 +42,10 @@ export const Config = z.object({
   maxAppendedTickets: z.natural().default(20).volatile(),
   maxWorkers: z.natural().min(1).max(32).default(16).volatile(),
   checkTimeoutMs: z.natural().min(1).max(2_147_483_647).default(120000).volatile(),
+  // What an integrated ticket imported from GitHub reports on its issue.
+  trackerWriteback: z.union(['off', 'comment', 'close']).default('off').volatile(),
+  // Ask the captain for one code-review round when a run first completes.
+  reviewOnComplete: z.boolean().default(false).volatile(),
 })
 
 const runId = { type: 'string', required: true, description: 'The runId returned by dag_run.' }
@@ -78,7 +83,13 @@ function checkList(checks) {
   ].join(' ')
 }
 
-export function captainSection({ checks, agents }) {
+const writebackMode = (value) => (['comment', 'close'].includes(value) ? value : 'off')
+
+// A spec or tickets on a tracker (from /to-spec and /to-tickets) are imported, not re-split.
+const importRule =
+  'When the goal points at a spec or its tickets (a GitHub issue number or URL, or a local .scratch/<slug> folder, spec.md or issues folder from /to-spec and /to-tickets), call dag_import with it first and build the manifest from its draft. If dependencyMode is declared, keep every ticket and its depends_on exactly as imported: add only verify, agent and manifest checks, and report a dependency that looks wrong instead of changing it. If dependencyMode is none, keep the imported tickets and infer depends_on yourself. If it is no-tickets, split the spec into tickets yourself. Whenever you infer an edge, write its reason into the dependent ticket prompt so the user sees it in the plan review. Keep each ticket source field so the run can report back to the issue.'
+
+export function captainSection({ checks, agents, trackerWriteback, reviewOnComplete }) {
   const presets = Object.keys(agents ?? {})
   return [
     'dsh-ticket-dag is this profile’s Agent Teams plugin: it runs a coding goal as a DAG of tickets, one worker per ticket in its own git worktree, verified and merged into an integration branch.',
@@ -87,8 +98,17 @@ export function captainSection({ checks, agents }) {
       (presets.length ? ' (presets: ' + presets.join(', ') + ')' : '') +
       ', then call dag_run in the current repository. ' +
       checkList(checks),
+    importRule +
+      (writebackMode(trackerWriteback) === 'off'
+        ? ' This profile does not report back to GitHub issues; do not close or comment on them yourself unless the user asks.'
+        : ' This profile reports each integrated GitHub ticket on its issue (' + writebackMode(trackerWriteback) + '); do not do it yourself.'),
+    reviewOnComplete === true
+      ? 'This profile reviews each run once: the first completion notice asks you to run code-review on the integration branch and add fixes with dag_add. Follow it; do not review again after the fixes land.'
+      : '',
     'Only the top-level captain may use dag_* tools. Keep the runId. When dag_run returns mode staged, tell the user to review and approve the plan in the 「工单 · <runId>」 tab of the right sidebar, then end the turn; after starting, end the turn when only waiting remains. The host schedules work and notifies you. Use dag_status for inspection, dag_resume after a host restart, and dag_retry only after addressing the specified ticket blocker. dag_cleanup removes the worktrees and branches of integrated tickets in a run. dag_add appends tickets to a run: they need no user approval, may use profile checks or the checks already in the run manifest, and cannot add new commands. Workers complete their own assignment and leave orchestration to the captain.',
-  ].join('\n')
+  ]
+    .filter(Boolean)
+    .join('\n')
 }
 
 // The latest user message activates the plugin when it starts with /dag or names Agent Teams anywhere.
@@ -103,7 +123,7 @@ function invocation(messages) {
 function commandDirective({ trigger, goal }, checks) {
   return [
     'The user activated dsh-ticket-dag, this profile’s Agent Teams plugin, with ' + trigger + '. Follow the dsh-ticket-dag captain rules in your system instructions.',
-    'Inspect the repository, split the goal into two or more tickets with genuine dependencies only, and call dag_run in this repository. If it returns staged, ask the user to review the plan in the right sidebar and end the turn; do not approve it yourself.',
+    'Inspect the repository, split the goal into two or more tickets with genuine dependencies only, and call dag_run in this repository. If the goal names a spec or tickets on a tracker, call dag_import first and follow its dependencyMode. If it returns staged, ask the user to review the plan in the right sidebar and end the turn; do not approve it yourself.',
     checkList(checks),
     goal ? 'Goal: ' + goal : 'No goal was given: ask the user what the team should accomplish.',
   ].join('\n')
@@ -150,7 +170,7 @@ function setting(field, fallback) {
   return typeof field?.get === 'function' ? field.get() : (field ?? fallback)
 }
 
-export function apply(ctx, config = {}) {
+export function apply(ctx, config = {}, { importer = importTickets, reporter = writeback } = {}) {
   const settings = () => ({
     checks: setting(config.checks, {}),
     agents: setting(config.agents, builtinAgents),
@@ -159,6 +179,8 @@ export function apply(ctx, config = {}) {
     maxAppendedTickets: setting(config.maxAppendedTickets, 20),
     maxWorkers: setting(config.maxWorkers, 16),
     checkTimeoutMs: setting(config.checkTimeoutMs, 120000),
+    trackerWriteback: writebackMode(setting(config.trackerWriteback, 'off')),
+    reviewOnComplete: setting(config.reviewOnComplete, false) === true,
   })
   const live = new Map()
   const notifying = new Map()
@@ -256,7 +278,7 @@ export function apply(ctx, config = {}) {
       ctx.logger.warn('Cannot index this run for the dashboard: ' + String(error).slice(0, 300))
     }
   }
-  const coordinator = new Coordinator({ launch, notify, canRetry, rememberRun, ...settings() })
+  const coordinator = new Coordinator({ launch, notify, canRetry, rememberRun, writeback: reporter, ...settings() })
   ctx.inject?.(['connection'], (scope) => {
     // A ticket without its own model inherits the captain's route, so the board shows it.
     mountDashboard(scope, catalog, coordinator, (parentId) => ctx.agents.get(parentId)?.options)
@@ -421,6 +443,34 @@ export function apply(ctx, config = {}) {
         description: 'Array of ticket objects in the dag_run manifest format, or a JSON string of it.',
       },
     },
+  )
+  ctx.tools.register(
+    defineTool({
+      name: 'dag_import',
+      description:
+        'Read a spec and its tickets from the tracker that /to-spec and /to-tickets publish to, and return a dag_run manifest draft without starting anything. spec is a GitHub issue number (#12 or 12) or URL whose sub-issues are the tickets, or a local .scratch/<slug> folder (spec.md plus issues/NN-*.md). Each ticket carries id, title, prompt (the ticket body with a pointer to the spec), acceptance (its checkboxes), depends_on and source. dependencyMode tells you what to do: declared means the tracker gave blocking edges (GitHub native dependencies or Blocked by lines), so keep depends_on unchanged; none means infer depends_on yourself; no-tickets means split the spec yourself. Closed issues and done local tickets are skipped and listed; a blocker that is closed counts as satisfied; an open blocker outside the spec is an error. Add verify, agent and checks, then call dag_run.',
+      parameters: {
+        spec: {
+          type: 'string',
+          required: true,
+          description: 'GitHub issue number or URL of the spec, or a local spec path.',
+        },
+        repo: {
+          type: 'string',
+          description: 'owner/name for a bare issue number; defaults to the current repository.',
+        },
+      },
+      output,
+      async execute(args, exec) {
+        const agent = exec.agent
+        if (!topLevel(agent) || ctx.agents.get(agent.id) !== agent) {
+          throw new Error('Only the live top-level captain can import tickets')
+        }
+        if (closing) throw new Error('DAG plugin is stopping')
+        const cwd = await ctx.workingDirectory.ensure(agent, exec.signal)
+        return JSON.parse(JSON.stringify(await importer({ cwd, spec: args.spec, repo: args.repo })))
+      },
+    }),
   )
   ctx.systemPrompt.section({
     name: 'tool:dsh-ticket-dag',

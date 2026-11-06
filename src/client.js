@@ -210,6 +210,8 @@ window.__ModuleLoader__.load({
       return {
         maxWorkers: String(value.maxWorkers ?? 16),
         requireApproval: value.requireApproval ?? true,
+        trackerWriteback: ['comment', 'close'].includes(value.trackerWriteback) ? value.trackerWriteback : 'off',
+        reviewOnComplete: value.reviewOnComplete === true,
         checkTimeoutMs: String(value.checkTimeoutMs ?? 120000),
         rules: Object.entries(value.checks ?? {}).map(([id, commands]) => ({ id, commands })),
         agents: Object.entries(value.agents ?? builtinAgents).map(([id, preset]) => agentRow(id, preset)),
@@ -275,6 +277,12 @@ window.__ModuleLoader__.load({
       }
       if (base.requireApproval !== draft.requireApproval) {
         changed.push({ op: 'set', path: ['requireApproval'], value: draft.requireApproval })
+      }
+      if (base.trackerWriteback !== draft.trackerWriteback) {
+        changed.push({ op: 'set', path: ['trackerWriteback'], value: draft.trackerWriteback })
+      }
+      if (base.reviewOnComplete !== draft.reviewOnComplete) {
+        changed.push({ op: 'set', path: ['reviewOnComplete'], value: draft.reviewOnComplete })
       }
       if (JSON.stringify(base.rules) !== JSON.stringify(draft.rules)) {
         changed.push({ op: 'set', path: ['checks'], value: checksFrom(draft.rules) })
@@ -672,6 +680,55 @@ window.__ModuleLoader__.load({
               ),
             ),
           ),
+          !agentsOnly &&
+            h(
+              'label',
+              { className: 'dtd-check' },
+              h('input', {
+                type: 'checkbox',
+                'aria-label': '完成后审查一轮',
+                checked: draft.reviewOnComplete,
+                onChange: (e) =>
+                  change((d) => {
+                    d.reviewOnComplete = e.target.checked
+                  }),
+              }),
+              h(
+                'span',
+                null,
+                h('strong', null, '完成后审查一轮'),
+                h(
+                  'small',
+                  null,
+                  '打开时，一轮运行首次全部集成后，插件在“运行完成”通知里要求队长用 code-review 审查集成分支，并把要修的发现用 dag_add 追加为修复工单。修复工单集成后不再重复审查。',
+                ),
+              ),
+            ),
+          !agentsOnly &&
+            h(
+              'label',
+              null,
+              h('span', null, '集成后回写 GitHub 工单'),
+              h(
+                'select',
+                {
+                  'aria-label': '集成后回写 GitHub 工单',
+                  value: draft.trackerWriteback,
+                  onChange: (e) =>
+                    change((d) => {
+                      d.trackerWriteback = e.target.value
+                    }),
+                },
+                h('option', { value: 'off' }, '不回写'),
+                h('option', { value: 'comment' }, '评论集成分支与提交'),
+                h('option', { value: 'close' }, '评论并关闭工单'),
+              ),
+              h(
+                'small',
+                null,
+                '只作用于用 dag_import 从 GitHub 导入的工单：工单集成到本轮集成分支后，插件用 gh 在对应 issue 下评论；选“关闭”时同时关闭该 issue。集成分支尚未合入默认分支，关闭前请确认这符合你的流程。',
+              ),
+            ),
           h(
             'section',
             { className: 'dtd-section', 'aria-label': '预设 Agent' },

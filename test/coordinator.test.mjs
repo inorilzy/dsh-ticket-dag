@@ -1159,6 +1159,96 @@ test('tickets appended to a staged run wait for the user and are approved with t
   }
 })
 
+test('reviewOnComplete asks for one review round on the first completion and not after the fixes land', { timeout: limit(90000) }, async (t) => {
+  const cwd = await repo(t)
+  const notices = []
+  const co = new Coordinator({
+    checks: {},
+    reviewOnComplete: true,
+    notify: async (n) => (notices.push(n.text), true),
+    launch: async (job) => ({ dispose: async () => {}, result: (async () => (await commit(job), { ok: true }))() }),
+  })
+  const q = { cwd, parentId: 'captain', runId: 'review' }
+  const completions = () => notices.filter((n) => /All tickets integrated/.test(n))
+  try {
+    await co.start({ ...q, manifest: { spec_id: 'rv', tickets: [{ id: 'A', title: 'A' }] } })
+    await until(async () => completions().length === 1, 'first completion notice')
+    const base = await git(cwd, 'rev-parse', 'main')
+    assert.match(completions()[0], /Review step: run the code-review skill/)
+    assert.ok(completions()[0].includes('git diff ' + base + '...integration/review'), completions()[0])
+    assert.match(completions()[0], /dag_add to runId review/)
+    await co.add({ ...q, tickets: [{ id: 'FIX1', title: 'Review fix' }] })
+    await until(async () => completions().length === 2, 'second completion notice')
+    assert.match(completions()[1], /without reviewing again/)
+    assert.doesNotMatch(completions()[1], /Review step/)
+  } finally {
+    await co.close()
+  }
+  // Off by default: the completion notice is unchanged.
+  const cwd2 = await repo(t)
+  const plain = []
+  const off = new Coordinator({
+    checks: {},
+    notify: async (n) => (plain.push(n.text), true),
+    launch: async (job) => ({ dispose: async () => {}, result: (async () => (await commit(job), { ok: true }))() }),
+  })
+  try {
+    await off.start({ cwd: cwd2, parentId: 'captain', runId: 'plain', manifest: { spec_id: 'p', tickets: [{ id: 'A', title: 'A' }] } })
+    await until(async () => plain.some((n) => /All tickets integrated/.test(n)), 'plain completion')
+    assert.ok(plain.every((n) => !/review/i.test(n)))
+  } finally {
+    await off.close()
+  }
+})
+
+test('an integrated imported GitHub ticket is reported once when trackerWriteback is on; failures do not block', { timeout: limit(60000) }, async (t) => {
+  const cwd = await repo(t)
+  const reports = []
+  const co = new Coordinator({
+    checks: {},
+    trackerWriteback: 'comment',
+    writeback: async (q) => {
+      reports.push(q)
+      if (q.source.number === 3) throw new Error('gh offline')
+      return { status: 'commented', target: q.source.repo + '#' + q.source.number }
+    },
+    launch: async (job) => ({ dispose: async () => {}, result: (async () => (await commit(job), { ok: true }))() }),
+  })
+  const q = { cwd, parentId: 'captain', runId: 'writeback' }
+  const gh = (number) => ({ kind: 'github', repo: 'o/r', number })
+  try {
+    await co.start({
+      ...q,
+      manifest: {
+        spec_id: 'gh-1',
+        tickets: [
+          { id: 'A', title: 'A', source: gh(2) },
+          { id: 'B', title: 'B', depends_on: ['A'], source: gh(3) },
+          { id: 'C', title: 'C', source: { kind: 'local', path: '.scratch/x/issues/01-c.md' } },
+        ],
+      },
+    })
+    const done = await until(async () => {
+      const s = await co.status(q)
+      if (s.counts.NEEDS_ATTENTION) throw Error(JSON.stringify(s))
+      return s.complete && reports.length === 2 && s
+    }, 'integrated and reported')
+    assert.deepEqual(done.tickets.find((x) => x.id === 'A').source, gh(2))
+    assert.deepEqual(reports.map((r) => [r.source.number, r.mode, r.ref, r.runId]).sort(), [
+      [2, 'comment', 'refs/heads/integration/writeback', 'writeback'],
+      [3, 'comment', 'refs/heads/integration/writeback', 'writeback'],
+    ])
+    const landed = done.tickets.find((x) => x.id === 'A').landedSha
+    assert.equal(reports.find((r) => r.source.number === 2).landedSha, landed)
+    const run = co.runs.values().next().value
+    await run.writebacks
+    const types = run.db.events().filter((e) => e.type.startsWith('writeback_')).map((e) => [e.ticketId, e.type])
+    assert.deepEqual(types.sort(), [['A', 'writeback_done'], ['B', 'writeback_failed']])
+  } finally {
+    await co.close()
+  }
+})
+
 test('a ticket without checks integrates after a clean merge, with an empty profile registry', { timeout: limit(60000) }, async (t) => {
   const cwd = await repo(t)
   const prompts = []

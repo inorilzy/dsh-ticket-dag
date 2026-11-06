@@ -76,8 +76,21 @@ function ledgerDigest(db) {
     ),
   }
 }
-function eventText(meta, event) {
-  return '[dsh-ticket-dag ' + meta.runId + '] ' + event.message + '\nevent_id=' + event.eventId
+function eventText(meta, event, review = '') {
+  return '[dsh-ticket-dag ' + meta.runId + '] ' + event.message + (review ? '\n\n' + review : '') + '\nevent_id=' + event.eventId
+}
+// With reviewOnComplete, the first completion notice asks the captain for one
+// review round; later completions (the appended fixes landing) say it is done.
+function reviewText(meta, first) {
+  const branch = meta.ref.replace(/^refs\/heads\//, '')
+  return first
+    ? 'Review step: run the code-review skill on this run before reporting. Fixed point ' + meta.baseSha +
+        '; review ' + branch + ' rather than HEAD: git diff ' + meta.baseSha + '...' + branch +
+        ' and git log ' + meta.baseSha + '..' + branch + '. Use the spec this run was built from. ' +
+        'Turn each finding you accept into a small fix ticket and add it with dag_add to runId ' + meta.runId +
+        ' (verify may name only check IDs this run already uses). Write down why for each finding you do not fix. ' +
+        'If nothing needs fixing, report to the user now.'
+    : 'Review fixes are integrated. This run had its review round; report to the user without reviewing again.'
 }
 function specPrompt(meta, row, upstream) {
   const stamp = [
@@ -177,6 +190,9 @@ export class Coordinator {
     checkTimeoutMs = 120000,
     retryDelayMs = 1500,
     maxAutoRetries = 2,
+    trackerWriteback = 'off',
+    reviewOnComplete = false,
+    writeback,
   } = {}) {
     requireValue(typeof launch === 'function', 'A subagent launch adapter is required')
     requireValue(
@@ -197,6 +213,9 @@ export class Coordinator {
       checkTimeoutMs,
       retryDelayMs,
       maxAutoRetries,
+      trackerWriteback,
+      reviewOnComplete,
+      writeback,
     })
     this.runs = new Map()
     this.opening = new Map()
@@ -221,6 +240,8 @@ export class Coordinator {
     maxAppendedTickets = this.maxAppendedTickets,
     maxWorkers,
     checkTimeoutMs,
+    trackerWriteback = this.trackerWriteback,
+    reviewOnComplete = this.reviewOnComplete,
   }) {
     requireValue(
       Number.isInteger(maxWorkers) && maxWorkers >= 1 && maxWorkers <= 32,
@@ -241,6 +262,8 @@ export class Coordinator {
       maxAppendedTickets,
       maxWorkers,
       checkTimeoutMs,
+      trackerWriteback,
+      reviewOnComplete,
     })
     for (const run of this.runs.values()) this._wake(run)
   }
@@ -546,6 +569,7 @@ export class Coordinator {
       await git.assertMergeParents(m.repo, i.candidateSha, i.oldTip, i.sourceSha)
       if (actual === i.candidateSha) {
         requireValue(run.db.finish(i.id, i.lease, i.candidateSha), 'Cannot repair the published ledger')
+        this._writeback(run, i.id)
       } else if (actual === i.oldTip) {
         if (m.mode === 'cancelled') {
           run.db.abandonIntent(i.id, i.lease)
@@ -555,6 +579,7 @@ export class Coordinator {
         this._checkPolicy(run)
         await git.publishCandidate(m.repo, m.ref, i.oldTip, i.candidateSha)
         requireValue(run.db.finish(i.id, i.lease, i.candidateSha), 'Cannot finish recovered publication')
+        this._writeback(run, i.id)
       } else throw new Error('Unrecognized target tip during publication recovery: ' + i.id)
     }
   }
@@ -602,10 +627,12 @@ export class Coordinator {
           agentSpec,
           cleanup,
           cleanupReason,
+          source,
         }) => ({
           id,
           title,
           status,
+          source: source ?? null,
           agent: agent ?? null,
           model: modelRoute({ agentSpec }),
           route: {
@@ -957,7 +984,12 @@ export class Coordinator {
       let delivered = false
       for (const e of run.db.pendingNotifications()) {
         if (this.stopping) break
-        if (!(await this.notify({ parentId: m.parentId, eventId: e.eventId, text: eventText(m, e) }))) break
+        let review = ''
+        if (e.type === 'run_completed' && this.reviewOnComplete) {
+          const first = run.db.events().find((x) => x.type === 'run_completed')
+          review = reviewText(m, first?.id === e.eventId)
+        }
+        if (!(await this.notify({ parentId: m.parentId, eventId: e.eventId, text: eventText(m, e, review) }))) break
         run.db.ackNotification(e.eventId)
         delivered = true
       }
@@ -1169,6 +1201,26 @@ export class Coordinator {
     run.db.move(row.id, row.lease, 'RUNNING', 'NEEDS_ATTENTION', patch)
   }
 
+  // Report an integrated imported ticket on its GitHub issue, once, when the
+  // profile turned trackerWriteback on. Failure is recorded and never blocks the run.
+  _writeback(run, id) {
+    if (this.trackerWriteback === 'off' || !this.writeback) return
+    const t = run.db.get(id)
+    if (t?.status !== 'INTEGRATED' || t.source?.kind !== 'github') return
+    if (run.db.events().some((e) => e.ticketId === id && e.type === 'writeback_done')) return
+    const m = run.db.meta()
+    const mode = this.trackerWriteback
+    run.writebacks = (run.writebacks ?? Promise.resolve())
+      .then(() =>
+        this.writeback({ cwd: m.repo.root, source: t.source, mode, runId: m.runId, ref: m.ref, landedSha: t.landedSha }),
+      )
+      .then(
+        (r) => run.db.recordWriteback(id, 'done', id + ' reported on ' + (r?.target ?? 'its issue'), { mode, ...r }),
+        (err) => run.db.recordWriteback(id, 'failed', id + ' could not be reported: ' + message(err), { mode }),
+      )
+      .catch(() => {})
+  }
+
   async _integrate(run, row, tip, job) {
     await serial(run, () => this._checkLedger(run))
     const m = run.db.meta()
@@ -1220,6 +1272,7 @@ export class Coordinator {
       }
     })
     if (run.db.get(row.id).status === 'INTEGRATED') {
+      this._writeback(run, row.id)
       try {
         await git.releaseCandidate(m.repo, candidatePath, candidate)
       } catch {
@@ -1256,7 +1309,7 @@ export class Coordinator {
     for (const r of runs) {
       try {
         await Promise.allSettled(
-          [...r.work.values()].map((j) => j.promise).concat([r.integration?.promise, r.notifier]),
+          [...r.work.values()].map((j) => j.promise).concat([r.integration?.promise, r.notifier, r.writebacks]),
         )
         await r.serial
       } catch (err) {
