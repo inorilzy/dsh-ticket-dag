@@ -1598,6 +1598,24 @@ test('a failed read marks the folded plan as an old snapshot and does not invent
   assert.deepEqual(opened.host.opened, [['dsh-resource://ticket-dag/' + cardKey + '/demo-01', 'ticket-dag']])
 })
 
+test('a run missing from the board list is marked an old snapshot, not a live ticket count', async () => {
+  const node = runCardNode()
+  // The run list answers, but this run is no longer in it. That is a read
+  // failure for the card, so its folded plan must not look live.
+  const gone = loadHost([], { respond: async () => answer(200, { runs: [], selected: null }) })
+  gone.renderSlot('conversation.chat.node', { sessionId: 's1', node })
+  await settle()
+  assert.equal(gone.indexed.filter(([at]) => at === 1).at(-1)[1], false, 'a missing run sets the snapshot to failed')
+  const { host, card } = renderRunCard(null, false)
+  assert.equal(cardState(card), '旧快照')
+  assert.match(text(card), /旧快照 · 4 张工单/)
+  assert.match(text(card), /读取失败，以下是旧快照，不是当前状态。/)
+  assert.deepEqual(cardMembers(card), ['文档员 · 2 张', '实现者 · 1 张', '默认成员 · 1 张'])
+  assert.doesNotMatch(text(card), /待确认|运行中|已暂停|已取消|已完成|记录不可读取/)
+  openRunCard(host, card)
+  assert.deepEqual(host.opened, [])
+})
+
 test('a closed turn shows its run cards in the turn tail instead of at the folded tool call', () => {
   const data = foldCard(loadHost([]).definitions[0], dagCall, dagResult(dagRunResult)).data
   const closed = { turn: 3, status: 'closed' }

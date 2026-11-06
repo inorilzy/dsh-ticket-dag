@@ -513,6 +513,39 @@ test('every snapshot mode carries the presets so the progress board can name mem
   }
 })
 
+test('a run the recovery scan cannot attach is listed as unreadable with its diagnostic', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'dag-recovery-board-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const catalog = new RunCatalog(join(root, 'profile'))
+  const { db, file } = addRun(root, 'repo', catalog, 1)
+  const cold = { maxWorkers: 16, runs: new Map(), peek: () => assert.fail('Unexpected attach') }
+  try {
+    const before = catalog.read(cold, null, 'captain-repo')
+    assert.equal(before.runs.length, 1)
+    assert.equal(before.selected.available, true)
+    // The host reports a failed attach: same run, still listed, now unreadable with the reason.
+    catalog.reportFailure('captain-repo', 'same', 'Another DSH coordinator owns this run: /runs/same', file)
+    const view = catalog.read(cold, null, 'captain-repo')
+    assert.equal(view.runs.length, 1)
+    assert.equal(view.selected.available, false)
+    assert.equal(view.selected.mode, 'unavailable')
+    assert.match(view.selected.diagnostic, /Another DSH coordinator owns this run/)
+    assert.deepEqual(view.selected.tickets, [])
+    // Another captain neither sees this run nor its failure.
+    assert.deepEqual(catalog.read(cold, null, 'someone-else'), { runs: [], selected: null })
+
+    // A failure for a run missing from the index still appears as a board row.
+    catalog.reportFailure('captain-ghost', 'ghost-run', 'Cannot read the run ledger x: not a database', '/nonexistent/runs/ghost-run/state.sqlite')
+    const ghost = catalog.read(cold, null, 'captain-ghost')
+    assert.equal(ghost.runs.length, 1)
+    assert.equal(ghost.selected.runId, 'ghost-run')
+    assert.equal(ghost.selected.available, false)
+    assert.match(ghost.selected.diagnostic, /not a database/)
+  } finally {
+    db.close()
+  }
+})
+
 test(
   'the installed DSH dispatcher rejects a non-owner before serving any dashboard data',
   {

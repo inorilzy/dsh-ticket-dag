@@ -379,8 +379,22 @@ export function apply(ctx, config = {}, { importer = importTickets, reporter = w
         const cwd = await ctx.workingDirectory.ensure(agent)
         if (closing) return
         const scan = await coordinator.attach({ cwd, parentId: agent.id })
-        for (const { runId, error } of scan.failures ?? [])
+        // A run the scan could not recover must not fail silently: show it on a
+        // board row with its diagnostic and send the captain one notice. The
+        // scan still never takes another coordinator's owner lock.
+        for (const { runId, error, file } of scan.failures ?? []) {
           ctx.logger.warn('DAG recovery scan, run ' + runId + ': ' + error.slice(0, 500))
+          catalog.reportFailure(agent.id, runId, error, file)
+          const eventId = 'recovery-failed:' + runId
+          void notify({
+            parentId: agent.id,
+            eventId,
+            text:
+              '[dsh-ticket-dag ' + runId + '] 恢复失败：' + error.slice(0, 500) +
+              '\n这轮运行在挂载时无法恢复（可能被其他协调器占用、记录损坏或加载失败）。请在处理后在队长会话中重新打开。' +
+              '\nevent_id=' + eventId,
+          })
+        }
       })
       .catch((error) => ctx.logger.warn('DAG recovery scan: ' + String(error).slice(0, 300)))
       .finally(() => attaching.delete(job))
