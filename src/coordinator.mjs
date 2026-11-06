@@ -3,7 +3,7 @@ import { access, lstat, mkdir, readFile, readdir, writeFile } from 'node:fs/prom
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import * as git from './git.mjs'
-import { agentSpec, normalizeAppend, normalizeManifest, RunStore } from './store.mjs'
+import { agentSpec, ledgerSnapshot, normalizeAppend, normalizeManifest, RunStore } from './store.mjs'
 
 const hash = (text) => createHash('sha256').update(text).digest('hex')
 const message = (err) => String(err?.message ?? err).slice(-3500)
@@ -67,21 +67,16 @@ function runTickets(db, meta = db.meta()) {
 // Digest of the ledger fields that decide dispatch and acceptance. plan covers
 // the run row and submitted manifest; approval covers the per-ticket
 // definitions (approved presets, verify IDs), dependency edges, append records
-// and which manifest checks the approval covered.
+// and which manifest checks the approval covered. The arrays come from
+// store.ledgerSnapshot so this digest and planRevision hash the same rows.
 function ledgerDigest(db) {
-  const { run, tickets, dependencies, appended, approvals } = db.integrity()
+  const integrity = db.integrity()
+  const snapshot = ledgerSnapshot(integrity)
   return {
-    mode: run.mode,
-    plan: hash(
-      JSON.stringify([run.runId, run.repo, run.ref, run.baseSha, run.parentId, run.policyHash, run.manifest]),
-    ),
+    mode: integrity.run.mode,
+    plan: hash(JSON.stringify(snapshot.run)),
     approval: hash(
-      JSON.stringify([
-        tickets.map((t) => [t.id, t.position, t.definition]),
-        dependencies.map((d) => [d.ticketId, d.upstream]),
-        appended.map((a) => [a.ticketId, a.batch, a.definition, a.policyHash, a.createdAt]),
-        approvals.map((a) => a.details),
-      ]),
+      JSON.stringify([snapshot.tickets, snapshot.dependencies, snapshot.appended, snapshot.approvals]),
     ),
   }
 }
@@ -645,7 +640,7 @@ export class Coordinator {
       verifiedSha: m.tipSha,
       // The opaque version of the plan the review is showing. Sending it back
       // with approval lets the serial region refuse an approval of an older plan.
-      revision: run.db.revision(),
+      revision: run.db.revision(this.agents),
       maxWorkers: Math.min(this.maxWorkers, run.limit),
       counts,
       cleanup: {
@@ -985,8 +980,8 @@ export class Coordinator {
           'Refresh the plan and confirm again; if you are on an older client, upgrade before approving a staged plan.',
       )
       requireValue(
-        revision === run.db.revision(),
-        'The plan changed after you reviewed it (a ticket was appended or the approved checks changed). ' +
+        revision === run.db.revision(this.agents),
+        'The plan changed after you reviewed it (a ticket was appended, the approved checks changed, or an effective preset changed). ' +
           'Refresh the plan and confirm the current version again.',
       )
       // A choice may only name a ticket of the plan, once each. Unknown or
