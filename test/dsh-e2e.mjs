@@ -292,7 +292,8 @@ for (const { workers, title, custom } of cases)
         fixtureError,
         receivedNotice = false,
         captainIdle = false,
-        sawStagedResult = false
+        sawStagedResult = false,
+        stagedResult = ''
       const notifications = []
       const server = createServer(async (req, res) => {
         try {
@@ -452,6 +453,7 @@ for (const { workers, title, custom } of cases)
             blockedRevival = true
           if (event.type === 'tool/result') {
             const text = JSON.stringify(event.data)
+            if (sawStaged(text)) stagedResult = text
             sawStagedResult ||= sawStaged(text)
             notifications.push(text.slice(0, 1400))
           }
@@ -499,8 +501,10 @@ for (const { workers, title, custom } of cases)
           await delay(75)
         }
         await delay(1500)
-        const diagnostics = JSON.stringify({ captainRequests, childRequests, sawStagedResult, notifications, stderr })
+        const diagnostics = JSON.stringify({ captainRequests, childRequests, sawStagedResult, stagedResult, notifications, stderr })
         assert.ok(sawDagTool && sawStagedResult, 'dag_run should return mode staged. ' + diagnostics)
+        // The approval is bound to the plan revision this result carries.
+        assert.match(stagedResult, /revision/, 'a staged result must carry its plan revision. ' + diagnostics)
         assert.equal(childRequests, 0, 'No worker may start before the user approves. ' + diagnostics)
         assert.equal(childSessionId, undefined)
         assert.equal(existsSync(marker), false, 'The unreviewed manifest command must not run')

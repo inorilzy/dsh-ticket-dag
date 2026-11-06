@@ -518,31 +518,72 @@ test(
   {
     skip: !process.env.DSH_TEST_BIN && 'Set DSH_TEST_BIN to test host access control',
   },
-  async () => {
+  async (t) => {
     const requireHost = createRequire(resolve(process.env.DSH_TEST_BIN))
     const { HostConnectionService } = await import(
       pathToFileURL(requireHost.resolve('@deepseek-ai/dsh-client-connection')).href
     )
+    // An isolated ledger fixture per run: the owner sees only this run, and the
+    // temp root is removed even if an assertion fails.
+    const root = mkdtempSync(join(tmpdir(), 'dsh-access-'))
+    const catalog = new RunCatalog(join(root, 'profile'))
+    const { db, file } = addRun(root, 'owned-repo', catalog, 1)
+    t.after(() => {
+      db.close()
+      rmSync(root, { recursive: true, force: true })
+    })
+    const coordinator = {
+      runs: new Map([[file, {}]]),
+      maxWorkers: 16,
+      agents: {},
+      peek: () => ({
+        available: true,
+        mode: 'active',
+        complete: true,
+        counts: { INTEGRATED: 2 },
+        rawMaxWorkers: 1,
+        tickets: [
+          { id: 'A', title: 'A title', status: 'INTEGRATED', dependsOn: [], verify: [], attempt: 1 },
+          { id: 'B', title: 'B title', status: 'INTEGRATED', dependsOn: ['A'], verify: [], attempt: 1 },
+        ],
+      }),
+    }
     const connection = Object.create(HostConnectionService.prototype)
     connection.fetchRoutes = new Map()
     connection.interceptors = new Map()
     const scope = { effect: (f) => f() }
     let reads = 0
+    const readOwn = catalog.read.bind(catalog)
+    catalog.read = (...args) => {
+      reads++
+      return readOwn(...args)
+    }
     mountDashboard(
       { connection: { fetch: { register: (route) => connection.registerFetchRoute(scope, route) } } },
-      {
-        read() {
-          reads++
-          return { runs: [], selected: null }
-        },
-      },
-      {},
+      catalog,
+      coordinator,
+      () => undefined,
     )
     const host = connection.createSharedFetchHandler('/api')
     const url = 'http://localhost/api/ticket-dag.dashboard'
-    assert.equal((await host.fetch(new Request(url), { principal: { kind: 'remote' } })).status, 403)
+    // A non-owner never reaches the ledger, whether it names a parent or a key.
+    assert.equal(
+      (await host.fetch(new Request(url + '?parent=captain-owned-repo'), { principal: { kind: 'remote' } })).status,
+      403,
+    )
+    assert.equal(
+      (await host.fetch(new Request(url + '?key=' + 'a'.repeat(64)), { principal: { kind: 'remote' } })).status,
+      403,
+    )
     assert.equal(reads, 0)
-    assert.equal((await host.fetch(new Request(url), { principal: { kind: 'owner' } })).status, 200)
+    // The owner reads only its own isolated run.
+    const owned = await host.fetch(new Request(url + '?parent=captain-owned-repo'), {
+      principal: { kind: 'owner' },
+    })
+    assert.equal(owned.status, 200)
+    const view = await owned.json()
+    assert.equal(view.runs.length, 1)
+    assert.equal(view.selected.runId, 'same')
     assert.equal(reads, 1)
   },
 )
