@@ -40,9 +40,9 @@ DSH_TEST_PUPPETEER=<unset>
 # 工作区内是否有已安装的 @deepseek-ai/dsh/lib/bin.js
 Get-ChildItem -Path 'D:\tmp\dsh-ticket-dag-workspace' -Recurse -Filter 'bin.js' | Where-Object { $_.FullName -match '@deepseek-ai\\dsh\\lib\\bin\.js$' }
 # 全局是否有 @deepseek-ai 包
-Get-ChildItem 'C:\Users\zhiyu_liu\AppData\Roaming\npm\node_modules\@deepseek-ai'
+Get-ChildItem "$env:USERPROFILE\AppData\Roaming\npm\node_modules\@deepseek-ai"
 # 是否有 puppeteer-core
-Get-ChildItem 'C:\Users\zhiyu_liu\AppData\Roaming\npm\node_modules' | Where-Object { $_.Name -like 'puppeteer*' }
+Get-ChildItem "$env:USERPROFILE\AppData\Roaming\npm\node_modules" | Where-Object { $_.Name -like 'puppeteer*' }
 ```
 
 输出：三段均为空；`C:\Program Files\Google\Chrome\Application\chrome.exe` 存在（`Test-Path` 返回 `True`），但 `DSH_TEST_CHROME` 未指向它。

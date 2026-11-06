@@ -145,8 +145,9 @@ export class RunCatalog {
         db.close()
       }
     }
-    // Entries remembered this process but not yet in the index stay visible and
-    // win over the index row, as before.
+    // Entries remembered this process stay visible even when the index is missing
+    // or not yet written, and their metadata wins over the index row; the cached
+    // summary still comes from the index so a live entry does not force a ledger read.
     for (const [key, live] of this.live) {
       if (parent !== null && live.parentId !== parent) continue
       const cached = known.get(key)
