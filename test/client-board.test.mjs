@@ -1326,27 +1326,176 @@ test('each dag_run tool call folds into a conversation card that keeps the run I
   assert.equal(foldCard(definition, dagCall, dagResult('not json')), null)
 })
 
+// RunCard state order: found run, snapshot (false when the read failed), notice.
+// The node is what the dag_run fold stored: the plan at start, not the live roster.
+function runCardNode() {
+  return {
+    data: foldCard(loadHost([]).definitions[0], dagCall, dagResult(dagRunResult)).data,
+    location: { kind: 'turn', turn: { turn: 3, status: 'open' } },
+  }
+}
+const cardKey = 'e'.repeat(64)
+function cardSnapshot(extra = {}) {
+  return {
+    key: cardKey,
+    runId: 'demo-01',
+    mode: 'staged',
+    available: true,
+    complete: false,
+    counts: { PENDING: 4 },
+    presets: [{ id: 'docs', name: '写文档的' }],
+    tickets: dagRunResult.tickets.map((t) => ({ ...t })),
+    ...extra,
+  }
+}
+function renderRunCard(found, snapshot) {
+  const host = loadHost([found, snapshot, ''])
+  const card = host.renderSlot('conversation.chat.node', { sessionId: 's1', node: runCardNode() })
+  return { host, card }
+}
+const openRunCard = (host, card) => find(card, (n) => n.type === 'button').props.onClick()
+const cardState = (card) => find(card, (n) => n.props['data-dag-run-state'] !== undefined).props['data-dag-run-state']
+const cardMembers = (card) => findAll(card, (n) => n.props['data-dag-member'] !== undefined).map(text)
+
 test('the run card names its members, shows the run state and opens the run tab', () => {
-  const key = 'e'.repeat(64)
-  const presets = [{ id: 'docs', name: '写文档的' }]
-  const node = { data: foldCard(loadHost([]).definitions[0], dagCall, dagResult(dagRunResult)).data, location: { kind: 'turn', turn: { turn: 3, status: 'open' } } }
-  // RunCard state order: found run, presets, notice.
-  const host = loadHost([{ key, runId: 'demo-01', mode: 'staged' }, presets, ''])
-  const card = host.renderSlot('conversation.chat.node', { sessionId: 's1', node })
+  const snapshot = cardSnapshot()
+  const { host, card } = renderRunCard(snapshot, snapshot)
   assert.deepEqual(host.urls, ['api/ticket-dag.dashboard?parent=s1'], 'reads this conversation only')
   assert.match(text(card), /工单 · demo-01/)
+  assert.equal(cardState(card), '待确认')
   assert.match(text(card), /待确认 · 4 张工单/)
-  const members = findAll(card, (n) => n.props['data-dag-member'] !== undefined)
-  assert.deepEqual(members.map(text), ['写文档的 · 2 张', '实现者 · 1 张', '默认成员 · 1 张'])
-  find(card, (n) => n.type === 'button').props.onClick()
-  assert.deepEqual(host.opened, [['dsh-resource://ticket-dag/' + key + '/demo-01', 'ticket-dag']])
+  assert.deepEqual(cardMembers(card), ['写文档的 · 2 张', '实现者 · 1 张', '默认成员 · 1 张'])
+  openRunCard(host, card)
+  assert.deepEqual(host.opened, [['dsh-resource://ticket-dag/' + cardKey + '/demo-01', 'ticket-dag']])
 
   // Before the run list answers, or for a run no longer listed, the click explains instead.
   const missing = loadHost([null, null, ''])
-  const lone = missing.renderSlot('conversation.chat.node', { sessionId: 's1', node })
+  const lone = missing.renderSlot('conversation.chat.node', { sessionId: 's1', node: runCardNode() })
   find(lone, (n) => n.type === 'button').props.onClick()
   assert.deepEqual(missing.opened, [])
   assert.match(missing.sets.at(-1), /找不到这轮运行的记录/)
+})
+
+test('the run card uses the same status words as the board and still opens that run', () => {
+  const cases = [
+    [cardSnapshot({ mode: 'active', counts: { RUNNING: 4 } }), '运行中', /运行中 · 4 张工单/],
+    [cardSnapshot({ mode: 'active', counts: { NEEDS_ATTENTION: 1, RUNNING: 3 } }), '运行中 · 有待处理工单', /运行中 · 有待处理工单 · 4 张工单/],
+    [cardSnapshot({ mode: 'paused', counts: { PENDING: 4 } }), '已暂停', /已暂停 · 4 张工单/],
+    [cardSnapshot({ mode: 'cancelled', counts: { CANCELLED: 4 } }), '已取消', /已取消 · 4 张工单/],
+    [cardSnapshot({ mode: 'active', complete: true, counts: { INTEGRATED: 4 } }), '已完成', /已完成 · 4 张工单/],
+  ]
+  for (const [snapshot, state, visible] of cases) {
+    const { host, card } = renderRunCard(snapshot, snapshot)
+    assert.equal(cardState(card), state)
+    assert.match(text(card), visible)
+    assert.doesNotMatch(text(card), /进行中|旧快照/)
+    openRunCard(host, card)
+    assert.deepEqual(host.opened, [['dsh-resource://ticket-dag/' + cardKey + '/demo-01', 'ticket-dag']])
+  }
+  const unread = cardSnapshot({
+    available: false,
+    mode: 'unavailable',
+    complete: false,
+    counts: {},
+    tickets: [],
+    diagnostic: '无法读取这轮任务的 SQLite 记录。请确认原仓库及运行记录仍然可用。',
+  })
+  const { host, card } = renderRunCard(unread, unread)
+  assert.equal(cardState(card), '记录不可读取')
+  assert.match(text(card), /无法读取这轮任务的 SQLite 记录/)
+  assert.equal(cardMembers(card).length, 0, 'an unreadable ledger has no current roster')
+  assert.doesNotMatch(text(card), /4 张工单|旧快照/)
+  openRunCard(host, card)
+  assert.deepEqual(host.opened, [['dsh-resource://ticket-dag/' + cardKey + '/demo-01', 'ticket-dag']])
+})
+
+test('a remounted card shows reassigned and appended tickets from the new snapshot', async () => {
+  const node = runCardNode()
+  const presets = [
+    { id: 'docs', name: '写文档的' },
+    { id: 'implementer', name: '改派后的实现' },
+  ]
+  const updated = cardSnapshot({
+    mode: 'active',
+    counts: { RUNNING: 2, PENDING: 3 },
+    presets,
+    tickets: [
+      { id: 'T1', agent: 'implementer' },
+      { id: 'T2', agent: 'implementer' },
+      { id: 'T3', agent: 'docs' },
+      { id: 'T4', agent: null },
+      { id: 'T5', agent: 'docs' },
+    ],
+  })
+  const mount = (body) => {
+    const host = loadHost([], { respond: async () => answer(200, body) })
+    host.renderSlot('conversation.chat.node', { sessionId: 's1', node })
+    return host
+  }
+  const first = mount({ runs: [cardSnapshot({ mode: 'active' })], selected: cardSnapshot({ mode: 'active' }) })
+  await settle()
+  const again = mount({ runs: [updated], selected: updated })
+  await settle()
+  const stored = (host) => host.indexed.filter(([at]) => at === 1).at(-1)[1]
+  const found = (host) => host.indexed.filter(([at]) => at === 0).at(-1)[1]
+  assert.equal(stored(first).tickets.length, 4, 'the first mount keeps the snapshot it just read')
+  assert.equal(stored(again).tickets.length, 5)
+  assert.equal(stored(again).tickets[0].agent, 'implementer', 'approval reassignment is on the new snapshot')
+  const { host, card } = renderRunCard(found(again), stored(again))
+  assert.equal(cardState(card), '运行中')
+  assert.match(text(card), /运行中 · 5 张工单/)
+  assert.deepEqual(cardMembers(card), ['改派后的实现 · 2 张', '写文档的 · 2 张', '默认成员 · 1 张'])
+  assert.doesNotMatch(text(card), /旧快照/)
+  openRunCard(host, card)
+  assert.deepEqual(host.opened, [['dsh-resource://ticket-dag/' + cardKey + '/demo-01', 'ticket-dag']])
+
+  // The open board may have another run selected; the card still reads its own snapshot.
+  const other = cardSnapshot({ key: 'a'.repeat(64), runId: 'other', tickets: [{ id: 'Z', agent: 'docs' }] })
+  const keyed = loadHost([], {
+    respond: async (url) =>
+      url.includes('key=')
+        ? answer(200, { runs: [other, updated], selected: updated })
+        : answer(200, { runs: [other, updated], selected: other }),
+  })
+  keyed.renderSlot('conversation.chat.node', { sessionId: 's1', node })
+  await settle()
+  assert.equal(stored(keyed).runId, 'demo-01')
+  assert.equal(stored(keyed).tickets.length, 5)
+  assert.ok(keyed.urls.some((url) => url.includes('key=' + cardKey)))
+})
+
+test('a failed read marks the folded plan as an old snapshot and does not invent a live status', async () => {
+  const node = runCardNode()
+  const offline = loadHost([], { respond: async () => { throw new TypeError('offline') } })
+  offline.renderSlot('conversation.chat.node', { sessionId: 's1', node })
+  await settle()
+  assert.equal(offline.indexed.some(([at, value]) => at === 1 && value === false), true)
+  const { host, card } = renderRunCard(null, false)
+  assert.equal(cardState(card), '旧快照')
+  assert.match(text(card), /旧快照 · 4 张工单/)
+  assert.match(text(card), /读取失败，以下是旧快照，不是当前状态。/)
+  assert.deepEqual(cardMembers(card), ['文档员 · 2 张', '实现者 · 1 张', '默认成员 · 1 张'])
+  assert.doesNotMatch(text(card), /待确认|运行中|已暂停|已取消|已完成|进行中|记录不可读取/)
+  openRunCard(host, card)
+  assert.deepEqual(host.opened, [])
+  assert.match(host.sets.at(-1), /找不到这轮运行的记录/)
+
+  // The run is listed, but its detail never arrives: still an old snapshot, and the button opens that run.
+  const hit = { key: cardKey, runId: 'demo-01', mode: 'paused', complete: false, counts: { PENDING: 4 }, available: true }
+  const listed = loadHost([], {
+    respond: async (url) => (url.includes('key=') ? answer(500, {}) : answer(200, { runs: [hit], selected: null })),
+  })
+  listed.renderSlot('conversation.chat.node', { sessionId: 's1', node })
+  await settle()
+  const kept = listed.indexed.filter(([at]) => at === 0).at(-1)[1]
+  assert.equal(kept.key, cardKey)
+  assert.equal(listed.indexed.filter(([at]) => at === 1).at(-1)[1], false)
+  const opened = renderRunCard(kept, false)
+  assert.equal(cardState(opened.card), '旧快照')
+  assert.match(text(opened.card), /不是当前状态/)
+  assert.doesNotMatch(text(opened.card), /已暂停|运行中/)
+  openRunCard(opened.host, opened.card)
+  assert.deepEqual(opened.host.opened, [['dsh-resource://ticket-dag/' + cardKey + '/demo-01', 'ticket-dag']])
 })
 
 test('a closed turn shows its run cards in the turn tail instead of at the folded tool call', () => {
