@@ -487,15 +487,17 @@ export class Coordinator {
     }
     for (const e of entries) {
       if (this.stopping || !e.isDirectory() || !runPattern.test(e.name)) continue
+      // The ledger path is known before opening, so a failure can name the file
+      // the board should show as unreadable alongside the diagnostic.
+      const file = dbFile(repo, e.name)
       try {
         // Do not acquire or reconcile a different captain's runs.
-        const file = dbFile(repo, e.name)
         if (!(await exists(file)) || ledgerOwner(file) !== parentId) continue
         const run = await this._open({ cwd, parentId, runId: e.name })
         this._wake(run)
         report.attached.push(e.name)
       } catch (err) {
-        report.failures.push({ runId: e.name, error: message(err) })
+        report.failures.push({ runId: e.name, error: message(err), file })
       }
     }
     return report

@@ -2492,7 +2492,14 @@ window.__ModuleLoader__.load({
             const view = await read('')
             if (!Array.isArray(view?.runs)) throw new Error('宿主未返回有效的运行快照。')
             const hit = view.runs.find((r) => r.runId === run.runId)
-            if (disposed || !hit) return
+            if (disposed) return
+            if (!hit) {
+              // The run is missing from the board list: treat it like a read
+              // failure so the folded plan is marked as a historical snapshot
+              // instead of passing the original ticket count off as live state.
+              setSnapshot(false)
+              return
+            }
             // The list row is enough to open the right sidebar tab if the detail read fails.
             setFound(hit)
             const detail = view.selected?.key === hit.key ? view.selected : (await read(hit.key))?.selected

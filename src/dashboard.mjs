@@ -70,6 +70,23 @@ export class RunCatalog {
     // Files this instance opened. A detail request must open the selected ledger
     // only; settled history comes from the cache, so the count stays constant.
     this.ledgerOpens = 0
+    // Recovery failures reported by the attach scan, keyed by parentId + runId.
+    // A run the host could not take over is shown as unreadable with its
+    // diagnostic instead of disappearing from the board.
+    this.failures = new Map()
+  }
+
+  // Remember a run that failed to attach so its board row can explain why.
+  // The host reports the same failure to the captain; this keeps the board honest.
+  reportFailure(parentId, runId, diagnostic, file = null) {
+    const id = String(parentId) + '\u0000' + String(runId)
+    this.failures.set(id, {
+      parentId: String(parentId),
+      runId: String(runId),
+      file: file ? String(file) : null,
+      diagnostic: displayDiagnostic(diagnostic) || unreadableDiagnostic,
+      createdAt: Date.now(),
+    })
   }
 
   // Add the cache columns to an index created before them. Old rows read as NULL
@@ -201,6 +218,29 @@ export class RunCatalog {
   // summary, so an unreadable unrelated ledger cannot hide the selected run.
   read(coordinator, key, parent = null, captainOf = () => undefined) {
     const known = this.entries(parent)
+    // Runs the attach scan could not recover are listed as unreadable rows so
+    // the user sees the failure with its diagnostic, not only in the host log.
+    const failed = [...this.failures.values()].filter((f) => parent === null || f.parentId === parent)
+    const knownRuns = new Set(known.map((row) => row.parentId + '\u0000' + row.runId))
+    for (const f of failed) {
+      if (knownRuns.has(f.parentId + '\u0000' + f.runId)) continue
+      known.push({
+        key: createHash('sha256')
+          .update(JSON.stringify([f.file ?? 'recovery:' + f.parentId + ':' + f.runId, f.parentId]))
+          .digest('hex'),
+        file: f.file,
+        runId: f.runId,
+        parentId: f.parentId,
+        repoName: f.file ? basename(dirname(dirname(dirname(f.file)))) : '',
+        specId: '',
+        total: 0,
+        createdAt: f.createdAt,
+        summary: null,
+        summarySig: null,
+      })
+    }
+    if (failed.length) known.sort((a, b) => b.createdAt - a.createdAt || a.key.localeCompare(b.key))
+    const failedById = new Map(failed.map((f) => [f.parentId + '\u0000' + f.runId, f]))
     if (key && !known.some((entry) => entry.key === key)) return null
     const selectedKey = key ?? known[0]?.key
     let selected = null
@@ -208,6 +248,8 @@ export class RunCatalog {
       const { file, summary, summarySig, ...entry } = row
       const detail = entry.key === selectedKey
       const attached = coordinator.runs.has(file)
+      // A run that is now attached is live even if an earlier scan failed it.
+      const recovery = attached ? null : failedById.get(entry.parentId + '\u0000' + entry.runId)
       let data
       try {
         if (attached) {
@@ -231,6 +273,18 @@ export class RunCatalog {
           complete: false,
           counts: {},
           diagnostic: unreadableDiagnostic,
+          tickets: [],
+        }
+      }
+      if (recovery) {
+        // A run that could not be recovered is not live even if a read-only
+        // ledger read would succeed (for example another coordinator holds the lock).
+        data = {
+          available: false,
+          mode: 'unavailable',
+          complete: false,
+          counts: {},
+          diagnostic: recovery.diagnostic,
           tickets: [],
         }
       }
