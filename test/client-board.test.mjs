@@ -813,6 +813,35 @@ test('plan review lists each check command, marks the ones the captain wrote and
   assert.match(text(find(block, (n) => n.props['data-dag-unchecked'] !== undefined)), /累计回归检查/)
 })
 
+test('plan review names a check no task uses yet and keeps every argument boundary and control character visible', () => {
+  const selected = {
+    ...reviewRun(),
+    checks: {
+      used: [['node', '--test']],
+      later: [
+        ['node', '', 'a b', 'a\nb', 'a\\nb', '""', 'bell\x07', 'nbsp\u00a0', 'bidi\u202e', 'tag\u{e0001}', '路径/x.js'],
+        ['npm', 'test'],
+      ],
+    },
+    planChecks: ['used', 'later'],
+  }
+  selected.tickets = selected.tickets.map((t) => ({ ...t, verify: t.id === 'A' ? ['used'] : [] }))
+  const host = loadHost([{ runs: [selected], selected }, selected.key])
+  const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  const row = (id) => find(pane, (n) => n.props['data-dag-check'] === id)
+  assert.match(text(row('used')), /队长编写，需你确认.*工单：A/)
+  const later = row('later')
+  assert.match(text(later), /队长编写，需你确认/)
+  assert.equal(text(find(later, (n) => n.props['data-dag-check-users'] !== undefined)), '尚无工单引用，批准后可供追加工单使用')
+  assert.deepEqual(
+    findAll(later, (n) => n.props.className === 'dtd-check-cmd').map(text),
+    [
+      'node "" "a b" "a\\nb" "a\\\\nb" "\\"\\"" "bell\\u0007" "nbsp\\u00a0" "bidi\\u202e" "tag\\u{e0001}" 路径/x.js',
+      'npm test',
+    ],
+  )
+})
+
 test('plan review: named members with their tasks and model, compact task list, map and fixed actions', () => {
   const selected = reviewRun()
   const host = loadHost([{ runs: [selected], selected }, selected.key])
