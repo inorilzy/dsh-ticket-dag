@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
+import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 import { Coordinator } from '../src/coordinator.mjs'
 import * as git from '../src/git.mjs'
@@ -213,4 +214,102 @@ test('an already-executed CAS is accounted even if the restored run is cancelled
   } finally {
     reader.close()
   }
+})
+
+test('a run approved before the review listed unused checks keeps its used commands but cannot presume the rest approved', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dag-coordinator-legacy-'))
+  const main = join(dir, 'project')
+  mkdirSync(main)
+  gitRun(main, 'init', '-q', '--initial-branch=main')
+  gitRun(main, 'config', 'user.name', 'Recovery test')
+  gitRun(main, 'config', 'user.email', 'recovery@test.invalid')
+  gitRun(main, 'config', 'commit.gpgSign', 'false')
+  gitRun(main, 'commit', '--allow-empty', '-qm', 'seed')
+  const ok = [[process.execPath, '-e', 'process.exit(0)']]
+  const hiddenRan = join(dir, 'hidden-ran')
+  const own = {
+    used: ok,
+    early: ok,
+    hidden: [[process.execPath, '-e', "require('node:fs').writeFileSync(process.argv[1], 'ran')", hiddenRan]],
+  }
+  const options = {
+    checks: {},
+    notify: async () => true,
+    launch: async (job) => ({
+      dispose: async () => {},
+      result: (async () => {
+        writeFileSync(join(job.cwd, job.ticketId + '.txt'), job.ticketId)
+        gitRun(job.cwd, 'add', '--', job.ticketId + '.txt')
+        gitRun(
+          job.cwd,
+          'commit',
+          '-qm',
+          'Deliver ' + job.ticketId,
+          '-m',
+          'DAG-Run: ' + job.runId + '\nDAG-Ticket: ' + job.ticketId + '\nDAG-Attempt: ' + job.attempt + '\nDAG-Complete: yes',
+        )
+        return { ok: true }
+      })(),
+    }),
+  }
+  const q = { cwd: main, parentId, runId: 'legacy' }
+  const settled = async (coordinator) => {
+    for (let i = 0; i < 3000; i++) {
+      const s = await coordinator.status(q)
+      assert.equal(s.counts.NEEDS_ATTENTION, undefined, JSON.stringify(s))
+      if (s.complete) return s
+      await sleep(40)
+    }
+    throw Error('run did not settle')
+  }
+  const first = new Coordinator(options)
+  let reopened
+  t.after(async () => {
+    await first.close()
+    await reopened?.close()
+    rmSync(dir, { recursive: true, force: true, maxRetries: 3 })
+  })
+  const manifest = { spec_id: 'legacy', checks: own, tickets: [{ id: 'A', title: 'A', verify: ['used'] }] }
+  await first.start({ ...q, manifest })
+  const [file] = first.runs.keys()
+  await first.approve(file, [])
+  await settled(first)
+  // Appended under the old rules: from then on this command is part of the run.
+  const history = [{ id: 'B', title: 'B', depends_on: ['A'], verify: ['early'] }]
+  await first.add({ ...q, tickets: history })
+  await settled(first)
+  await first.close()
+
+  // What 0.13.0 wrote: approval with no record of which commands were shown.
+  const old = new DatabaseSync(file)
+  old.prepare("UPDATE events SET details='{}' WHERE type='run_approved'").run()
+  old.close()
+
+  reopened = new Coordinator(options)
+  const loaded = await reopened.status(q)
+  assert.equal(loaded.mode, 'active')
+  assert.equal(loaded.diagnostic, null)
+  assert.deepEqual(loaded.unapprovedChecks, ['hidden'])
+  assert.deepEqual(Object.keys(loaded.checks).sort(), ['early', 'used'])
+  await assert.rejects(
+    reopened.add({ ...q, tickets: [{ id: 'X', title: 'X', verify: ['hidden'] }] }),
+    /X: check hidden was not shown/,
+  )
+  assert.equal((await reopened.add({ ...q, tickets: history })).tickets.length, 2, 'the old batch stays idempotent')
+  assert.equal((await reopened.start({ ...q, manifest })).mode, 'active', 'the old manifest stays idempotent')
+  await reopened.add({ ...q, tickets: [{ id: 'C', title: 'C', depends_on: ['B'], verify: ['used', 'early'] }] })
+  const done = await settled(reopened)
+  assert.equal(done.tickets.at(-1).status, 'INTEGRATED')
+  assert.deepEqual(done.unapprovedChecks, ['hidden'])
+  assert.throws(() => readFileSync(hiddenRan))
+
+  // A forged approval record is an outside edit, not a grant.
+  const forged = new DatabaseSync(file)
+  forged.prepare("UPDATE events SET details='{\"planChecks\":[\"hidden\"]}' WHERE type='run_approved'").run()
+  forged.close()
+  await assert.rejects(
+    reopened.add({ ...q, tickets: [{ id: 'Y', title: 'Y', verify: ['hidden'] }] }),
+    /modified outside the coordinator/,
+  )
+  assert.equal((await reopened.status(q)).mode, 'paused')
 })

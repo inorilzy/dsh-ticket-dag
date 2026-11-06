@@ -8,6 +8,7 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { Coordinator } from '../src/coordinator.mjs'
+import { RunCatalog, mountApproval, mountDashboard } from '../src/dashboard.mjs'
 
 const exec = promisify(execFile)
 const env = {
@@ -969,6 +970,89 @@ test(
   },
 )
 
+for (const mode of ['automatic', 'manual'])
+  test(
+    mode + ' cleanup keeps local files, reports why through status and the board, then cleans once they are gone',
+    { timeout: limit(120000) },
+    async (t) => {
+      const cwd = await repo(t)
+      await writeFile(join(cwd, '.git', 'info', 'exclude'), '*.env\n')
+      const settings = { checks: noopChecks, maxWorkers: 16, checkTimeoutMs: 20000 }
+      const catalog = new RunCatalog()
+      const co = new Coordinator({
+        ...settings,
+        autoCleanup: false,
+        notify: async () => true,
+        rememberRun: (file, meta, startedAt) => catalog.remember(file, meta, startedAt),
+        launch: async (job) => ({
+          dispose: async () => {},
+          result: (async () => {
+            await commit(job)
+            return { ok: true }
+          })(),
+        }),
+      })
+      let board
+      mountDashboard({ connection: { fetch: { register: (r) => (board = r) } } }, catalog, co)
+      const q = { cwd, parentId: 'captain', runId: 'keep-' + mode }
+      try {
+        const ids = ['Ignored', 'Untracked', 'Tracked', 'Clean']
+        await co.start({ ...q, manifest: { spec_id: 'keep', tickets: ids.map((id) => ticket(id)) } })
+        const done = await until(async () => {
+          const s = await co.status(q)
+          if (s.counts.NEEDS_ATTENTION) throw Error(JSON.stringify(s))
+          return s.complete && s.pendingNotifications === 0 && s
+        }, 'complete and notified')
+        const paths = Object.fromEntries(done.tickets.map((r) => [r.id, r.path]))
+        const local = [
+          [join(paths.Ignored, 'local.env'), 'ignored data', /ignored: "local\.env"/],
+          [join(paths.Untracked, 'notes.txt'), 'untracked data', /untracked: "notes\.txt"/],
+          [join(paths.Tracked, 'Tracked.txt'), 'edited data', /tracked changes: "Tracked\.txt"/],
+        ]
+        for (const [file, data] of local) await writeFile(file, data)
+
+        let status
+        if (mode === 'automatic') {
+          co.updateSettings({ ...settings, autoCleanup: true })
+          status = await until(async () => {
+            const s = await co.status(q)
+            return s.tickets.every((r) => r.cleanup) && s
+          }, 'automatic cleanup')
+        } else status = await co.cleanup(q)
+
+        assert.deepEqual(status.cleanup, { cleaned: 1, skipped: 3 })
+        const row = (rows, id) => rows.find((r) => r.id === id)
+        const selected = (await (await board.fetch(new Request('http://localhost' + board.path))).json()).selected
+        for (const [index, [file, data, reason]] of local.entries()) {
+          assert.equal(await readFile(file, 'utf8'), data)
+          for (const rows of [status.tickets, selected.tickets]) {
+            assert.equal(row(rows, ids[index]).cleanup, 'skipped')
+            assert.match(row(rows, ids[index]).cleanupReason, reason)
+          }
+        }
+        assert.equal(row(selected.tickets, 'Clean').cleanup, 'cleaned')
+        assert.equal(await exists(paths.Clean), false)
+        assert.equal((await ticketBranches(cwd)).length, 3)
+
+        // Retrying by hand while the files remain keeps them; once tidied, the same call cleans.
+        const retried = await co.cleanup(q)
+        assert.deepEqual(retried.results.map((r) => r.status), ['skipped', 'skipped', 'skipped', 'cleaned'])
+        for (const [file, data] of local) assert.equal(await readFile(file, 'utf8'), data)
+        await rm(local[0][0])
+        await rm(local[1][0])
+        await git(paths.Tracked, 'checkout', '--', 'Tracked.txt')
+        for (let i = 0; i < 2; i++) {
+          const cleaned = await co.cleanup(q)
+          assert.deepEqual(cleaned.results.map((r) => r.status), ['cleaned', 'cleaned', 'cleaned', 'cleaned'])
+          assert.deepEqual(cleaned.cleanup, { cleaned: 4, skipped: 0 })
+          assert.deepEqual(await ticketBranches(cwd), [])
+        }
+      } finally {
+        await co.close()
+      }
+    },
+  )
+
 test('a cancelled run is never cleaned', { timeout: limit(60000) }, async (t) => {
   const cwd = await repo(t)
   const co = new Coordinator({
@@ -1562,6 +1646,116 @@ test(
       assert.equal(after.mode, 'active')
       assert.equal(after.diagnostic, null)
       assert.deepEqual(after.tickets.map((r) => r.appended), [false, true])
+    } finally {
+      await co.close()
+      await reopened?.close()
+    }
+  },
+)
+
+test(
+  'the registered board shows every manifest command with exact argv; dag_add may first use one only after approval',
+  { timeout: limit(120000) },
+  async (t) => {
+    const cwd = await repo(t)
+    const recorder = "require('node:fs').writeFileSync(process.argv[1], JSON.stringify(process.argv.slice(2)))"
+    const usedRan = join(cwd, '..', 'used-ran')
+    const laterRan = join(cwd, '..', 'later-ran')
+    const evilRan = join(cwd, '..', 'evil-ran')
+    const laterArgs = ['', 'a b', 'tab\tnew\nline\x07']
+    const checks = {
+      used: [[process.execPath, '-e', recorder, usedRan]],
+      later: [[process.execPath, '-e', recorder, laterRan, ...laterArgs]],
+    }
+    const manifest = { spec_id: 'shown', checks, tickets: [{ id: 'A', title: 'A', verify: ['used'] }] }
+    const catalog = new RunCatalog()
+    const launched = []
+    const options = {
+      checks: noopChecks,
+      requireApproval: false,
+      rememberRun: (...args) => catalog.remember(...args),
+      launch: async (job) => {
+        launched.push(job.ticketId)
+        return {
+          dispose: async () => {},
+          result: (async () => {
+            await commit(job)
+            return { ok: true }
+          })(),
+        }
+      },
+    }
+    const handlers = (coordinator) => {
+      const routes = {}
+      const ctx = { connection: { fetch: { register: (r) => (routes[r.path] = r) } } }
+      mountDashboard(ctx, catalog, coordinator, () => undefined)
+      mountApproval(ctx, catalog, coordinator)
+      return {
+        board: async () =>
+          (await routes['/api/ticket-dag.dashboard'].fetch(new Request('http://x/api/ticket-dag.dashboard'))).json(),
+        post: (body) =>
+          routes['/api/ticket-dag.approve'].fetch(
+            new Request('http://x/api/ticket-dag.approve', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', 'x-dsh-ticket-dag': '1' },
+              body: JSON.stringify(body),
+            }),
+          ),
+      }
+    }
+    const q = { cwd, parentId: 'captain', runId: 'shown' }
+    const settled = async (coordinator, label) =>
+      until(async () => {
+        const s = await coordinator.status(q)
+        if (s.counts.NEEDS_ATTENTION) throw Error(JSON.stringify(s))
+        return s.complete && s
+      }, label)
+    const co = new Coordinator(options)
+    let reopened
+    try {
+      await co.start({ ...q, manifest })
+      const { board, post } = handlers(co)
+      const { selected } = await board()
+      assert.equal(selected.mode, 'staged')
+      assert.deepEqual(selected.checks, checks, 'the unused command is listed with its exact argv')
+      assert.deepEqual(selected.planChecks, ['used', 'later'])
+      assert.deepEqual(selected.tickets[0].verify, ['used'])
+      assert.equal((await post({ key: selected.key, action: 'approve', choices: [] })).status, 200)
+      await settled(co, 'A integrated')
+      assert.equal(await readFile(laterRan, 'utf8').catch(() => null), null, 'an unused command does not run')
+
+      // Approved: no ticket used this command yet, and the batch still cannot bring a new one.
+      await assert.rejects(
+        co.add({ ...q, tickets: [{ id: 'X', title: 'X', verify: ['sneaky'] }] }),
+        /unknown verification check: sneaky/,
+      )
+      const batch = [{ id: 'B', title: 'B', depends_on: ['A'], verify: ['later'] }]
+      const added = await co.add({ ...q, tickets: batch })
+      assert.deepEqual(added.unapprovedChecks, [])
+      assert.equal((await settled(co, 'B integrated')).diagnostic, null)
+      assert.deepEqual(JSON.parse(await readFile(laterRan, 'utf8')), laterArgs, 'the approved argv reaches the program')
+      assert.equal((await co.add({ ...q, tickets: batch })).tickets.length, 2, 'a repeated batch adds nothing')
+      assert.equal((await co.start({ ...q, manifest })).mode, 'active', 'resubmitting the manifest stays idempotent')
+      await co.close()
+
+      // A later profile check with the same ID cannot displace the approved command.
+      await rm(laterRan)
+      reopened = new Coordinator({
+        ...options,
+        checks: {
+          ...noopChecks,
+          later: [[process.execPath, '-e', "require('node:fs').writeFileSync(process.argv[1], 'evil')", evilRan]],
+        },
+      })
+      const loaded = await reopened.status(q)
+      assert.equal(loaded.diagnostic, null)
+      assert.deepEqual(loaded.checks.later, checks.later)
+      assert.equal((await reopened.add({ ...q, tickets: batch })).tickets.length, 2, 'still idempotent once reopened')
+      await reopened.add({ ...q, tickets: [{ id: 'C', title: 'C', depends_on: ['B'], verify: ['later'] }] })
+      assert.equal((await settled(reopened, 'C integrated')).diagnostic, null)
+      assert.deepEqual(JSON.parse(await readFile(laterRan, 'utf8')), laterArgs)
+      assert.equal(await readFile(evilRan, 'utf8').catch(() => null), null)
+      assert.deepEqual(launched, ['A', 'B', 'C'])
     } finally {
       await co.close()
       await reopened?.close()

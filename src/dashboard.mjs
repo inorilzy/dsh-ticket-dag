@@ -134,7 +134,7 @@ export class RunCatalog {
             model: p?.model ?? '',
             reasoningEffort: p?.reasoningEffort ?? '',
           })),
-          // Commands of the checks the run uses; the plan review shows them for approval.
+          // Every approved or reviewable command; the plan review shows them for approval.
           checks: data.checks ?? {},
           planChecks: data.planChecks ?? [],
           tickets: data.tickets.map((t) => ({
@@ -224,6 +224,12 @@ function readLedger(file, entry, detail, globalLimit) {
           appended: appended.has(row.id),
           appendedAt: appended.get(row.id) ?? null,
         }))
+      // A plan waiting for approval shows the captain's commands even before its captain reopens.
+      if (run.mode === 'staged') {
+        const { checks } = db.prepare("SELECT json_extract(manifest,'$.checks') AS checks FROM run").get()
+        result.checks = checks ? JSON.parse(checks) : {}
+        result.planChecks = Object.keys(result.checks)
+      }
     }
     return result
   } finally {
