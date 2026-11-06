@@ -86,7 +86,7 @@ owner-only `POST /api/ticket-dag.approve`，body `{ key, action: 'approve' | 'di
 - 范围：`cancelled` 运行的所有工单、非 `INTEGRATED` 的工单一律跳过；只处理账本中该工单的 `path` 与 `branch`。已 `cleaned` 的工单不再处理；`skipped` 的工单自动清理不重试，`dag_cleanup` 会重试。
 - `git.cleanupWorktree(repo, { path, branch, target, baseRef, root })` 的保护：
   - 拒绝（抛错，记为 `skipped`，原因前缀 `refused:`）：分支等于集成分支或 `baseRef` 指向的本地分支；路径不在插件 worktree 根目录内；路径是主 worktree；该路径检出的是别的分支；该分支在另一 worktree 中检出。
-  - 跳过（返回原因）：工单分支不是集成分支的祖先；worktree 有未提交改动；路径存在但不是已登记的 worktree。
+  - 跳过（返回原因）：工单分支不是集成分支的祖先；worktree 有 tracked 改动、untracked 或 ignored 文件（原因列出类别和文件名，每类最多 5 个）；路径存在但不是已登记的 worktree。
   - 删除：`git worktree remove`、以集成分支为上游的 `git branch -d`、`git worktree prune`，均不强制。集成分支永不删除。
 - 账本：`tickets` 新增 `cleanup`（`cleaned` | `skipped` | NULL）与 `cleanupReason` 列，打开旧账本时补列，NULL 视为未清理。`RunStore.recordCleanup(id, status, reason)` 只写 `INTEGRATED` 且未 `cleaned` 的工单，并记 `cleanup_cleaned` / `cleanup_skipped` 事件。
 - 快照：运行带 `cleanup: { cleaned, skipped }`，工单行带 `cleanup` 与 `cleanupReason`；冷历史缺列时读为 `null`。看板阶段条末尾新增“清理”步（`done` / `skipped` / `todo`），运行概况显示“已清理 N 张 / 跳过 M 张（原因）”。
