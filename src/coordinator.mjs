@@ -13,8 +13,12 @@ const transient =
 const capacityCode = 'ACTIVATION_LIMIT_REACHED'
 const runPattern = /^[a-z0-9][a-z0-9_-]{0,62}$/
 
-function requireValue(test, text) {
-  if (!test) throw new Error(text)
+function requireValue(test, text, code) {
+  if (!test) {
+    const error = new Error(text)
+    if (code) error.code = code
+    throw error
+  }
 }
 async function exists(path) {
   try {
@@ -978,11 +982,13 @@ export class Coordinator {
         typeof revision === 'string' && revision.length > 0,
         'This approval did not include the revision of the plan you reviewed. ' +
           'Refresh the plan and confirm again; if you are on an older client, upgrade before approving a staged plan.',
+        'missing-revision',
       )
       requireValue(
         revision === run.db.revision(this.agents),
         'The plan changed after you reviewed it (a ticket was appended, the approved checks changed, or an effective preset changed). ' +
           'Refresh the plan and confirm the current version again.',
+        'stale-revision',
       )
       // A choice may only name a ticket of the plan, once each. Unknown or
       // duplicate IDs are a malformed request, not a grant to start anything.

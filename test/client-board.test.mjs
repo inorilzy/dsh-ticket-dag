@@ -969,12 +969,17 @@ test('plan review shows the run concurrency and lets the user change it before a
   assert.equal(Object.hasOwn(host.posts[0][1], 'maxWorkers'), false)
 })
 
-test('plan review turns a 409 into a refreshed plan and asks for a fresh confirmation', async () => {
+test('plan review turns a stale-revision 409 into a refreshed plan and asks for a fresh confirmation', async () => {
   const selected = reviewRun()
   const view = { runs: [{ ...selected }], selected }
   const host = loadHost([{ runs: [selected], selected }, selected.key], {
     respond: async () => ({ ok: true, status: 200, json: async () => view }),
-    postRespond: async () => ({ ok: false, status: 409, text: async () => 'The plan changed after you reviewed it' }),
+    postRespond: async () => ({
+      ok: false,
+      status: 409,
+      text: async () =>
+        JSON.stringify({ code: 'stale-revision', message: 'The plan changed after you reviewed it' }),
+    }),
   })
   const flush = () => new Promise((resolve) => setImmediate(resolve))
   const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
@@ -1032,6 +1037,139 @@ test('plan review keeps the edits that still apply when a ticket is appended', (
   // The edit the user made (D -> implementer) survived the refresh.
   assert.match(text(tasks[4]), /实现者/)
   assert.equal(find(review, (n) => n.props['aria-label'] === '同时运行工单数').props.value, '8')
+})
+
+// A plan review opened at `pinned` but now showing a polled plan with an extra
+// ticket. Seeds are the hook order: Dashboard (data, selectedKey, error,
+// lastRead) then PlanReview (owners, routes, catalog, busy, error,
+// confirmDiscard, checked, expanded, bulk, hovered, workers, pinnedRevision,
+// pinnedIds).
+function changedPlanSeeds(selected, { owners = null, pinned, pinnedIds }) {
+  const view = { runs: [selected], selected }
+  return [
+    view,
+    selected.key,
+    '',
+    null,
+    owners,
+    null,
+    catalog,
+    false,
+    '',
+    false,
+    new Set(),
+    null,
+    null,
+    null,
+    null,
+    pinned,
+    pinnedIds,
+  ]
+}
+
+test('plan review pins the version it opened and asks to reconfirm when a poll changes it', () => {
+  const selected = reviewRun()
+  selected.revision = 'n'.repeat(64)
+  selected.tickets = [
+    ...selected.tickets,
+    {
+      id: 'E',
+      title: '补丁',
+      status: 'PENDING',
+      dependsOn: [],
+      attempt: 0,
+      agent: 'docs',
+      route: { provider: '', model: '', reasoningEffort: '' },
+    },
+  ]
+  selected.total = 6
+  selected.counts = { PENDING: 6 }
+  // The review was opened at an older revision holding only A, C, T, B, D.
+  const seeds = changedPlanSeeds(selected, {
+    owners: { D: 'implementer' },
+    pinned: 'o'.repeat(64),
+    pinnedIds: ['A', 'C', 'T', 'B', 'D'],
+  })
+  const host = loadHost(seeds)
+  const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  const review = find(pane, (n) => n.props['data-dag-review'] !== undefined)
+
+  const notice = find(review, (n) => n.props['data-dag-plan-changed'] !== undefined)
+  assert.ok(notice, 'a plan that changed under review is called out')
+  assert.match(text(notice), /计划已更新/)
+  assert.match(text(notice), /新增工单 E/, 'the notice names the appended ticket')
+
+  // The appended ticket is shown with its planned owner, and the edit the user
+  // made before the poll still applies to the ticket it named.
+  const tasks = findAll(review, (n) => n.props['data-dag-task'] !== undefined)
+  assert.deepEqual(tasks.map((t) => t.props['data-dag-task']), ['A', 'C', 'T', 'B', 'D', 'E'])
+  assert.match(text(tasks[5]), /文档员/)
+  assert.match(text(tasks[4]), /实现者/)
+
+  // Approval is refused until the user explicitly reconfirms the new plan.
+  const approve = find(review, (n) => n.type === 'button' && text(n) === '确认并启动')
+  assert.equal(approve.props.disabled, true, 'a changed plan cannot be approved until reconfirmed')
+
+  host.sets.length = 0
+  find(notice, (n) => n.type === 'button' && text(n) === '确认最新计划').props.onClick()
+  assert.ok(host.sets.includes(selected.revision), 'reconfirm pins the polled revision')
+  assert.deepEqual(
+    host.sets.find((v) => Array.isArray(v)),
+    ['A', 'C', 'T', 'B', 'D', 'E'],
+    'reconfirm pins the polled ticket list',
+  )
+})
+
+test('after reconfirming, approval sends the newly pinned revision and is enabled again', () => {
+  const selected = reviewRun()
+  selected.revision = 'n'.repeat(64)
+  // The user has reconfirmed, so the pinned revision now matches the polled one.
+  const seeds = changedPlanSeeds(selected, {
+    pinned: selected.revision,
+    pinnedIds: selected.tickets.map((t) => t.id),
+  })
+  const host = loadHost(seeds)
+  const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  const review = find(pane, (n) => n.props['data-dag-review'] !== undefined)
+  assert.equal(
+    find(review, (n) => n.props['data-dag-plan-changed'] !== undefined),
+    undefined,
+    'no pending-change notice once reconfirmed',
+  )
+  const approve = find(review, (n) => n.type === 'button' && text(n) === '确认并启动')
+  assert.equal(approve.props.disabled, false)
+  approve.props.onClick()
+  assert.equal(host.posts[0][1].revision, selected.revision, 'approval echoes the pinned revision')
+})
+
+test('plan review shows the server message for a non-stale approval refusal', async () => {
+  const selected = reviewRun()
+  const view = { runs: [selected], selected }
+  const host = loadHost([{ runs: [selected], selected }, selected.key], {
+    respond: async () => ({ ok: true, status: 200, json: async () => view }),
+    postRespond: async () => ({
+      ok: false,
+      status: 409,
+      text: async () => JSON.stringify({ code: 'duplicate-ticket', message: 'Duplicate ticket ID in approval: A' }),
+    }),
+  })
+  const flush = () => new Promise((resolve) => setImmediate(resolve))
+  const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  await flush()
+  const review = find(pane, (n) => n.props['data-dag-review'] !== undefined)
+  find(review, (n) => n.type === 'button' && text(n) === '确认并启动').props.onClick()
+  await flush()
+  await flush()
+  const messages = host.sets.filter((v) => typeof v === 'string')
+  assert.ok(
+    messages.some((v) => /Duplicate ticket ID in approval: A/.test(v)),
+    'the server message is shown for a duplicate ticket id',
+  )
+  assert.equal(
+    messages.some((v) => /计划已更新/.test(v)),
+    false,
+    'only a stale revision shows the plan-updated message',
+  )
 })
 
 test('built-in presets saved without a display name still show their Chinese name', () => {

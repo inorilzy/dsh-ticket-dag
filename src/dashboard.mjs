@@ -564,9 +564,14 @@ export function mountApproval(ctx, catalog, coordinator, getLlm = () => undefine
             : await coordinator.discard(entry.file)
         return Response.json(snapshot, { headers: noStore })
       } catch (error) {
-        return new Response(displayDiagnostic(error?.message) || 'Approval failed', {
+        const message = displayDiagnostic(error?.message) || 'Approval failed'
+        // A stale or missing plan revision is the only refusal the board treats
+        // as "review the new plan again"; every other refusal (duplicate or
+        // unknown ticket, a bad route, a tampered ledger) keeps its own message.
+        const code = typeof error?.code === 'string' ? error.code : null
+        return new Response(code ? JSON.stringify({ code, message }) : message, {
           status: error?.status ?? 409,
-          headers: noStore,
+          headers: code ? { ...noStore, 'content-type': 'application/json' } : noStore,
         })
       }
     },
