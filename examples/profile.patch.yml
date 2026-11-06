@@ -1,6 +1,15 @@
 # Headless alternative to the plugin settings panel. Merge into the active profile and keep other fields.
 - id: dsh-ticket-dag
   config:
+    # An SDK session has no plan-review panel, so a staged run never starts.
+    # examples/hello.json only names the profile checks below. Writing them into
+    # this profile is the approval, and requireApproval: false lets that first run
+    # dispatch, integrate, and notify the captain. A manifest that brings its own
+    # "checks" still stays staged even with this off. The SDK cannot approve it:
+    # open the same captain conversation in the Web or Desktop UI and confirm
+    # 「工单 · <runId>」, or move the command into the profile checks and drop it
+    # from the manifest. dag_resume does not start a staged run.
+    requireApproval: false
     maxWorkers: 16
     checkTimeoutMs: 120000
     checks:
