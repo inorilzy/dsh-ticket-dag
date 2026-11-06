@@ -236,7 +236,8 @@ function normalizeTickets(list, checkRegistry, agentRegistry) {
     const title = text(raw.title, id + '.title')
     const prompt = text(raw.prompt ?? raw.description ?? title, id + '.prompt')
     const dependsOn = strings(raw.dependsOn ?? raw.depends_on, id + '.dependsOn', safeId)
-    // Optional: a ticket without checks integrates after a clean trial merge.
+    // Optional: an empty list means no check of the ticket's own; checks of tickets
+    // already integrated still run on its candidate.
     const verify = strings(raw.verify, id + '.verify', safeId)
     verify.forEach((name) => commandExists(checkRegistry, name))
     const acceptance = strings(raw.acceptance, id + '.acceptance')
