@@ -158,6 +158,26 @@ test('nine captain tools bind identity and trusted checks, existing and new root
   await h.close()
 })
 
+test('a recovery scan logs each failed run by its runId', async () => {
+  const h = harness()
+  const warnings = []
+  h.ctx.logger.warn = (line) => warnings.push(line)
+  h.controller.attach = async () => ({
+    attached: ['good'],
+    failures: [
+      { runId: 'locked', error: 'Another DSH coordinator owns this run: x' },
+      { runId: 'corrupt', error: 'Cannot read the run ledger x: file is not a database' },
+    ],
+  })
+  await afterPublication()
+  await afterPublication()
+  assert.deepEqual(warnings, [
+    'DAG recovery scan, run locked: Another DSH coordinator owns this run: x',
+    'DAG recovery scan, run corrupt: Cannot read the run ledger x: file is not a database',
+  ])
+  await h.close()
+})
+
 test('dag_cleanup is a captain-only run tool and autoCleanup defaults on', async () => {
   const h = harness()
   assert.deepEqual(h.tools.get('dag_cleanup').parameters, { runId: h.tools.get('dag_status').parameters.runId })
