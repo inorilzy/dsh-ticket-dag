@@ -368,7 +368,10 @@ export function apply(ctx, config = {}, { importer = importTickets, reporter = w
       .then(async () => {
         if (closing || ctx.agents.get(agent.id) !== agent) return
         const cwd = await ctx.workingDirectory.ensure(agent)
-        if (!closing) await coordinator.attach({ cwd, parentId: agent.id })
+        if (closing) return
+        const scan = await coordinator.attach({ cwd, parentId: agent.id })
+        for (const { runId, error } of scan.failures ?? [])
+          ctx.logger.warn('DAG recovery scan, run ' + runId + ': ' + error.slice(0, 500))
       })
       .catch((error) => ctx.logger.warn('DAG recovery scan: ' + String(error).slice(0, 300)))
       .finally(() => attaching.delete(job))
