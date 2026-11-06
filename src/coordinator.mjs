@@ -582,8 +582,9 @@ export class Coordinator {
     throw err
   }
   async _reconcile(run, publish = true) {
-    const m = run.db.meta()
-    for (const i of run.db.intents()) {
+    const m = run.db.meta(),
+      open = run.db.intents()
+    for (const i of open) {
       const actual = await git.resolveRef(m.repo, m.ref)
       await git.assertMergeParents(m.repo, i.candidateSha, i.oldTip, i.sourceSha)
       if (actual === i.candidateSha) {
@@ -600,6 +601,11 @@ export class Coordinator {
         requireValue(run.db.finish(i.id, i.lease, i.candidateSha), 'Cannot finish recovered publication')
         this._writeback(run, i.id)
       } else throw new Error('Unrecognized target tip during publication recovery: ' + i.id)
+    }
+    // A final run has nothing else to recover: its open publication was what the diagnostic warned about.
+    if (m.mode === 'cancelled' && open.length) {
+      run.haltError = ''
+      run.db.clearDiagnostic()
     }
   }
   _snapshot(run) {
@@ -688,6 +694,7 @@ export class Coordinator {
         }),
       ),
       pendingNotifications: run.db.pendingNotifications().length,
+      pendingPublications: run.db.intents(),
     }
   }
   async status(q) {
@@ -778,21 +785,33 @@ export class Coordinator {
     this._wake(run)
     return this._snapshot(run)
   }
+  /**
+   * The captain's dag_cancel. Once the ledger says cancelled, workers and checks
+   * stop whether or not Git can be reconciled. Repeating it sends the stop again
+   * and retries an open publication: a published one is accounted, an unpublished
+   * one is abandoned, and one that cannot be proven either way stays on record.
+   * @returns the run snapshot; reconcileError is null once nothing failed to settle.
+   */
   async cancel(q) {
     const run = await this._open(q)
-    await serial(run, async () => {
-      this._setMode(run, 'cancelled')
-      await this._reconcile(run, false)
-    })
-    const jobs = [...run.work.values()]
+    await serial(run, () => this._setMode(run, 'cancelled'))
+    const jobs = [...run.work.values(), run.integration].filter(Boolean)
     for (const j of jobs) {
       j.ctrl.abort()
-      if (j.handle) j.handle.dispose().catch(() => {})
+      if (j.handle) Promise.resolve().then(() => j.handle.dispose()).catch(() => {})
     }
-    run.integration?.ctrl.abort()
+    const reconcileError = await serial(run, async () => {
+      try {
+        await this._reconcile(run, false)
+        return null
+      } catch (err) {
+        this._holdQuietly(run, err)
+        return message(err)
+      }
+    })
     await Promise.allSettled(jobs.map((j) => j.promise))
     this._wake(run)
-    return this._snapshot(run)
+    return { ...this._snapshot(run), reconcileError }
   }
 
   /**
