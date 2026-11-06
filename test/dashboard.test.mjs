@@ -93,6 +93,42 @@ test('dashboard history survives restart, separates projects, and never attaches
   }
 })
 
+test('a cold plan under review still lists its manifest commands; other cold runs claim none', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'dag-history-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const repo = join(root, 'repo')
+  mkdirSync(repo)
+  const file = join(repo, 'state.sqlite')
+  const db = new RunStore(file)
+  const checks = { later: [['node', '', 'a b']] }
+  const meta = {
+    runId: 'cold',
+    parentId: 'captain',
+    repo: { root: repo, commonDir: join(repo, '.git') },
+    ref: 'refs/heads/integration/cold',
+    baseSha: 'start',
+    manifest: normalizeManifest({ spec_id: 'demo', checks, tickets: [{ id: 'A', title: 'A' }] }),
+    policyHash: 'test',
+    mode: 'staged',
+  }
+  db.init(meta)
+  const catalog = new RunCatalog()
+  catalog.remember(file, meta, 1000)
+  const cold = { maxWorkers: 16, runs: new Map(), peek: () => assert.fail('Unexpected attach') }
+  try {
+    const review = catalog.read(cold, null).selected
+    assert.equal(review.attached, false)
+    assert.deepEqual(review.checks, checks)
+    assert.deepEqual(review.planChecks, ['later'])
+    db.setMode('cancelled')
+    const ended = catalog.read(cold, null).selected
+    assert.deepEqual(ended.checks, {})
+    assert.deepEqual(ended.planChecks, [])
+  } finally {
+    db.close()
+  }
+})
+
 test('dashboard URL accepts only one opaque key and only supplies a GET route', async () => {
   let route,
     reads = 0

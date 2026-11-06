@@ -501,9 +501,21 @@ export class RunStore {
       const update = this.#db.prepare('UPDATE tickets SET definition=? WHERE id=?')
       for (const t of approved) update.run(JSON.stringify(t), t.id)
       this.#db.prepare("UPDATE run SET mode='active', diagnostic=NULL WHERE singleton=1").run()
-      this.#event('run_approved', null, 'Plan approved by the user; dispatch started', {}, true)
+      // The review shows every manifest check, so approval covers each of them.
+      // An approval without this record predates that and covers none on its own.
+      const planChecks = Object.keys(run.manifest.checks ?? {})
+      this.#event('run_approved', null, 'Plan approved by the user; dispatch started', { planChecks }, true)
       return true
     })
+  }
+
+  /** The manifest check IDs the user saw and approved; empty before approval and for older approvals. */
+  approvedChecks() {
+    return this.#approvals().flatMap((row) => JSON.parse(row.details).planChecks ?? [])
+  }
+
+  #approvals() {
+    return this.#db.prepare("SELECT details FROM events WHERE type='run_approved' ORDER BY rowid").all()
   }
 
   /**
@@ -596,8 +608,8 @@ export class RunStore {
   /**
    * The raw ledger fields that decide what may run and how it is accepted:
    * the run row (including mode), every ticket definition, the dependency
-   * edges and the append records. The coordinator pins a digest of them
-   * against outside edits.
+   * edges, the append records and the approval records. The coordinator pins
+   * a digest of them against outside edits.
    */
   integrity() {
     return {
@@ -609,6 +621,7 @@ export class RunStore {
       appended: this.#db
         .prepare('SELECT ticketId,batch,definition,policyHash,createdAt FROM appended ORDER BY batch,rowid')
         .all(),
+      approvals: this.#approvals(),
     }
   }
 

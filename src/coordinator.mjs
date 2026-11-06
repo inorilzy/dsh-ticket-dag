@@ -53,15 +53,23 @@ function copyChecks(manifest, registry) {
 function registryOf(profile, manifest) {
   return { ...profile, ...(manifest?.checks ?? {}) }
 }
+// Manifest checks no approval covers and no ticket of the run uses. A run
+// approved before the review listed unused checks never showed them to the user.
+function unapprovedChecks(db, meta, used) {
+  if (meta.mode === 'staged') return []
+  const approved = new Set(db.approvedChecks())
+  return Object.keys(meta.manifest.checks ?? {}).filter((id) => !approved.has(id) && !Object.hasOwn(used, id))
+}
 // Every ticket a run will verify: the submitted manifest plus each dag_add batch.
 function runTickets(db, meta = db.meta()) {
   return { tickets: [...meta.manifest.tickets, ...db.appended().flatMap((b) => b.tickets)] }
 }
 // Digest of the ledger fields that decide dispatch and acceptance. plan covers
 // the run row and submitted manifest; approval covers the per-ticket
-// definitions (approved presets, verify IDs), dependency edges and append records.
+// definitions (approved presets, verify IDs), dependency edges, append records
+// and which manifest checks the approval covered.
 function ledgerDigest(db) {
-  const { run, tickets, dependencies, appended } = db.integrity()
+  const { run, tickets, dependencies, appended, approvals } = db.integrity()
   return {
     mode: run.mode,
     plan: hash(
@@ -72,6 +80,7 @@ function ledgerDigest(db) {
         tickets.map((t) => [t.id, t.position, t.definition]),
         dependencies.map((d) => [d.ticketId, d.upstream]),
         appended.map((a) => [a.ticketId, a.batch, a.definition, a.policyHash, a.createdAt]),
+        approvals.map((a) => a.details),
       ]),
     ),
   }
@@ -585,8 +594,10 @@ export class Coordinator {
   }
   _snapshot(run) {
     const m = run.db.meta(),
-      tickets = run.db.tickets()
+      tickets = run.db.tickets(),
+      unapproved = unapprovedChecks(run.db, m, run.checks)
     const appendedAt = new Map(run.db.appended().flatMap((b) => b.tickets.map((t) => [t.id, b.createdAt])))
+    const planCommands = Object.entries(m.manifest.checks ?? {}).filter(([id]) => !unapproved.includes(id))
     const counts = Object.create(null)
     for (const t of tickets) counts[t.status] = (counts[t.status] ?? 0) + 1
     return {
@@ -603,9 +614,11 @@ export class Coordinator {
         skipped: tickets.filter((t) => t.cleanup === 'skipped').length,
       },
       diagnostic: run.haltError || m.diagnostic || null,
-      // What the user approves: the captain's own check commands, and each ticket's check IDs.
-      checks: run.checks,
+      // What the user approves: every check command the captain wrote, used or
+      // not, the profile commands the run uses, and each ticket's check IDs.
+      checks: { ...Object.fromEntries(planCommands), ...run.checks },
       planChecks: Object.keys(m.manifest.checks ?? {}),
+      unapprovedChecks: unapproved,
       tickets: tickets.map(
         ({
           id,
@@ -798,6 +811,14 @@ export class Coordinator {
       // appended tickets skip the user's review.
       const registry = registryOf(this.checks, run.db.meta().manifest)
       const tickets = normalizeAppend(q.tickets, { ...registry, ...run.checks }, this.agents)
+      const unapproved = unapprovedChecks(run.db, run.db.meta(), run.checks)
+      for (const t of tickets) {
+        const id = t.verify.find((name) => unapproved.includes(name))
+        requireValue(
+          !id,
+          t.id + ': check ' + id + ' was not shown when this run was approved, so dag_add cannot use it; start a new run',
+        )
+      }
       const approval = run.db.events().find((e) => e.type === 'run_approved')
       if (approval) {
         const late = new Set(
