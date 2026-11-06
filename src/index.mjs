@@ -89,8 +89,15 @@ const writebackMode = (value) => (['comment', 'close'].includes(value) ? value :
 const importRule =
   'When the goal points at a spec or its tickets (a GitHub issue number or URL, or a local .scratch/<slug> folder, spec.md or issues folder from /to-spec and /to-tickets), call dag_import with it first and build the manifest from its draft. If dependencyMode is declared, keep every ticket and its depends_on exactly as imported: add only verify, agent and manifest checks, and report a dependency that looks wrong instead of changing it. If dependencyMode is none, keep the imported tickets and infer depends_on yourself. If it is no-tickets, split the spec into tickets yourself. Whenever you infer an edge, write its reason into the dependent ticket prompt so the user sees it in the plan review. Keep each ticket source field so the run can report back to the issue.'
 
-export function captainSection({ checks, agents, trackerWriteback, reviewOnComplete }) {
+export function captainSection({ checks, agents, trackerWriteback, reviewOnComplete, checkTimeoutMs, maxWorkers }) {
   const presets = Object.keys(agents ?? {})
+  const limits =
+    'Give each ticket the preset that matches its kind of work (for example UI tickets to a frontend preset, real-host acceptance to a verifier preset) instead of one preset for every ticket. Set max_workers explicitly' +
+    (maxWorkers ? ' (this profile allows at most ' + maxWorkers + ')' : '') +
+    ' and tell the user the value; tickets that edit the same files conflict more when many run at once. Each check command has ' +
+    Math.round((checkTimeoutMs ?? 120000) / 1000) +
+    ' seconds before it times out; pick checks that finish within that.' +
+    ' A trial-merge conflict is sent back to the ticket worker automatically; you are notified only if it keeps conflicting. Then merge the integration branch into that ticket branch in its worktree, commit it with the ticket current DAG trailers, and call dag_retry, which submits that commit without starting a new worker; a ticket added with dag_add cannot change another ticket branch.'
   return [
     'dsh-ticket-dag is this profile’s Agent Teams plugin: it runs a coding goal as a DAG of tickets, one worker per ticket in its own git worktree, verified and merged into an integration branch.',
     'A user message that starts with /dag or contains "Agent Teams" (any case, also agent team or AgentTeams) always activates it, and the host then adds a directive for that step. Otherwise use it only when the user explicitly asks for it (teams, 工单团队, ticket DAG) and the work splits into two or more tickets; mentioning, discussing or declining it is not a request, and a single small change is done directly, without dag_run.',
@@ -98,6 +105,7 @@ export function captainSection({ checks, agents, trackerWriteback, reviewOnCompl
       (presets.length ? ' (presets: ' + presets.join(', ') + ')' : '') +
       ', then call dag_run in the current repository. ' +
       checkList(checks),
+    limits,
     importRule +
       (writebackMode(trackerWriteback) === 'off'
         ? ' This profile does not report back to GitHub issues; do not close or comment on them yourself unless the user asks.'
@@ -406,7 +414,7 @@ export function apply(ctx, config = {}, { importer = importTickets, reporter = w
 
   register(
     'run',
-    'Start the approved spec manifest and return its runId. Reusing a runId with the same manifest is idempotent. Each ticket verify list is optional and names check IDs: a profile check, or one defined in the manifest checks object ({"<id>": [["program", "arg"]]}), which the user approves with the plan; a ticket without checks integrates after a clean merge. A ticket may set agent to a configured agent preset ID (for example implementer, test-writer or docs) to give its worker that role and model; omit it for the default worker. When the result mode is staged, nothing has started: the user reviews each ticket preset and model in the 「工单 · <runId>」 tab of the conversation right sidebar and approves or discards the plan there. Tell the user that and end the turn; you are notified once it is approved. dag_resume cannot start a staged run. To add work to this run later, use dag_add instead of a new dag_run.',
+    'Start the approved spec manifest and return its runId. Reusing a runId with the same manifest is idempotent. Each ticket verify list is optional and names check IDs: a profile check, or one defined in the manifest checks object ({"<id>": [["program", "arg"]]}), which the user approves with the plan; a ticket without checks integrates after a clean merge. A ticket may set agent to a configured agent preset ID (for example implementer, frontend, verifier, test-writer, docs or merger) to give its worker that role and model; omit it for the default worker. When the result mode is staged, nothing has started: the user reviews each ticket preset and model in the 「工单 · <runId>」 tab of the conversation right sidebar and approves or discards the plan there. Tell the user that and end the turn; you are notified once it is approved. dag_resume cannot start a staged run. To add work to this run later, use dag_add instead of a new dag_run.',
     {
       manifest: { type: 'json', required: true, description: 'Ticket DAG manifest object or JSON string.' },
       runId: {

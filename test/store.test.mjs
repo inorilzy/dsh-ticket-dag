@@ -370,6 +370,36 @@ test('a staged run admits nothing until approved; approval freezes each ticket c
   }
 })
 
+test('the user concurrency chosen at approval replaces the manifest max_workers and survives reopening', (t) => {
+  const file = tempDb(t)
+  let db = new RunStore(file)
+  try {
+    const spec = manifest([ticket('A'), ticket('B'), ticket('C')])
+    db.init({
+      runId: 'run-1',
+      repo: { root: '/work', commonDir: '/work/.git' },
+      ref: 'refs/heads/integration/run-1',
+      baseSha: 'start',
+      parentId: 'parent',
+      policyHash: 'checks-hash',
+      manifest: spec,
+      mode: 'staged',
+    })
+    assert.equal(db.workerLimit(), spec.maxWorkers)
+    assert.throws(() => db.approve(spec.tickets, { maxWorkers: 0 }), /1 to 32/)
+    assert.throws(() => db.approve(spec.tickets, { maxWorkers: 33 }), /1 to 32/)
+    assert.equal(db.approve(spec.tickets, { maxWorkers: 1 }), true)
+    assert.equal(db.workerLimit(), 1)
+    assert.ok(db.claim('A', assignment('A')))
+    assert.equal(db.claim('B', assignment('B')), null, 'one ticket at a time')
+    db.close()
+    db = new RunStore(file)
+    assert.equal(db.workerLimit(), 1)
+  } finally {
+    db.close()
+  }
+})
+
 test('a staged run can be discarded, and approval must name exactly the run tickets', (t) => {
   const db = new RunStore(tempDb(t))
   try {

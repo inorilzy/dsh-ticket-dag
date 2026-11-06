@@ -352,12 +352,13 @@ export function mountApproval(ctx, catalog, coordinator, getLlm = () => undefine
       } catch {
         return new Response('Invalid approval request', { status: 400, headers: noStore })
       }
-      const { key, action, choices } = body ?? {}
+      const { key, action, choices, maxWorkers } = body ?? {}
       if (
         typeof key !== 'string' ||
         !/^[0-9a-f]{64}$/.test(key) ||
         !['approve', 'discard'].includes(action) ||
-        (action === 'approve' && !Array.isArray(choices))
+        (action === 'approve' && !Array.isArray(choices)) ||
+        (maxWorkers !== undefined && (!Number.isInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 32))
       ) {
         return new Response('Invalid approval request', { status: 400, headers: noStore })
       }
@@ -376,7 +377,9 @@ export function mountApproval(ctx, catalog, coordinator, getLlm = () => undefine
       }
       try {
         const snapshot =
-          action === 'approve' ? await coordinator.approve(entry.file, choices) : await coordinator.discard(entry.file)
+          action === 'approve'
+            ? await coordinator.approve(entry.file, choices, maxWorkers === undefined ? {} : { maxWorkers })
+            : await coordinator.discard(entry.file)
         return Response.json(snapshot, { headers: noStore })
       } catch (error) {
         return new Response(displayDiagnostic(error?.message) || 'Approval failed', { status: 409, headers: noStore })

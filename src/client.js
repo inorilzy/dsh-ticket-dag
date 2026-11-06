@@ -33,7 +33,7 @@ window.__ModuleLoader__.load({
         name: '实现者',
         description: '实现者：按工单完成代码与配套测试',
         instructions:
-          'Implement the ticket end to end: production code plus the tests that prove it. Keep the change limited to what the ticket asks for.',
+          'Implement the ticket end to end: production code plus the tests that prove it. Keep the change limited to what the ticket asks for. Put new tests in a new test file named for this ticket rather than appending to a large shared test file, so parallel tickets do not conflict.',
         provider: '',
         model: '',
         reasoningEffort: '',
@@ -54,6 +54,36 @@ window.__ModuleLoader__.load({
         description: '文档编写者：只改文档与注释',
         instructions:
           'Update documentation, README files and code comments only. Do not change program behavior.',
+        provider: '',
+        model: '',
+        reasoningEffort: '',
+        maxConcurrent: 0,
+      },
+      frontend: {
+        name: '前端',
+        description: '前端：界面、渲染与对应的界面测试',
+        instructions:
+          'Implement the ticket in the user interface: components, rendering, copy and the UI tests that prove it. Follow the existing panel structure, styles and wording; keep server and scheduler code unchanged unless the ticket requires it.',
+        provider: '',
+        model: '',
+        reasoningEffort: '',
+        maxConcurrent: 0,
+      },
+      verifier: {
+        name: '验收员',
+        description: '验收员：运行真实宿主、浏览器和 SDK 验收，如实记录结果',
+        instructions:
+          'Run the acceptance the ticket names against real hosts, browsers or SDKs and record each item as PASS, FAIL or NOT RUN with the exact command and output. Missing environments are NOT RUN, never PASS; do not fake or skip results. You may fix test fixtures and harnesses, not production code; report defects instead of fixing them. Commit the acceptance record.',
+        provider: '',
+        model: '',
+        reasoningEffort: '',
+        maxConcurrent: 1,
+      },
+      merger: {
+        name: '合并员',
+        description: '合并员：把指定分支的已有成果合入本工单分支并解决冲突',
+        instructions:
+          'Merge the branch or commit named in the ticket into your own ticket branch, resolve every conflict keeping the intent of both sides, run the tests, and commit the merge. Do not add features or refactor; if a conflict needs a product decision, stop and describe it.',
         provider: '',
         model: '',
         reasoningEffort: '',
@@ -1729,6 +1759,8 @@ window.__ModuleLoader__.load({
       const [bulk, setBulk] = useState(null)
       // The map node under the pointer or keyboard focus.
       const [hovered, setHovered] = useState(null)
+      // The user's concurrency for this run, as typed; null keeps the plan's.
+      const [workers, setWorkers] = useState(null)
       useEffect(() => {
         const ctrl = new AbortController()
         fetch('api/ticket-dag.models', { signal: ctrl.signal, cache: 'no-store' })
@@ -1826,11 +1858,20 @@ window.__ModuleLoader__.load({
           setBusy(false)
         }
       }
-      const approve = () =>
+      const plannedWorkers = String(run.maxWorkers ?? 1)
+      const currentWorkers = workers ?? plannedWorkers
+      const approve = () => {
+        const n = Number(currentWorkers)
+        if (!/^\d+$/.test(currentWorkers) || n < 1 || n > 32) {
+          setError('同时运行工单数须为 1 到 32 之间的整数。')
+          return
+        }
         send({
           action: 'approve',
           choices: run.tickets.map((t) => ({ id: t.id, agent: currentOwners[t.id], ...routeOf(currentOwners[t.id]) })),
+          ...(currentWorkers !== plannedWorkers && { maxWorkers: n }),
         })
+      }
       const blocked = busy || run.attached === false
       return h(
         'section',
@@ -1848,7 +1889,31 @@ window.__ModuleLoader__.load({
           h(
             'p',
             { className: 'dtd-hint' },
-            memberIds.length + ' 名成员 · ' + run.tickets.length + ' 项任务 · ' + edges + ' 条依赖',
+            memberIds.length + ' 名成员 · ' + run.tickets.length + ' 项任务 · ' + edges + ' 条依赖 · 最多同时 ' + currentWorkers + ' 个',
+          ),
+        ),
+        h(
+          'section',
+          { className: 'dtd-block', 'aria-label': '并行' },
+          h(
+            'label',
+            null,
+            h('span', null, '同时运行工单数'),
+            h('input', {
+              'aria-label': '同时运行工单数',
+              type: 'number',
+              min: 1,
+              max: 32,
+              step: 1,
+              value: currentWorkers,
+              disabled: busy,
+              onChange: (e) => setWorkers(e.target.value),
+            }),
+            h(
+              'small',
+              null,
+              '每张工单各由一个 worker 在独立 worktree 中完成；成员是角色模板，同一成员可同时带多个 worker。这里限制这轮最多同时跑几张，实际还受插件“最大并发工单数”和宿主子智能体上限限制。改同一批文件的工单同时跑得越多，试合并冲突越多。',
+            ),
           ),
         ),
         run.attached === false &&

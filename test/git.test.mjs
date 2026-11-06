@@ -175,7 +175,7 @@ test('trial merges use exact parents, cannot publish a stale tip or checked-out 
   await releaseCandidate(repo, trialB, fresh)
 })
 
-test('conflict state and worker commits persist; retry adopts an explicitly resolved exact merge', async (t) => {
+test('a content conflict names the files and aborts the trial; the ticket resolves it on its own branch', async (t) => {
   const { root, repo, base } = await fixture(t)
   await initIntegration(repo, target, base)
   const a = join(root, 'task-a'),
@@ -187,15 +187,24 @@ test('conflict state and worker commits persist; retry adopts an explicitly reso
   const bTip = await finish(b, 'common.txt', 'B\n', 'B')
   const first = await buildCandidate(repo, join(root, 'first'), base, aTip)
   await publishCandidate(repo, target, base, first)
-  await assert.rejects(buildCandidate(repo, conflict, first, bTip), /checkout preserved/)
-  assert.match(await readFile(join(conflict, 'common.txt'), 'utf8'), /<<<<<<</)
-  assert.equal(await g(conflict, 'rev-parse', 'MERGE_HEAD'), bTip)
-  await assert.rejects(buildCandidate(repo, conflict, first, bTip), /unfinished operation/)
+  const err = await buildCandidate(repo, conflict, first, bTip).then(
+    () => assert.fail('expected a conflict'),
+    (e) => e,
+  )
+  assert.match(err.message, /Trial merge conflicts with the integration tip in: common\.txt/)
+  assert.deepEqual(err.conflicts, ['common.txt'])
+  // The plugin-owned trial is back at the tip with no merge in progress. (Its
+  // cleanliness is checked below by reusing it: buildCandidate refuses local changes.)
+  assert.equal(await resolveRef(conflict, 'HEAD'), first)
+  await assert.rejects(g(conflict, 'rev-parse', '-q', '--verify', 'MERGE_HEAD'))
   assert.equal(await resolveRef(repo, target), first)
-  assert.equal(await resolveRef(b, 'HEAD'), bTip)
-  const resolved = await finish(conflict, 'common.txt', 'A+B\n', 'Resolve ticket B with A')
-  assert.equal(await buildCandidate(repo, conflict, first, bTip), resolved)
-  await assertMergeParents(repo, resolved, first, bTip)
+  assert.equal(await resolveRef(b, 'HEAD'), bTip, 'the worker commit is untouched')
+  // The ticket merges the tip on its own branch; the next trial in the same checkout is clean.
+  await g(b, 'merge', '--no-edit', first).catch(() => {})
+  const resolved = await finish(b, 'common.txt', 'A+B\n', 'Merge the tip into B')
+  const candidate = await buildCandidate(repo, conflict, first, resolved)
+  await assertMergeParents(repo, candidate, first, resolved)
+  assert.equal(await g(conflict, 'show', 'HEAD:common.txt'), 'A+B')
 })
 
 // Publishes each ticket tip onto the integration branch through an exact trial merge.

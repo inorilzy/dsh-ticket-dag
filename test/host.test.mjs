@@ -221,7 +221,7 @@ test('local child launch uses a worktree and caller-delivered completion, drains
 })
 
 test('built-in agent presets are the default; profile presets replace them; a preset model reaches the child', async () => {
-  assert.deepEqual(Object.keys(harness().api.agents), ['implementer', 'test-writer', 'docs'])
+  assert.deepEqual(Object.keys(harness().api.agents), ['implementer', 'test-writer', 'docs', 'frontend', 'verifier', 'merger'])
   assert.equal(harness().api.requireApproval, true, 'runs wait for the user by default')
   assert.equal(harness({ requireApproval: false }).api.requireApproval, false)
   const agents = { reviewer: { instructions: 'Review only.', model: 'fast-1', provider: 'acme' } }
@@ -367,6 +367,17 @@ test('dag_import is captain-only, reads in the captain cwd, and the captain is t
   const review = harness({ reviewOnComplete: true })
   assert.equal(review.api.reviewOnComplete, true)
   assert.match(review.sections.find((s) => s.name === 'tool:dsh-ticket-dag').text(), /reviews each run once.*code-review/)
+  await h.close()
+})
+
+test('the captain section states the check timeout, the worker cap, preset choice and how conflicts are handled', async () => {
+  const h = harness({ checkTimeoutMs: 600000, maxWorkers: 16 })
+  const text = h.sections.find((s) => s.name === 'tool:dsh-ticket-dag').text()
+  assert.match(text, /600 seconds before it times out/)
+  assert.match(text, /Set max_workers explicitly \(this profile allows at most 16\) and tell the user/)
+  assert.match(text, /preset that matches its kind of work/)
+  assert.match(text, /conflict is sent back to the ticket worker automatically/)
+  assert.match(text, /dag_retry, which submits that commit without starting a new worker/)
   await h.close()
 })
 

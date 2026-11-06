@@ -483,7 +483,9 @@ export class RunStore {
    * @param tickets - every ticket definition of the run, with its approved agent fields.
    * @returns true when the run was staged and is now active.
    */
-  approve(tickets) {
+  approve(tickets, { maxWorkers } = {}) {
+    if (maxWorkers !== undefined && (!Number.isInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 32))
+      throw new TypeError('maxWorkers must be an integer from 1 to 32')
     return this.#transaction(() => {
       const run = this.meta()
       const plan = run ? this.plan() : []
@@ -501,9 +503,24 @@ export class RunStore {
       const update = this.#db.prepare('UPDATE tickets SET definition=? WHERE id=?')
       for (const t of approved) update.run(JSON.stringify(t), t.id)
       this.#db.prepare("UPDATE run SET mode='active', diagnostic=NULL WHERE singleton=1").run()
-      this.#event('run_approved', null, 'Plan approved by the user; dispatch started', {}, true)
+      this.#event(
+        'run_approved',
+        null,
+        'Plan approved by the user; dispatch started',
+        maxWorkers === undefined ? {} : { maxWorkers },
+        true,
+      )
       return true
     })
+  }
+
+  /** How many tickets may run at once: the user's choice at approval, else the manifest's. */
+  workerLimit() {
+    const row = this.#db
+      .prepare("SELECT details FROM events WHERE type='run_approved' ORDER BY rowid DESC LIMIT 1")
+      .get()
+    const chosen = row ? JSON.parse(row.details).maxWorkers : undefined
+    return Number.isInteger(chosen) && chosen >= 1 && chosen <= 32 ? chosen : this.meta().manifest.maxWorkers
   }
 
   /**
@@ -640,7 +657,7 @@ export class RunStore {
       if (resourceKeys({ path, branch, childId }).some(([kind, value]) => retired.get(kind, value)))
         return null
       const active = this.#db.prepare("SELECT COUNT(*) AS n FROM tickets WHERE status='RUNNING'").get().n
-      if (active >= run.manifest.maxWorkers) return null
+      if (active >= this.workerLimit()) return null
       const lease = randomUUID()
       const changed = this.#db
         .prepare(
@@ -788,6 +805,33 @@ export class RunStore {
       ) {
         this.#event('run_completed', null, 'All tickets integrated at ' + landedSha, { landedSha }, true)
       }
+      return true
+    })
+  }
+
+  /**
+   * Send a submitted ticket whose trial merge conflicted back to its own
+   * branch: the next attempt resumes the same worktree and frozen base and
+   * merges the integration tip itself. Bounded per ticket.
+   * @returns true when the ticket was requeued.
+   */
+  requeueConflict(id, lease, { message, maxRetries = 2 }) {
+    if (!Number.isSafeInteger(maxRetries) || maxRetries < 0)
+      throw new TypeError('maxRetries must be a nonnegative integer')
+    text(message, 'conflict message')
+    return this.#transaction(() => {
+      if (this.meta()?.mode !== 'active' || this.#hasIntent(id)) return false
+      const used = this.#db
+        .prepare("SELECT COUNT(*) AS n FROM events WHERE type='conflict_requeued' AND ticketId=?")
+        .get(id).n
+      if (used >= maxRetries) return false
+      const result = this.#db
+        .prepare(
+          "UPDATE tickets SET status='PENDING', lease=NULL, retryAt=0, message=? WHERE id=? AND status='SUBMITTED' AND lease=?",
+        )
+        .run(message, id, lease)
+      if (result.changes !== 1) return false
+      this.#event('conflict_requeued', this.get(id), message, { oldLease: lease, conflictRetries: used + 1 })
       return true
     })
   }

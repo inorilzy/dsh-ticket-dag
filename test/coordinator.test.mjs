@@ -602,7 +602,8 @@ test(
       assert.equal(held.tickets[0].status, 'PENDING')
       await assert.rejects(co.resume(q), /approv/)
       // The user can still approve the plan from the board.
-      await co.approve(file, [{ id: 'A' }])
+      const approved = await co.approve(file, [{ id: 'A' }], { maxWorkers: 1 })
+      assert.equal(approved.maxWorkers, 1, 'the user concurrency applies to the run')
       await until(async () => (await co.status(q)).complete, 'approved run integrates', 30000)
       assert.equal(jobs.length, 1)
     } finally {
@@ -1244,6 +1245,164 @@ test('an integrated imported GitHub ticket is reported once when trackerWritebac
     await run.writebacks
     const types = run.db.events().filter((e) => e.type.startsWith('writeback_')).map((e) => [e.ticketId, e.type])
     assert.deepEqual(types.sort(), [['A', 'writeback_done'], ['B', 'writeback_failed']])
+  } finally {
+    await co.close()
+  }
+})
+
+// Both tickets edit the same line of shared.txt, so whichever lands second conflicts.
+async function editShared(job, text) {
+  await writeFile(join(job.cwd, 'shared.txt'), text + '\n')
+  await git(job.cwd, 'add', '--', 'shared.txt')
+  const trailers = ['DAG-Run: ' + job.runId, 'DAG-Ticket: ' + job.ticketId, 'DAG-Attempt: ' + job.attempt, 'DAG-Complete: yes']
+  await git(job.cwd, 'commit', '-qm', 'Edit shared by ' + job.ticketId, '-m', trailers.join('\n'))
+}
+async function sharedRepo(t) {
+  const cwd = await repo(t)
+  await writeFile(join(cwd, 'shared.txt'), 'base\n')
+  await git(cwd, 'add', 'shared.txt')
+  await git(cwd, 'commit', '-qm', 'shared')
+  return cwd
+}
+
+test('a trial merge conflict goes back to the ticket worker, which merges the tip and integrates', { timeout: limit(120000) }, async (t) => {
+  const cwd = await sharedRepo(t)
+  const prompts = []
+  const gateA = gate()
+  const co = new Coordinator({
+    checks: {},
+    launch: async (job) => {
+      prompts.push([job.ticketId, job.attempt, job.prompt])
+      return {
+        dispose: async () => {},
+        result: (async () => {
+          if (job.ticketId === 'A') {
+            await editShared(job, 'from A')
+            gateA.release()
+          } else if (job.attempt === 1) {
+            await gateA.wait
+            await editShared(job, 'from B')
+          } else {
+            // The resumed worker merges the integration tip, resolving to both lines.
+            await git(job.cwd, 'merge', '--no-edit', 'integration/conflict').catch(() => {})
+            await writeFile(join(job.cwd, 'shared.txt'), 'from A\nfrom B\n')
+            await git(job.cwd, 'add', '--', 'shared.txt')
+            const trailers = ['DAG-Run: ' + job.runId, 'DAG-Ticket: B', 'DAG-Attempt: ' + job.attempt, 'DAG-Complete: yes']
+            await git(job.cwd, 'commit', '-qm', 'Merge tip into B', '-m', trailers.join('\n'))
+          }
+          return { ok: true }
+        })(),
+      }
+    },
+  })
+  const q = { cwd, parentId: 'captain', runId: 'conflict' }
+  try {
+    await co.start({ ...q, manifest: { spec_id: 'c', tickets: [{ id: 'A', title: 'A' }, { id: 'B', title: 'B' }] } })
+    const done = await until(async () => {
+      const s = await co.status(q)
+      if (s.counts.NEEDS_ATTENTION) throw Error(JSON.stringify(s.tickets.map((r) => [r.id, r.status, r.message])))
+      return s.complete && s
+    }, 'both integrated after the conflict')
+    assert.equal(await git(cwd, 'show', 'integration/conflict:shared.txt'), 'from A\nfrom B')
+    const b = done.tickets.find((r) => r.id === 'B')
+    assert.equal(b.attempt, 2, 'B was requeued once')
+    const retryPrompt = prompts.find(([id, attempt]) => id === 'B' && attempt === 2)[2]
+    assert.match(retryPrompt, /conflicted with the integration branch/)
+    assert.match(retryPrompt, /shared\.txt/)
+    assert.match(retryPrompt, /git merge integration\/conflict/)
+    assert.match(prompts[0][2], /Before the final commit, run git merge integration\/conflict/)
+    const [run] = co.runs.values()
+    assert.ok(run.db.events().some((e) => e.type === 'conflict_requeued' && e.ticketId === 'B'))
+    assert.ok(!run.db.events().some((e) => e.type === 'needs_attention'))
+  } finally {
+    await co.close()
+  }
+})
+
+test('conflict requeues are bounded; then the ticket needs attention with the conflicting files', { timeout: limit(120000) }, async (t) => {
+  const cwd = await sharedRepo(t)
+  const gateA = gate()
+  const co = new Coordinator({
+    checks: {},
+    maxConflictRetries: 1,
+    launch: async (job) => ({
+      dispose: async () => {},
+      result: (async () => {
+        if (job.ticketId === 'A') {
+          await editShared(job, 'from A')
+          gateA.release()
+        } else {
+          await gateA.wait
+          // Each attempt commits another conflicting edit without merging the tip.
+          await editShared(job, 'from B ' + job.attempt)
+        }
+        return { ok: true }
+      })(),
+    }),
+  })
+  const q = { cwd, parentId: 'captain', runId: 'stuck' }
+  try {
+    await co.start({ ...q, manifest: { spec_id: 's', tickets: [{ id: 'A', title: 'A' }, { id: 'B', title: 'B' }] } })
+    const s = await until(async () => {
+      const s = await co.status(q)
+      return s.counts.NEEDS_ATTENTION && s
+    }, 'B needs attention')
+    const b = s.tickets.find((r) => r.id === 'B')
+    assert.equal(b.attempt, 2)
+    assert.match(b.message, /Trial merge conflicts with the integration tip in: shared\.txt/)
+  } finally {
+    await co.close()
+  }
+})
+
+test('dag_retry submits a new stamped commit for the current attempt instead of starting a worker', { timeout: limit(120000) }, async (t) => {
+  const cwd = await sharedRepo(t)
+  const gateA = gate()
+  let launches = 0
+  const co = new Coordinator({
+    checks: {},
+    maxConflictRetries: 0,
+    canRetry: async () => true,
+    launch: async (job) => {
+      launches++
+      return {
+        dispose: async () => {},
+        result: (async () => {
+          if (job.ticketId === 'A') {
+            await editShared(job, 'from A')
+            gateA.release()
+          } else {
+            await gateA.wait
+            await editShared(job, 'from B')
+          }
+          return { ok: true }
+        })(),
+      }
+    },
+  })
+  const q = { cwd, parentId: 'captain', runId: 'adopt' }
+  try {
+    await co.start({ ...q, manifest: { spec_id: 'a', tickets: [{ id: 'A', title: 'A' }, { id: 'B', title: 'B' }] } })
+    const stuck = await until(async () => {
+      const s = await co.status(q)
+      return s.counts.NEEDS_ATTENTION && s
+    }, 'B conflicts')
+    const b = stuck.tickets.find((r) => r.id === 'B')
+    // The captain merges the tip on B's branch and commits it with B's current trailers.
+    await git(b.path, 'merge', '--no-edit', 'integration/adopt').catch(() => {})
+    await writeFile(join(b.path, 'shared.txt'), 'from A\nfrom B\n')
+    await git(b.path, 'add', '--', 'shared.txt')
+    await git(b.path, 'commit', '-qm', 'Captain merge', '-m', ['DAG-Run: adopt', 'DAG-Ticket: B', 'DAG-Attempt: 1', 'DAG-Complete: yes'].join('\n'))
+    const before = launches
+    const retried = await co.retry({ ...q, id: 'B' })
+    assert.equal(retried.tickets.find((r) => r.id === 'B').status, 'SUBMITTED')
+    await until(async () => {
+      const s = await co.status(q)
+      if (s.counts.NEEDS_ATTENTION) throw Error(JSON.stringify(s.tickets.map((r) => [r.id, r.status, r.message])))
+      return s.complete
+    }, 'B integrated from the captain commit', 60000)
+    assert.equal(launches, before, 'no new worker was started')
+    assert.equal(await git(cwd, 'show', 'integration/adopt:shared.txt'), 'from A\nfrom B')
   } finally {
     await co.close()
   }

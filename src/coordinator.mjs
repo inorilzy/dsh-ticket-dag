@@ -99,6 +99,8 @@ function specPrompt(meta, row, upstream) {
     'DAG-Attempt: ' + row.attempt,
     'DAG-Complete: yes',
   ]
+  const branch = meta.ref.replace(/^refs\/heads\//, '')
+  const conflicted = row.attempt > 1 && /^Trial merge conflicts with the integration tip/.test(row.message ?? '')
   return [
     'Implement this single ticket in the assigned Git worktree. Confirm git rev-parse --show-toplevel matches ' +
       row.path +
@@ -107,10 +109,13 @@ function specPrompt(meta, row, upstream) {
       ' before writing.',
     'Do not change branches, run the DAG control tools, modify other worktrees, or push. The coordinator alone integrates.',
     'Frozen base: ' + row.baseSha + '. Integrated dependencies: ' + JSON.stringify(upstream),
-    row.attempt > 1
-      ? 'This is a recovery attempt. Inspect the existing diff, git log, and tests. Preserve valid prior work; continue this ticket. Prior diagnostic: ' +
-        (row.message || 'inspect the worktree')
-      : '',
+    conflicted
+      ? 'Your previous completion conflicted with the integration branch. ' + row.message +
+        '. Run git merge ' + branch + ' in this worktree, resolve every conflict keeping both your change and the integrated work, run the tests, and commit the merge with the trailers below. Do not redo the ticket from scratch.'
+      : row.attempt > 1
+        ? 'This is a recovery attempt. Inspect the existing diff, git log, and tests. Preserve valid prior work; continue this ticket. Prior diagnostic: ' +
+          (row.message || 'inspect the worktree')
+        : '',
     'Ticket: ' + row.id + ' — ' + row.title,
     row.agentSpec?.instructions ? 'Role (' + row.agent + '): ' + row.agentSpec.instructions : '',
     row.prompt,
@@ -118,6 +123,9 @@ function specPrompt(meta, row, upstream) {
       (row.verify.length
         ? 'Required check IDs: ' + JSON.stringify(row.verify) + ' (the coordinator runs them after you commit).'
         : 'No automatic check is attached: the coordinator only trial-merges your commit, so test your own change before committing.'),
+    'Before the final commit, run git merge ' +
+      branch +
+      ' so your branch contains the latest integrated work, resolve any conflict, and rerun the tests; the coordinator trial-merges against that branch.',
     'When work is complete, commit all intended changes on this branch and leave git status clean. The final commit message must end with these four separate Git trailers (in a final paragraph). A WIP commit is not a completion receipt:',
     stamp.join('\n'),
     'After the commit, return the commit SHA and a short report.',
@@ -190,6 +198,7 @@ export class Coordinator {
     checkTimeoutMs = 120000,
     retryDelayMs = 1500,
     maxAutoRetries = 2,
+    maxConflictRetries = 2,
     trackerWriteback = 'off',
     reviewOnComplete = false,
     writeback,
@@ -213,6 +222,7 @@ export class Coordinator {
       checkTimeoutMs,
       retryDelayMs,
       maxAutoRetries,
+      maxConflictRetries,
       trackerWriteback,
       reviewOnComplete,
       writeback,
@@ -379,7 +389,7 @@ export class Coordinator {
         file,
         root,
         checks: copyChecks(runTickets(db, meta), registryOf(seed?.checks ?? this.checks, meta.manifest)),
-        limit: meta.manifest.maxWorkers,
+        limit: db.workerLimit(),
         serial: Promise.resolve(),
         pump: null,
         again: false,
@@ -731,10 +741,13 @@ export class Coordinator {
           })),
         'Cannot prove the old child stopped. Stop it and retry, or request isolated recovery to a NEW directory from the frozen base; old files are retained.',
       )
+      // A stamped commit for the current attempt that is not the one already
+      // tried (for example the captain's conflict merge) is submitted directly.
       let adopt
-      if (t.path && !t.sourceSha) {
+      if (t.path) {
         try {
-          adopt = await stampedSource(m, t)
+          const head = await stampedSource(m, t)
+          if (head !== t.sourceSha) adopt = head
         } catch {
           /* Unstamped work is a resume candidate, never a success receipt. */
         }
@@ -885,9 +898,10 @@ export class Coordinator {
    * which keeps the copy frozen at dag_run; the result is frozen into the run.
    * @param file - the run ledger the board selected.
    * @param choices - per-ticket selections.
+   * @param options.maxWorkers - the user's concurrency for this run, replacing the manifest's.
    * @returns the run snapshot after approval.
    */
-  async approve(file, choices) {
+  async approve(file, choices, { maxWorkers } = {}) {
     const run = this.runs.get(file)
     requireValue(run, 'Open the captain conversation of this run first')
     await serial(run, async () => {
@@ -922,7 +936,8 @@ export class Coordinator {
           ...(Object.keys(spec).length && { agentSpec: spec }),
         }
       })
-      requireValue(run.db.approve(tickets), 'This run is not waiting for approval')
+      requireValue(run.db.approve(tickets, { maxWorkers }), 'This run is not waiting for approval')
+      run.limit = run.db.workerLimit()
       const after = ledgerDigest(run.db)
       run.trust = { ...run.trust, mode: after.mode, approval: after.approval, approved: true }
       run.haltError = ''
@@ -1022,13 +1037,33 @@ export class Coordinator {
     if (!submitted && !ready.length) return
     this._checkPolicy(run)
     const tip = await this._trustedTip(run)
-    if (submitted && !run.integration) {
+    // Re-read after the awaits above: an integration that finished meanwhile may
+    // have moved this row, and a stale submission must not be trial-merged again.
+    const fresh = submitted && run.db.get(submitted.id)
+    if (
+      submitted &&
+      !run.integration &&
+      fresh.status === 'SUBMITTED' &&
+      fresh.lease === submitted.lease &&
+      fresh.sourceSha === submitted.sourceSha
+    ) {
       const job = { id: submitted.id, phase: { stage: 'merge' }, ctrl: new AbortController() }
       run.integration = job
       job.promise = this._integrate(run, submitted, tip, job)
         .catch((err) => {
           // A held ledger leaves the submission as it was for inspection.
           if (err.ledger) return
+          // A failure belongs only to the submission it tried; a newer one (same lease) stays.
+          if (run.db.get(submitted.id)?.sourceSha !== submitted.sourceSha) return
+          // A content conflict goes back to the ticket's own worker, a bounded number of times.
+          if (
+            err.conflicts &&
+            run.db.requeueConflict(submitted.id, submitted.lease, {
+              message: message(err),
+              maxRetries: this.maxConflictRetries,
+            })
+          )
+            return
           run.db.move(submitted.id, submitted.lease, 'SUBMITTED', 'NEEDS_ATTENTION', {
             message: message(err),
           })
@@ -1229,7 +1264,14 @@ export class Coordinator {
       'candidates',
       keyOf(row.id) + '-' + row.attempt + '-' + tip.slice(0, 12),
     )
-    const candidate = await git.buildCandidate(m.repo, candidatePath, tip, row.sourceSha)
+    let candidate
+    try {
+      candidate = await git.buildCandidate(m.repo, candidatePath, tip, row.sourceSha)
+    } catch (err) {
+      // The conflicted trial was aborted back to the tip; drop the clean checkout.
+      if (err.conflicts) await git.releaseCandidate(m.repo, candidatePath, tip).catch(() => {})
+      throw err
+    }
     const checkIds = [
       ...new Set(
         [row, ...run.db.tickets().filter((t) => t.status === 'INTEGRATED')].flatMap((t) => t.verify),

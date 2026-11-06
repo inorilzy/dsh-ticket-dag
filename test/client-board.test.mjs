@@ -670,7 +670,7 @@ test('without saved presets the config page starts from the built-in presets', a
   const values = (label) =>
     findAll(section, (n) => n.props['aria-label'] === label).map((n) => n.props.value)
   assert.deepEqual(values('Agent ID'), Object.keys(builtinAgents))
-  assert.deepEqual(values('显示名'), ['实现者', '测试员', '文档员'])
+  assert.deepEqual(values('显示名'), ['实现者', '测试员', '文档员', '前端', '验收员', '合并员'])
   assert.deepEqual(
     values('角色说明'),
     Object.values(builtinAgents).map((a) => a.instructions),
@@ -915,6 +915,24 @@ function stagedRun(tickets) {
     })),
   }
 }
+
+test('plan review shows the run concurrency and lets the user change it before approval', () => {
+  const selected = { ...reviewRun(), maxWorkers: 4 }
+  const host = loadHost([{ runs: [selected], selected }, selected.key])
+  const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  const review = find(pane, (n) => n.props['data-dag-review'] !== undefined)
+  assert.match(text(review), /最多同时 4 个/)
+  const field = find(review, (n) => n.props['aria-label'] === '同时运行工单数')
+  assert.equal(field.props.value, '4')
+  assert.equal(field.props.max, 32)
+  assert.match(text(find(review, (n) => n.props['aria-label'] === '并行')), /成员是角色模板/)
+  host.sets.length = 0
+  field.props.onChange({ target: { value: '8' } })
+  assert.ok(host.sets.includes('8'))
+  // Unchanged, the approval carries no concurrency of its own.
+  find(review, (n) => n.type === 'button' && text(n) === '确认并启动').props.onClick()
+  assert.equal(Object.hasOwn(host.posts[0][1], 'maxWorkers'), false)
+})
 
 test('built-in presets saved without a display name still show their Chinese name', () => {
   const selected = reviewRun()

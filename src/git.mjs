@@ -393,6 +393,18 @@ export async function buildCandidate(repo, path, oldTip, sourceSha) {
         source,
       )
     } catch (err) {
+      // A content conflict is the ticket's to resolve on its own branch: record the
+      // files, abort the plugin-owned trial so the checkout is clean for the next try.
+      const conflicts = await optionalGit(wt, 'diff', '--name-only', '--diff-filter=U').catch(() => null)
+      if (conflicts) {
+        await git(wt, 'merge', '--abort')
+        const files = conflicts.split(/\r?\n/).filter(Boolean)
+        const error = new Error('Trial merge conflicts with the integration tip in: ' + files.join(', '), {
+          cause: err,
+        })
+        error.conflicts = files
+        throw error
+      }
       throw new Error(
         'Trial merge failed; checkout preserved at ' +
           wt +

@@ -239,8 +239,8 @@ test('approval route approves or discards only an attached staged run named by i
   const catalog = { entries: () => [{ key, file: '/runs/a/state.sqlite' }] }
   const coordinator = {
     runs: new Map([['/runs/a/state.sqlite', {}]]),
-    async approve(file, choices) {
-      calls.push(['approve', file, choices])
+    async approve(file, choices, options) {
+      calls.push(['approve', file, choices, options])
       return { mode: 'active' }
     },
     async discard(file) {
@@ -260,9 +260,12 @@ test('approval route approves or discards only an attached staged run named by i
   assert.equal(ok.status, 200)
   assert.deepEqual(await ok.json(), { mode: 'active' })
   assert.equal((await post({ key, action: 'discard' })).status, 200)
+  assert.equal((await post({ key, action: 'approve', choices, maxWorkers: 8 })).status, 200)
+  for (const bad of [0, 33, 2.5, '8']) assert.equal((await post({ key, action: 'approve', choices, maxWorkers: bad })).status, 400)
   assert.deepEqual(calls, [
-    ['approve', '/runs/a/state.sqlite', choices],
+    ['approve', '/runs/a/state.sqlite', choices, {}],
     ['discard', '/runs/a/state.sqlite'],
+    ['approve', '/runs/a/state.sqlite', choices, { maxWorkers: 8 }],
   ])
   assert.equal((await post({ key: 'c'.repeat(64), action: 'approve', choices })).status, 404)
   assert.equal((await post({ key: '../x', action: 'approve', choices })).status, 400)
