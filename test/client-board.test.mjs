@@ -30,16 +30,30 @@ const loadBoard = (seeds) => loadHost(seeds).slots['sidebar.right.pane.tab'].com
 // present. Effects run immediately and fetch only records the URL it was asked for.
 // respond(url) may answer a GET; by default reads never settle. Timers are
 // recorded, not run, so a test fires each scheduled poll itself.
-function loadHost(seeds, { expanded = false, config = { status: 'loading' }, respond, postRespond, document } = {}) {
+function loadHost(seeds, { expanded = false, config = { status: 'loading' }, respond, postRespond, document, clock } = {}) {
   let definition
   const source = readFileSync(resolve(import.meta.dirname, '..', 'src', 'client.js'), 'utf8')
   const urls = []
   const posts = []
   const postHeaders = []
   const timers = []
+  const intervals = []
+  const cleanups = []
   vm.runInNewContext(source, {
     window: { __ModuleLoader__: { load: (d) => (definition = d) } },
     ...(document && { document }),
+    // clock.now is what the page reads as the current time.
+    ...(clock && {
+      Date: class extends Date {
+        static now() {
+          return clock.now
+        }
+      },
+    }),
+    setInterval: (fn, ms) => intervals.push({ fn, ms, cleared: false }),
+    clearInterval: (id) => {
+      if (intervals[id - 1]) intervals[id - 1].cleared = true
+    },
     fetch: (url, init) => {
       urls.push(url)
       if (init?.method === 'POST') {
@@ -74,9 +88,15 @@ function loadHost(seeds, { expanded = false, config = { status: 'loading' }, res
       ]
     },
     useRef: (current) => ({ current }),
-    useEffect: (fn) => void fn(),
+    useEffect: (fn) => {
+      const cleanup = fn()
+      if (cleanup) cleanups.push(cleanup)
+    },
   }
   const host = {
+    intervals,
+    cleanups,
+    seed: (more) => queue.push(...more),
     tabs: [],
     opened: [],
     slots: {},
@@ -1997,4 +2017,190 @@ test('appended tickets carry a 追加 tag with their time on hover, on the board
   const tasks = findAll(review, (n) => n.props['data-dag-task'] !== undefined)
   assert.deepEqual(tasks.map((t) => Boolean(tagOf(t))), [false, false, false, false, true])
   assert.equal(tagOf(tasks[4]).props.title, tag.props.title)
+})
+const startedAt = 1_700_000_000_000
+const timingOf = (over = {}) => ({
+  startedAt,
+  endedAt: null,
+  accumulatedMs: 754_000,
+  runningSince: startedAt,
+  attentionMs: 0,
+  tickets: {},
+  totals: { workerMs: 0, queueMs: null, verifyMs: null, checkRuns: 0, checkFailures: 0, conflicts: 0, attempts: 0 },
+  ...over,
+})
+
+// Paints a board on a clock the test moves; the elapsed number counts from clock.now
+// at the time of the reading. Each paint() renders it again, as a tick would.
+function elapsedBoard(timing, over = {}) {
+  const clock = { now: startedAt + 3_600_000 }
+  const run = {
+    key: 'k'.repeat(64),
+    runId: 'hello-01',
+    mode: 'active',
+    complete: false,
+    total: sample.length,
+    counts: {},
+    tickets: sample.map((t) => ({ dependsOn: [], attempt: 0, ...t })),
+    timing,
+    now: clock.now,
+    receivedAt: clock.now,
+    ...over,
+  }
+  const seeds = [{ runs: [run], selected: run }, run.key]
+  const host = loadHost([], { clock })
+  const Dashboard = host.slots['sidebar.right.pane.tab'].component
+  const paint = () => (host.seed(seeds), render({ type: Dashboard, props: {}, children: [] }))
+  return { clock, host, paint }
+}
+const elapsedOf = (root) => find(root, (n) => n.props['data-dag-elapsed'] !== undefined)
+const blockOf = (root) => find(root, (n) => n.props['aria-label'] === '运行概况')
+function definitions(node) {
+  const cells = findAll(node, (n) => n.type === 'dt' || n.type === 'dd').map(text)
+  return Object.fromEntries(cells.flatMap((c, i) => (i % 2 ? [] : [[c, cells[i + 1]]])))
+}
+
+test('a running board counts each second locally, without another request or double counting', () => {
+  // A pause earlier in the run: runningSince is far back, but accumulatedMs already
+  // holds the open segment, so now - runningSince must not be added on top.
+  const { clock, host, paint } = elapsedBoard(timingOf())
+  const root = paint()
+  const value = elapsedOf(root)
+  assert.equal(text(value), '12:34')
+  assert.match(text(blockOf(root)), /累计用时/)
+  assert.ok(find(blockOf(root), (n) => n === value))
+  assert.ok(cssFor(root, '.dtd-elapsed [data-dag-elapsed]')[0].includes('font-variant-numeric:tabular-nums'))
+  assert.equal(host.intervals.length, 1)
+  assert.equal(host.intervals[0].ms, 1000)
+
+  clock.now += 5_000
+  const requests = host.urls.length
+  const updates = host.sets.length
+  host.intervals[0].fn()
+  assert.equal(host.urls.length, requests)
+  assert.equal(host.sets.length, updates + 1)
+  assert.equal(text(elapsedOf(paint())), '12:39')
+})
+
+test('the elapsed time counts on from the local moment the reading arrived', async () => {
+  const run = {
+    key: 'k'.repeat(64),
+    runId: 'hello-01',
+    mode: 'active',
+    total: 0,
+    counts: {},
+    tickets: [],
+    timing: timingOf(),
+    // A server clock an hour off the page's must not change anything.
+    now: startedAt + 7_200_000,
+  }
+  const clock = { now: startedAt + 3_600_000 }
+  const host = loadHost([], {
+    clock,
+    respond: async () => ({ ok: true, status: 200, json: async () => ({ runs: [run], selected: run }) }),
+  })
+  render({ type: host.slots['sidebar.right.pane.tab'].component, props: {}, children: [] })
+  await new Promise((done) => setImmediate(done))
+  const view = host.sets.find((value) => value?.selected)
+  assert.equal(view.selected.receivedAt, clock.now)
+})
+
+test('elapsed time reads minutes under an hour and hours from an hour up', () => {
+  const shown = (accumulatedMs) =>
+    text(elapsedOf(elapsedBoard(timingOf({ accumulatedMs, runningSince: null })).paint()))
+  assert.equal(shown(0), '0:00')
+  assert.equal(shown(7_999), '0:07')
+  assert.equal(shown(3_599_000), '59:59')
+  assert.equal(shown(3_600_000), '1:00:00')
+  assert.equal(shown(3_754_000), '1:02:34')
+})
+
+test('a paused, completed or cancelled run freezes its elapsed time', () => {
+  const frozen = timingOf({ runningSince: null, endedAt: startedAt + 754_000 })
+  for (const [over, note] of [
+    [{ mode: 'paused' }, true],
+    [{ mode: 'active', complete: true }, false],
+    // A pause holds across a completion, and the board then says the run is done.
+    [{ mode: 'paused', complete: true }, false],
+    [{ mode: 'cancelled' }, false],
+  ]) {
+    const { clock, host, paint } = elapsedBoard(frozen, over)
+    assert.equal(text(elapsedOf(paint())), '12:34')
+    clock.now += 60_000
+    const root = paint()
+    assert.equal(text(elapsedOf(root)), '12:34')
+    assert.equal(host.intervals.length, 0)
+    assert.equal(/已暂停/.test(text(find(root, (n) => n.props.className === 'dtd-elapsed'))), note)
+  }
+})
+
+test('a run without timing shows no elapsed time', () => {
+  const { host, paint } = elapsedBoard(null)
+  const root = paint()
+  assert.equal(elapsedOf(root), undefined)
+  assert.doesNotMatch(text(root), /累计用时|用时分解/)
+  assert.equal(host.intervals.length, 0)
+  const selected = reviewRun()
+  selected.timing = null
+  const review = loadHost([{ runs: [selected], selected }, selected.key])
+  assert.equal(elapsedOf(review.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })), undefined)
+})
+
+test('unmounting the elapsed time clears its interval', () => {
+  const { host, paint } = elapsedBoard(timingOf())
+  paint()
+  assert.equal(host.intervals[0].cleared, false)
+  for (const cleanup of host.cleanups) cleanup()
+  assert.equal(host.intervals[0].cleared, true)
+})
+
+test('the breakdown shows a dash for what is unknown and keeps a measured zero', () => {
+  const breakdown = (timing) =>
+    definitions(find(elapsedBoard(timing).paint(), (n) => n.props['data-dag-elapsed-breakdown'] !== undefined))
+  // Folded by default.
+  const folded = find(elapsedBoard(timingOf()).paint(), (n) => n.props['data-dag-elapsed-breakdown'] !== undefined)
+  assert.equal(folded.type, 'details')
+  assert.equal(folded.props.open, undefined)
+  // An old ledger has no verification events, so its check count of 0 means nothing either.
+  assert.deepEqual(breakdown(timingOf()), {
+    工单工作合计: '0:00',
+    集成排队: '—',
+    验收: '—',
+    等待处理: '0:00',
+    验收命令次数: '—',
+    冲突次数: '0',
+  })
+  assert.deepEqual(
+    breakdown(
+      timingOf({
+        attentionMs: 65_000,
+        totals: { workerMs: 3_754_000, queueMs: 0, verifyMs: 12_000, checkRuns: 3, checkFailures: 1, conflicts: 2, attempts: 4 },
+      }),
+    ),
+    {
+      工单工作合计: '1:02:34',
+      集成排队: '0:00',
+      验收: '0:12',
+      等待处理: '1:05',
+      验收命令次数: '3',
+      冲突次数: '2',
+    },
+  )
+})
+
+test('a ticket row lists its own durations and attempts in its details', () => {
+  const tickets = {
+    A: { attempts: 2, workerMs: 125_000, queueMs: 3_000, verifyMs: 40_000, attentionMs: 0 },
+    C: { attempts: 1, workerMs: 9_000, queueMs: null, verifyMs: null, attentionMs: 0 },
+  }
+  const root = elapsedBoard(timingOf({ tickets }), {
+    // A ticket ID that names an Object.prototype member has no row of its own.
+    tickets: [...sample, { id: 'constructor', status: 'PENDING' }].map((t) => ({ dependsOn: [], attempt: 0, ...t })),
+  }).paint()
+  const row = (id) => find(root, (n) => n.props['data-dag-ticket'] === id)
+  const details = (id) => definitions(find(row(id), (n) => n.type === 'details'))
+  assert.deepEqual(details('A'), { 工作时长: '2:05', 排队时长: '0:03', 验收时长: '0:40', 尝试次数: '2' })
+  assert.deepEqual(details('C'), { 工作时长: '0:09', 排队时长: '—', 验收时长: '—', 尝试次数: '1' })
+  assert.equal(find(row('B'), (n) => n.type === 'details'), undefined)
+  assert.equal(find(row('constructor'), (n) => n.type === 'details'), undefined)
 })

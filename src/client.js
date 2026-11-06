@@ -112,6 +112,7 @@ window.__ModuleLoader__.load({
 .dtd-phase,.dtd-ticket details {font-size:.86rem}.dtd-ticket summary {cursor:pointer}
 .dtd-info {display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.25rem .75rem;margin:.3rem 0}
 .dtd-info dd {margin:0}.dtd-ticket .dtd-alert {white-space:pre-wrap}
+.dtd-elapsed {display:flex;align-items:baseline;gap:.25rem .6rem;flex-wrap:wrap}.dtd-elapsed [data-dag-elapsed] {font-variant-numeric:tabular-nums;font-weight:600}.dtd-elapsed details {flex-basis:100%;font-size:.86rem}.dtd-elapsed summary {cursor:pointer}
 .dtd-panel h3,.dtd-panel h4,.dtd-panel p,.dtd-panel fieldset {margin:0}
 .dtd-panel h3 {font-size:1.1rem}.dtd-panel h4 {font-size:.96rem}
 .dtd-panel small,.dtd-panel .dtd-hint {font-size:.83rem;color:inherit;opacity:.78}
@@ -951,7 +952,57 @@ window.__ModuleLoader__.load({
         '追加',
       )
 
-    function Ticket({ ticket, view, open, captain, member }) {
+    // 12:34, or 1:02:34 from an hour up. An unknown duration is a dash, never 0:00.
+    function durationText(ms) {
+      if (!Number.isFinite(ms)) return '—'
+      const seconds = Math.floor(Math.max(0, ms) / 1000)
+      const pad = (n) => String(n).padStart(2, '0')
+      const hours = Math.floor(seconds / 3600)
+      const minutes = Math.floor(seconds / 60) % 60
+      return (hours ? hours + ':' + pad(minutes) : minutes) + ':' + pad(seconds % 60)
+    }
+
+    // Holds its own timer so a tick repaints only this number. accumulatedMs already
+    // runs up to the server's reading, so only the local time since that reading is
+    // added, and the page and server clocks are never compared.
+    function ElapsedTime({ timing, receivedAt }) {
+      const [, setTick] = useState(0)
+      const ticking = timing.runningSince !== null
+      useEffect(() => {
+        if (!ticking) return undefined
+        const interval = setInterval(() => setTick((n) => n + 1), 1000)
+        return () => clearInterval(interval)
+      }, [ticking])
+      const sinceRead = ticking && receivedAt ? Math.max(0, Date.now() - receivedAt) : 0
+      return h('span', { 'data-dag-elapsed': '' }, durationText(timing.accumulatedMs + sinceRead))
+    }
+
+    function timingBreakdown(timing) {
+      const { workerMs, queueMs, verifyMs, checkRuns, conflicts } = timing.totals
+      return [
+        ['工单工作合计', durationText(workerMs)],
+        ['集成排队', durationText(queueMs)],
+        ['验收', durationText(verifyMs)],
+        ['等待处理', durationText(timing.attentionMs)],
+        // A ledger that cannot split verification has no check_finished rows to count either.
+        ['验收命令次数', verifyMs === null ? '—' : String(checkRuns)],
+        ['冲突次数', String(conflicts)],
+      ]
+    }
+
+    // A ticket with no events yet has no row in timing.tickets.
+    function ticketTiming(timing, id) {
+      if (!timing || !Object.hasOwn(timing.tickets, id)) return []
+      const { workerMs, queueMs, verifyMs, attempts } = timing.tickets[id]
+      return [
+        ['工作时长', durationText(workerMs)],
+        ['排队时长', durationText(queueMs)],
+        ['验收时长', durationText(verifyMs)],
+        ['尝试次数', String(attempts)],
+      ]
+    }
+
+    function Ticket({ ticket, view, open, captain, member, timing }) {
       const { id, title, status, dependsOn, attempt, retryAt, message } = ticket
       const info = [
         ['子会话', ticket.childId],
@@ -960,6 +1011,7 @@ window.__ModuleLoader__.load({
         ['基线提交', ticket.baseSha],
         ['成果提交', ticket.sourceSha],
         ['已集成提交', ticket.landedSha],
+        ...ticketTiming(timing, id),
       ].filter(([, value]) => value)
       return h(
         'li',
@@ -1064,7 +1116,15 @@ window.__ModuleLoader__.load({
               'ul',
               { className: 'dtd-tickets', key: 'list' },
               ...visible.map(({ ticket, view }) =>
-                h(Ticket, { key: ticket.id, ticket, view, open, captain: run.captain, member: memberOf(ticket) }),
+                h(Ticket, {
+                  key: ticket.id,
+                  ticket,
+                  view,
+                  open,
+                  captain: run.captain,
+                  member: memberOf(ticket),
+                  timing: run.timing,
+                }),
               ),
             )
           : h('p', { className: 'dtd-hint', key: 'list' }, '当前没有符合筛选条件的工单。'))
@@ -1126,6 +1186,27 @@ window.__ModuleLoader__.load({
               h('span', { className: 'dtd-hint' }, routeName(run.captain) || '模型未知'),
             ),
           ),
+          run.timing &&
+            h(
+              'div',
+              { className: 'dtd-elapsed' },
+              h('span', { className: 'dtd-hint' }, '累计用时'),
+              h(ElapsedTime, { timing: run.timing, receivedAt: run.receivedAt }),
+              run.mode === 'paused' && !run.complete && h('span', { className: 'dtd-hint' }, '已暂停'),
+              h(
+                'details',
+                { 'data-dag-elapsed-breakdown': '' },
+                h('summary', null, '用时分解'),
+                h(
+                  'dl',
+                  { className: 'dtd-info' },
+                  ...timingBreakdown(run.timing).flatMap(([key, value]) => [
+                    h('dt', { key: key + '-key' }, key),
+                    h('dd', { key: key + '-value' }, value),
+                  ]),
+                ),
+              ),
+            ),
           h('progress', {
             className: 'dtd-sr',
             max: run.total || 1,
@@ -2315,6 +2396,8 @@ window.__ModuleLoader__.load({
             settled = Boolean(view.selected?.complete || view.selected?.mode === 'cancelled')
             target.current = selected
             setSelectedKey(selected)
+            // The local moment of this reading, which the elapsed time counts on from.
+            if (view.selected) view.selected.receivedAt = Date.now()
             setData(view)
             setError('')
             setLastRead(new Date())
