@@ -752,6 +752,53 @@ test('the sidebar board scrolls, shows the dependency map before the ticket list
   ])
 })
 
+test('a dispatched map node opens its conversation from the card, without selecting the node', async () => {
+  const selected = {
+    key: 'k'.repeat(64),
+    runId: 'demo',
+    parentId: 'session-captain',
+    mode: 'active',
+    total: 2,
+    counts: { RUNNING: 1, PENDING: 1 },
+    tickets: [
+      { id: 'A', title: 'A', status: 'RUNNING', dependsOn: [], attempt: 1, childId: 'child-a', livePhase: { stage: 'agent' } },
+      { id: 'B', title: 'B', status: 'PENDING', dependsOn: ['A'], attempt: 0 },
+    ],
+  }
+  const seeds = [{ runs: [selected], selected }, selected.key]
+  const host = loadHost(seeds)
+  const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  const chats = findAll(pane, (n) => n.props['data-dag-node-chat'] !== undefined)
+  assert.deepEqual(chats.map((n) => n.props['data-dag-node-chat']), ['A'], 'a ticket without a child session has no entry')
+  const chat = chats[0]
+  assert.equal(chat.type, 'button')
+  assert.equal(text(chat), '查看对话')
+  assert.equal(chat.props['aria-label'], '查看 A 的对话')
+  // A button cannot nest inside the node's button, so it overlays the card as a sibling.
+  const nodeA = find(pane, (n) => n.props['data-dag-node'] === 'A')
+  assert.equal(find(nodeA, (n) => n.props['data-dag-node-chat'] !== undefined), undefined)
+  // The card keeps a row free for it, so it never covers the title.
+  assert.ok(nodeA.props.style.height >= 76 + 20)
+  assert.ok(cssFor(pane, '.dtd-panel .dtd-node-chat').length)
+
+  // Leaving the card for its overlay keeps that ticket's chain lit.
+  chat.props.onMouseEnter()
+  assert.ok(host.indexed.some(([, value]) => value === 'A'), 'hovering the entry keeps its ticket hovered')
+  const before = host.indexed.length
+  await chat.props.onClick()
+  assert.deepEqual(host.indexed.slice(before), [], 'opening the conversation does not select the node')
+  assert.deepEqual(host.sessions.at(-1), [
+    'open',
+    { parentSessionId: 'session-captain', childSessionId: 'child-a', mode: 'continuable' },
+  ])
+})
+
+test('map cards keep their size when no conversation can be opened', () => {
+  const root = boardFor([{ id: 'A', title: 'A', status: 'RUNNING', childId: 'child-a' }])
+  assert.equal(find(root, (n) => n.props['data-dag-node-chat'] !== undefined), undefined)
+  assert.equal(find(root, (n) => n.props['data-dag-node'] === 'A').props.style.height, 76)
+})
+
 // The A/C/T/B/D plan of the review design: three named members own five tasks.
 function reviewRun() {
   const presets = [

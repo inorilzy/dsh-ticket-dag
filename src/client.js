@@ -162,6 +162,9 @@ window.__ModuleLoader__.load({
 .dtd-node[data-tone=blocked] {border-color:color-mix(in srgb,var(--dtd-blocked) 70%,transparent)}
 .dtd-node[data-dim=true] {opacity:.42}.dtd-edges path[data-active=false] {opacity:.45}
 .dtd-node[data-selected=true] {border-color:var(--dtd-work);box-shadow:0 0 0 1px var(--dtd-work)}
+.dtd-panel .dtd-node-chat {position:absolute;padding:.05rem .4rem;line-height:1.4;border-radius:.35rem;white-space:nowrap;background:var(--dsw-alias-bg-layer-1,Canvas)}
+.dtd-panel .dtd-node-chat:hover {background:color-mix(in srgb,currentColor 12%,var(--dsw-alias-bg-layer-1,Canvas))}
+.dtd-node-chat[data-dim=true] {opacity:.42}
 .dtd-steps {display:flex;list-style:none;margin:.2rem 0;padding:0;gap:3px;font-size:.76rem}
 .dtd-steps li {flex:1;min-width:0;text-align:center;padding-top:.3rem;border-top:3px solid var(--dtd-idle);opacity:.7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dtd-steps [data-state=done] {border-color:var(--dtd-done);opacity:1}
@@ -928,8 +931,10 @@ window.__ModuleLoader__.load({
     }
 
     // Opens the worker's own conversation; present once the ticket has a child session.
-    const chatButton = (ticket, open) =>
-      open && ticket.childId && button('查看对话', () => open(ticket.childId), { title: '打开这个工单子会话的对话记录' })
+    const chatButton = (ticket, open, extra) =>
+      open &&
+      ticket.childId &&
+      button('查看对话', () => open(ticket.childId), { title: '打开这个工单子会话的对话记录', ...extra })
 
     // A ticket row knows its model as "provider/model"; the vendor match reads the whole string.
     const ticketRoute = (ticket, captain) => (ticket.model ? { model: ticket.model } : captain)
@@ -1199,7 +1204,8 @@ window.__ModuleLoader__.load({
     // Card size for the measured map width: cards widen to share it, up to a
     // readable maximum; text scales with the card; long titles add lines (up to 4).
     // Before measuring, or when the panel is too narrow, the base card is used and the map scrolls.
-    function fitNode(base, tickets, available) {
+    // actionRow keeps room for the card's 查看对话 entry; every card reserves it, so the map does not jump on dispatch.
+    function fitNode(base, tickets, available, actionRow = false) {
       const columns = Math.max(0, ...depthMap(tickets).values()) + 1
       const share = available ? (available - (columns - 1) * base.gapX) / columns : 0
       const width = Math.round(Math.min(320, Math.max(base.width, share)))
@@ -1208,7 +1214,8 @@ window.__ModuleLoader__.load({
       const textWidth = (s) => [...s].reduce((n, c) => n + (c.charCodeAt(0) > 0x2e7f ? 1 : 0.56), 0) * font
       const longest = Math.max(0, ...tickets.map((t) => (t.title && t.title !== t.id ? textWidth(t.title) : 0)))
       const lines = Math.min(4, Math.max(1, Math.ceil(longest / (width - 26))))
-      return { ...base, width, font, height: Math.max(base.height, Math.round(48 + font * 1.35 * lines)) }
+      const height = Math.max(base.height, Math.round(48 + font * 1.35 * lines)) + (actionRow ? Math.round(font * 1.7) : 0)
+      return { ...base, width, font, height }
     }
 
     function dagLayout(tickets, node = fullNode) {
@@ -1277,7 +1284,7 @@ window.__ModuleLoader__.load({
       }, [])
       if (!rows.length) return null
       const tickets = rows.map((r) => r.ticket)
-      const node = fitNode(compact ? compactNode : fullNode, tickets, available)
+      const node = fitNode(compact ? compactNode : fullNode, tickets, available, !compact && Boolean(open))
       const layout = dagLayout(tickets, node)
       if (compact) {
         // Nothing has started in a plan, so waiting tasks stay plain grey. Hover
@@ -1368,7 +1375,7 @@ window.__ModuleLoader__.load({
                 }),
               ),
             ),
-            ...rows.map(({ ticket, view }) => {
+            ...rows.flatMap(({ ticket, view }) => {
               const { x, y } = layout.at.get(ticket.id)
               const owner = ownerOf(ticket)
               // The state is spelled out, not only coloured.
@@ -1381,7 +1388,7 @@ window.__ModuleLoader__.load({
               ]
                 .filter(Boolean)
                 .join(' · ')
-              return h(
+              const card = h(
                 'button',
                 {
                   key: ticket.id,
@@ -1415,6 +1422,25 @@ window.__ModuleLoader__.load({
                 ),
                 ticket.title && ticket.title !== ticket.id && h('span', { className: 'dtd-node-title' }, ticket.title),
               )
+              // A button cannot nest inside the card's button, so this one overlays the
+              // card as its sibling and keeps the ticket hovered when the pointer moves onto it.
+              const chat = chatButton(ticket, open, {
+                key: ticket.id + '-chat',
+                className: 'dtd-node-chat',
+                'data-dag-node-chat': ticket.id,
+                'data-dim': chain ? !chain.has(ticket.id) : false,
+                'aria-label': '查看 ' + ticket.id + ' 的对话',
+                style: {
+                  right: layout.width - x - node.width + 8,
+                  bottom: layout.height - y - node.height + 6,
+                  fontSize: Math.round(node.font * 8.2) / 10 + 'px',
+                },
+                onMouseEnter: () => setHovered(ticket.id),
+                onMouseLeave: () => setHovered(null),
+                onFocus: () => setHovered(ticket.id),
+                onBlur: () => setHovered(null),
+              })
+              return chat ? [card, chat] : [card]
             }),
           ),
         ),
