@@ -20,6 +20,9 @@ const maxLabel = '最大并发工单数'
 const timeoutLabel = '验收超时（毫秒）'
 const saveLabel = '保存配置'
 const exampleButton = '补入示例验收项'
+// A cross-platform assertion the review shows as an exact argv: A.txt only
+// exists in a candidate checkout once the integrated A ticket has landed.
+const fixtureCheck = "process.exitCode = require('fs').existsSync('A.txt') ? 0 : 1"
 
 async function openBundle(page) {
   // On first launch DSH can show its preview notice before the sidebar is interactive.
@@ -53,18 +56,23 @@ async function input(page, label, value, section = '') {
 async function modelFixture(t) {
   const calls = new Set()
   const toolErrors = []
-  const gates = { A: Promise.withResolvers(), B: Promise.withResolvers() }
+  const gates = { A: Promise.withResolvers(), B: Promise.withResolvers(), C: Promise.withResolvers() }
+  // A and B are the submitted plan; B waits for A and has no command of its own,
+  // so it still runs A's integrated cumulative check. C is appended while staged.
   const manifest = {
     specId: 'web-test',
     maxWorkers: 2,
-    tickets: ['A', 'B'].map((id) => ({
-      id,
-      title: 'Dashboard ' + id,
-      prompt: 'LOCAL-WORKER-' + id,
-      dependsOn: id === 'B' ? ['A'] : [],
-      verify: ['custom'],
-    })),
+    tickets: [
+      { id: 'A', title: 'Dashboard A', prompt: 'LOCAL-WORKER-A', dependsOn: [], verify: ['captain-check'], agent: 'implementer' },
+      { id: 'B', title: 'Dashboard B', prompt: 'LOCAL-WORKER-B', dependsOn: ['A'], verify: [], agent: 'implementer' },
+    ],
+    // A captain-written command that needs the user's review; the space-bearing
+    // and empty arguments prove the panel keeps each argv boundary.
+    checks: { 'captain-check': [['node', '-e', fixtureCheck, 'two words', '']] },
   }
+  const appended = [
+    { id: 'C', title: 'Dashboard C', prompt: 'LOCAL-WORKER-C', dependsOn: ['A'], verify: ['captain-check'], agent: 'implementer' },
+  ]
   const server = createServer(async (req, res) => {
     try {
       let input = ''
@@ -77,7 +85,16 @@ async function modelFixture(t) {
           if (part.type === 'tool_result' && part.is_error)
             toolErrors.push(JSON.stringify(part.content).slice(-650))
         }
-      const id = text.match(/LOCAL-WORKER-([AB])/)?.[1]
+      // A second captain turn appends to the still-staged plan. This changes the
+      // plan revision the review shows and must invalidate the earlier approval.
+      if (
+        text.includes('APPEND-WEB-CAPTAIN') &&
+        !calls.has('append') &&
+        data.tools?.some((t) => t.name === 'dag_add')
+      ) {
+        calls.add('append')
+        return reply(res, 'dag_add', { runId: 'web-board', tickets: appended })
+      }
       if (
         text.includes('ROOT-WEB-CAPTAIN') &&
         !calls.has('captain') &&
@@ -86,6 +103,7 @@ async function modelFixture(t) {
         calls.add('captain')
         return reply(res, 'dag_run', { runId: 'web-board', manifest })
       }
+      const id = text.match(/LOCAL-WORKER-([ABC])/)?.[1]
       if (
         !text.includes('ROOT-WEB-CAPTAIN') &&
         id &&
@@ -97,7 +115,7 @@ async function modelFixture(t) {
         return reply(res, 'bash', {
           description: 'Commit the local dashboard test fixture',
           command:
-            (id === 'B' ? 'test -f A.txt && ' : '') +
+            (id === 'A' ? '' : 'test -f A.txt && ') +
             'echo done > ' +
             id +
             '.txt && git add ' +
@@ -117,8 +135,7 @@ async function modelFixture(t) {
   server.listen(0, '127.0.0.1')
   await once(server, 'listening')
   t.after(() => {
-    gates.A.resolve()
-    gates.B.resolve()
+    for (const gate of Object.values(gates)) gate.resolve()
     server.closeAllConnections()
     server.close()
   })
@@ -149,10 +166,10 @@ async function remote(page, method, request) {
 }
 
 test(
-  'real DSH Web: discover the panel, edit commands, validate and persist the profile',
+  'real DSH Web: review the captain plan, approve the exact commands, append, integrate and reload',
   {
     skip: !(binPath && chrome && driver) && 'Set DSH_TEST_BIN, DSH_TEST_CHROME and DSH_TEST_PUPPETEER',
-    timeout: 180000,
+    timeout: 300000,
   },
   async (t) => {
     const puppeteer = (await import(pathToFileURL(resolve(driver)).href)).default
@@ -257,7 +274,6 @@ test(
     await page.locator(button('添加参数')).click()
     await input(page, '命令 1 的参数 1', '-e')
     await page.locator(button('添加参数')).click()
-    const fixtureCheck = "process.exitCode = require('fs').existsSync('A.txt') ? 0 : 1"
     await input(page, '命令 1 的参数 2', fixtureCheck)
     await page.locator(button(exampleButton)).click()
     assert.equal(await page.$$eval('[aria-label="验收项 ID"]', (items) => items.length), 4)
@@ -293,31 +309,152 @@ test(
     )
     if (process.env.DSH_TEST_UI_SCREENSHOT)
       await second.screenshot({ path: resolve(process.env.DSH_TEST_UI_SCREENSHOT) })
-    // Verify automatic dashboard updates while the fake model holds each real worker's HTTP request.
-    await second.reload()
-    await openBundle(second)
-    await second.waitForFunction(() => document.body.innerText.includes('暂无运行记录'))
-    const { workspace } = await remote(second, 'workspace/create', { path: repo })
-    const { sessionId } = await remote(second, 'session/create', { workspaceId: workspace.workspaceId })
-    await remote(second, 'session/selectModel', {
+    // ---- Real captain conversation -> side review -> approve -> integrate ----
+    // The board lives only in the conversation right sidebar now: this replaces
+    // the retired plugin-detail board entry the old test waited on.
+    const third = await browser.newPage()
+    await third.setViewport({ width: 1240, height: 900 })
+    await third.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'language', { get: () => 'zh-CN' })
+      Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh'] })
+    })
+    await third.goto(url)
+    const { workspace } = await remote(third, 'workspace/create', { path: repo })
+    const { sessionId } = await remote(third, 'session/create', { workspaceId: workspace.workspaceId })
+    await remote(third, 'session/selectModel', {
       sessionId,
       provider: 'deepseek-official',
       model: 'deepseek-v4-pro',
       reasoningEffort: 'off',
     })
-    await remote(second, 'session/prompt', {
+    // Open this captain conversation on load, exactly as reopening the tab does.
+    await third.evaluateOnNewDocument(
+      ({ workspaceId, sessionId }) => {
+        localStorage.setItem('dsh.sessions.current', JSON.stringify({ sessionId }))
+        localStorage.setItem(
+          'dsh.workspace.view.v5',
+          JSON.stringify({
+            groupBy: 'workspace',
+            orderBy: 'updated',
+            groupExpansion: { [workspaceId]: true },
+            sessionOrderByAccount: { [workspaceId]: [sessionId], __flat_session_order__: [sessionId] },
+          }),
+        )
+      },
+      { workspaceId: workspace.workspaceId, sessionId },
+    )
+    await third.reload()
+    await third.locator('[data-composer-input]').first().waitFor({ timeout: 30000 })
+
+    const dashboard = (parent) =>
+      third.evaluate(async (parent) => {
+        const res = await fetch(
+          'api/ticket-dag.dashboard' + (parent ? '?parent=' + encodeURIComponent(parent) : ''),
+          { cache: 'no-store' },
+        )
+        return { status: res.status, body: await res.json().catch(() => null) }
+      }, parent)
+    const planReaching = async (predicate) => {
+      let last
+      for (let i = 0; i < 200; i++) {
+        last = await dashboard(sessionId)
+        if (last.status === 200 && last.body?.selected && predicate(last.body.selected)) return last.body
+        await delay(150)
+      }
+      throw Error('dashboard never reached the expected plan: ' + JSON.stringify(last))
+    }
+
+    await remote(third, 'session/prompt', {
       sessionId,
       requestId: randomUUID(),
       mode: 'queue',
-      content: [{ type: 'text', text: 'ROOT-WEB-CAPTAIN. Run the approved test.' }],
+      content: [{ type: 'text', text: 'ROOT-WEB-CAPTAIN. Submit the plan, then stop for my review.' }],
+    })
+    // The durable dag_run card and the conversation-header entry appear once staged.
+    await third.waitForSelector('[data-dag-run-card="web-board"]', { visible: true })
+    await third.locator(button('查看工单')).click()
+    await third.locator('::-p-aria(工单 · web-board[role="tab"])').click()
+    await third.waitForSelector('[aria-label="执行前计划审查"]', { visible: true })
+
+    const first = await planReaching(
+      (run) => run.mode === 'staged' && run.tickets.some((t) => t.id === 'A'),
+    )
+    const revision1 = first.selected.revision
+    const runKey = first.selected.key
+    const firstTickets = new Map(first.selected.tickets.map((t) => [t.id, t]))
+    assert.ok(/^[0-9a-f]{64}$/.test(revision1), 'the review carries an opaque plan revision')
+    assert.deepEqual(firstTickets.get('B').dependsOn, ['A'], 'B waits for A')
+    assert.deepEqual(firstTickets.get('B').verify, [], 'B has no command of its own')
+    await third.waitForSelector('[data-dag-task="A"]', { visible: true })
+    await third.waitForSelector('[data-dag-task="B"]', { visible: true })
+
+    // The panel shows every manual command as an exact argv, including the
+    // space-bearing and the empty argument.
+    const expectedArgv = ['node', '-e', fixtureCheck, 'two words', '']
+      .map((arg) => (/^[\p{L}\p{N}_@%+=:,./-]+$/u.test(arg) ? arg : JSON.stringify(arg)))
+      .join(' ')
+    assert.deepEqual(
+      await third.$$eval('[data-dag-check="captain-check"] .dtd-check-cmd', (items) =>
+        items.map((el) => el.textContent),
+      ),
+      [expectedArgv],
+      'the review shows the full command and exact parameters',
+    )
+    assert.match(
+      await third.$eval('[data-dag-check="captain-check"]', (el) => el.textContent),
+      /队长编写，需你确认/,
+    )
+    assert.equal(
+      await third.$eval('[data-dag-check="captain-check"] [data-dag-check-users]', (el) => el.textContent),
+      '工单：A',
+    )
+
+    // A captain append while the plan is still staged changes the revision: the
+    // approval bound to the earlier plan must be refused, and the refreshed
+    // review must be confirmed again.
+    await remote(third, 'session/prompt', {
+      sessionId,
+      requestId: randomUUID(),
+      mode: 'queue',
+      content: [{ type: 'text', text: 'APPEND-WEB-CAPTAIN. Add ticket C to the plan under review.' }],
+    })
+    const secondPlan = await planReaching(
+      (run) =>
+        run.mode === 'staged' &&
+        run.tickets.some((t) => t.id === 'C') &&
+        run.revision !== revision1,
+    )
+    assert.notEqual(secondPlan.selected.revision, revision1, 'appending changes the plan revision')
+    const stale = await third.evaluate(
+      async ({ key, revision, choices }) => {
+        const res = await fetch('api/ticket-dag.approve', {
+          method: 'POST',
+          // The host refuses an approval without the plugin header.
+          headers: { 'content-type': 'application/json', 'x-dsh-ticket-dag': '1' },
+          body: JSON.stringify({ key, action: 'approve', revision, choices }),
+        })
+        return { status: res.status, body: (await res.text()).trim() }
+      },
+      { key: runKey, revision: revision1, choices: secondPlan.selected.tickets.map((t) => ({ id: t.id })) },
+    )
+    assert.equal(stale.status, 409, 'a stale revision is refused before dispatch')
+    assert.match(stale.body, /plan changed|Refresh the plan/i)
+    // The review refreshed to the current plan; C is visible and A is still staged.
+    await third.waitForSelector('[data-dag-task="C"]', { visible: true })
+    assert.equal((await planReaching((run) => run.mode === 'staged')).selected.tickets.length, 3)
+
+    // Confirm the refreshed plan from the real review button and watch dispatch.
+    await third.locator(button('确认并启动')).click()
+    await third.waitForFunction(() => !document.querySelector('[aria-label="执行前计划审查"]'), {
+      timeout: 20000,
     })
     async function waitForProgress(id, text, integrated) {
       try {
-        await second.waitForFunction(
+        await third.waitForFunction(
           (id, text, value) =>
             document.querySelector('[data-dag-ticket="' + id + '"]')?.innerText.includes(text) &&
             document.querySelector('progress[aria-label="已集成工单"]')?.value === value,
-          { timeout: 25000 },
+          { timeout: 30000 },
           id,
           text,
           integrated,
@@ -333,7 +470,7 @@ test(
             '. Tool errors: ' +
             JSON.stringify(fixture.toolErrors.slice(-3)) +
             '. Page: ' +
-            (await second.evaluate(() => document.body.innerText)).slice(-800) +
+            (await third.evaluate(() => document.body.innerText)).slice(-800) +
             '. Host: ' +
             buf.replace(/token=[^\s]+/g, 'token=[redacted]').slice(-700),
           { cause: error },
@@ -341,22 +478,41 @@ test(
       }
     }
     await waitForProgress('A', '执行中', 0)
-    assert.ok((await second.$eval('[data-dag-ticket="B"]', (e) => e.innerText)).includes('等待依赖'))
+    assert.ok((await third.$eval('[data-dag-ticket="B"]', (e) => e.innerText)).includes('等待依赖'))
+    assert.ok((await third.$eval('[data-dag-ticket="C"]', (e) => e.innerText)).includes('等待依赖'))
     if (process.env.DSH_TEST_BOARD_SCREENSHOT)
-      await second.screenshot({ path: resolve(process.env.DSH_TEST_BOARD_SCREENSHOT) })
+      await third.screenshot({ path: resolve(process.env.DSH_TEST_BOARD_SCREENSHOT) })
     fixture.gates.A.resolve()
     await waitForProgress('B', '执行中', 1)
+    await waitForProgress('C', '执行中', 1)
     fixture.gates.B.resolve()
-    await waitForProgress('B', '已集成', 2)
+    fixture.gates.C.resolve()
+    await waitForProgress('B', '已集成', 3)
+    await waitForProgress('C', '已集成', 3)
     assert.equal(git('show', 'integration/web-board:B.txt'), 'done')
-    await second.reload()
-    // The board opens from the conversation header into its own right-sidebar tab.
-    await second.locator(button('查看工单')).click()
-    await second.locator('::-p-aria(工单 · web-board[role="tab"])').click()
-    await waitForProgress('B', '已集成', 2)
+    assert.equal(git('show', 'integration/web-board:C.txt'), 'done')
+
+    // The durable conversation card reflects the current snapshot: finished,
+    // three tickets, one member.
+    const card = await third.$eval('[data-dag-run-card="web-board"]', (el) => el.innerText)
+    assert.match(card, /已完成/)
+    assert.match(card, /3 张工单/)
+    assert.match(card, /实现者 · 3 张/)
+
+    // Reloading the page keeps the same completed run in its own sidebar tab.
+    await third.reload()
+    await third.locator('[data-composer-input]').first().waitFor({ timeout: 30000 })
+    await third.waitForSelector('[data-dag-run-card="web-board"]', { visible: true })
+    assert.match(await third.$eval('[data-dag-run-card="web-board"]', (el) => el.innerText), /已完成/)
+    await third.locator(button('查看工单')).click()
+    await third.locator('::-p-aria(工单 · web-board[role="tab"])').click()
+    await waitForProgress('B', '已集成', 3)
     t.diagnostic('The 工单 · web-board right-sidebar tab reloaded the same completed run.')
     t.diagnostic(
-      'Dashboard observed A running with B waiting, B running after A integrated, and 2/2 integrated; final Git tree contains B.',
+      'Review showed the exact captain argv and the empty/space arguments; the appended plan refused the stale revision with 409 and needed a fresh confirm.',
+    )
+    t.diagnostic(
+      'A ran with B and C waiting, B and C ran after A integrated, and 3/3 integrated; the final Git tree contains B and C.',
     )
     t.diagnostic(
       'Chromium round-trip verified for DSH ' +
