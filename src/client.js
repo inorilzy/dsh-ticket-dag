@@ -1742,6 +1742,21 @@ window.__ModuleLoader__.load({
         ?.focus()
     }
 
+    // One argument per token, so the reader sees the argv the check runs. Plain
+    // tokens are literal; anything else is a quoted JSON string with every
+    // invisible character escaped, which keeps "", "a b" and "a\nb" apart.
+    const invisible = /(?! )[\p{C}\p{Z}]/gu
+    const escapeInvisible = (c) => {
+      const code = c.codePointAt(0)
+      return code > 0xffff ? '\\u{' + code.toString(16) + '}' : '\\u' + code.toString(16).padStart(4, '0')
+    }
+    const argvText = (argv) =>
+      argv
+        .map((arg) =>
+          /^[\p{L}\p{N}_@%+=:,./-]+$/u.test(arg) ? arg : JSON.stringify(arg).replace(invisible, escapeInvisible),
+        )
+        .join(' ')
+
     // A staged run waits for the user. Members are the presets that own tasks:
     // each member's model applies to all of its tasks; a task row expands to
     // change its owner. Approve starts dispatch; discard cancels the plan.
@@ -1795,7 +1810,7 @@ window.__ModuleLoader__.load({
       const edges = run.tickets.reduce((n, t) => n + t.dependsOn.length, 0)
       const byId = new Map(run.tickets.map((t) => [t.id, t]))
       const rows = run.tickets.map((ticket) => ({ ticket, view: ticketView(ticket, byId, 'staged') }))
-      // Every check the plan runs, with its commands and the tasks that use it.
+      // Every check the plan runs or later tickets may use, with its commands and the tasks that use it.
       const ownChecks = new Set(run.planChecks ?? [])
       const checkRows = Object.entries(run.checks ?? {}).map(([id, commands]) => ({
         id,
@@ -2058,8 +2073,12 @@ window.__ModuleLoader__.load({
                     { key: id, className: 'dtd-check', 'data-dag-check': id },
                     h('span', { className: 'dtd-chip' }, id),
                     h('span', { className: 'dtd-hint' }, own ? '队长编写，需你确认' : '插件配置'),
-                    h('span', { className: 'dtd-hint' }, users.join('、')),
-                    ...commands.map((argv, i) => h('code', { key: i, className: 'dtd-check-cmd' }, argv.join(' '))),
+                    h(
+                      'span',
+                      { className: 'dtd-hint', 'data-dag-check-users': '' },
+                      users.length ? '工单：' + users.join('、') : '尚无工单引用，批准后可供追加工单使用',
+                    ),
+                    ...commands.map((argv, i) => h('code', { key: i, className: 'dtd-check-cmd' }, argvText(argv))),
                   ),
                 ),
               )
@@ -2068,7 +2087,8 @@ window.__ModuleLoader__.load({
             ? h(
                 'p',
                 { className: 'dtd-hint', 'data-dag-unchecked': true },
-                unchecked.join('、') + ' 不跑验收命令，干净合并即集成。',
+                unchecked.join('、') +
+                  ' 没有本票专属验收命令；候选仍会执行已集成工单的累计回归检查，通过后干净合并即集成。',
               )
             : null,
         ),

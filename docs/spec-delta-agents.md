@@ -98,6 +98,7 @@ owner-only `POST /api/ticket-dag.approve`，body `{ key, action: 'approve' | 'di
 - 幂等：与此前某一批逐项相同（忽略解析出的 `agentSpec`）时返回该批结果，`added: false`；同一 ID 换了内容再追加被拒绝。`cancelled` 运行拒绝追加。累计追加数超过 `maxAppendedTickets` 时拒绝并提示另开 `dag_run`。
 - 审批：`dag_add` 不需要用户批准，追加的工单以 `PENDING` 进入调度，仍经过试合并、验收和集成。`staged` 运行把它们并入待审查的计划，`RunStore.approve` 与 `Coordinator.approve` 按 `plan()` 列出全部工单。已批准的运行中，追加工单的 `agent` 若与批准时已在计划中的某张工单相同，沿用其 `provider`/`model`/`reasoningEffort`，角色说明按当前配置解析；否则按当前配置解析。
 - 验收命令：本轮已冻结的验收 ID 沿用冻结命令，新 ID 按当前配置冻结。每批记录自己的 `policyHash`，`_checkPolicy` 同时核对原清单与每一批。
+- 已批准范围：审查面板列出清单的全部 `checks`，批准时把这些 ID 写进 `run_approved` 事件的 `details.planChecks`，该记录纳入账本摘要的 `approval` 部分。批准后追加工单可以首次引用其中的命令。旧账本的批准事件没有这条记录，没有工单用过的清单命令不算已批准：快照的 `unapprovedChecks` 列出它们，`checks` 不含它们，`dag_add` 引用时拒绝。已被工单用过的命令照常恢复。
 - 已完成的运行：追加后存在非 `INTEGRATED` 工单，运行重新派工；新工单全部集成时再写一条 `run_completed` 并通知队长，随后自动清理只处理尚无清理结果的新工单。
 - 快照：工单行带 `appended` 与 `appendedAt`；看板与审查面板为追加工单显示“追加”标记，悬停显示追加时间。
 
@@ -145,3 +146,6 @@ owner-only `POST /api/ticket-dag.approve`，body `{ key, action: 'approve' | 'di
 | 追加工单遵循清单规则、可依赖本轮或同批工单、原清单不变；待确认运行的追加工单并入审批计划 | `test/store.test.mjs`、`test/coordinator.test.mjs` |
 | `dag_add` 无需再批准即派工、沿用已批准成员的模型、受上限约束；已完成运行被重开后再次通知并只清理新工单 | `test/coordinator.test.mjs` |
 | 看板与审查面板的“追加”标记与悬停时间 | `test/client-board.test.mjs` |
+| 全部清单命令经看板与审批路由可见、批准后首次引用、重开账本与幂等、同名配置不能替换已批准命令 | `test/coordinator.test.mjs` |
+| 旧批准不推定未展示的命令、已用命令照常恢复、伪造批准记录被暂停 | `test/coordinator-recovery.test.mjs` |
+| 未引用命令的标注、参数边界与控制字符的转义显示；冷读待确认计划的命令 | `test/client-board.test.mjs`、`test/dashboard.test.mjs` |

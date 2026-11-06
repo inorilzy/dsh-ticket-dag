@@ -73,7 +73,7 @@ const keywordPattern = /(?<![a-z0-9])agent[\s_-]*teams?(?![a-z0-9])/i
 function checkList(checks) {
   const ids = Object.keys(checks ?? {})
   return [
-    'Verification is optional per ticket. A ticket with an empty or omitted verify list integrates after its commit merges cleanly, with no command run; use that for docs or other work no command can check.',
+    'Verification is optional per ticket. An empty or omitted verify list means the ticket has no check of its own: its candidate still runs the accumulated regression checks of the tickets already integrated in this run, then integrates once those pass and its trial merge is clean and the candidate is reviewed. Use that for docs or other work no command can check.',
     ids.length
       ? 'Profile check IDs (trusted, no approval needed): ' +
         ids.map((id) => id + ' = ' + checks[id].map((argv) => argv.join(' ')).join(' && ')).join('; ') +
