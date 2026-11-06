@@ -80,7 +80,7 @@ DeepSeek Harness 的本地 Git 工单调度插件。队长交给它一个已确�
 | `dag_pause` | `runId` | 暂停新工单和新的发布动作；在途 worker 可以提交成果 |
 | `dag_resume` | `runId` | 核对发布记录和真实 Git 后继续就绪队列 |
 | `dag_retry` | `runId, id`，可选 `isolated` | 对指定阻塞工单核对旧现场，接回完成提交或启动新尝试。无法确认旧 worker 退出时可显式选择 `isolated: true` |
-| `dag_cancel` | `runId` | 终止运行、请求停止已知 worker、保留证据，并对已发出的 Git 发布做对账。取消后的 run 为终态 |
+| `dag_cancel` | `runId` | 终止运行、请求停止已知 worker 和验收进程、保留证据，并对已发出的 Git 发布做对账。取消一落盘就发停止信号，对账失败也不例外：错误写入 `reconcileError` 和 `diagnostic` 并通知队长，未决意图保留在 `pendingPublications`，工单保持 `PUBLISHING`。取消后的 run 为终态。可重复调用：再次发出停止信号并重试对账，目标分支已是候选提交则记为已集成，仍是旧提交则放弃发布，都不是则继续保留 |
 | `dag_cleanup` | `runId` | 手动删除该轮已集成工单的 worktree 和分支（包括已结束的运行），返回每张工单的结果。重复调用无害，见下文“清理” |
 | `dag_add` | `runId, tickets` | 向已有运行追加工单，`tickets` 为工单数组或其 JSON 字符串。无需再次人工确认，但同样要通过验收，见下文“追加工单” |
 | `dag_import` | `spec`，可选 `repo` | 只读：把 GitHub issue 或本地 `.scratch` 中的 spec 和工单转成清单草稿，并给出 `dependencyMode`，见下文“从 spec 和工单导入” |

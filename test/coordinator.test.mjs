@@ -968,6 +968,87 @@ test(
   },
 )
 
+test(
+  'a reconciliation error or a throwing dispose cannot keep cancel from stopping workers and a running check',
+  { timeout: limit(60000) },
+  async (t) => {
+    const cwd = await repo(t)
+    const pidFile = join(cwd, '..', 'check-pid').replaceAll('\\', '/')
+    const signals = new Map()
+    const co = new Coordinator({
+      maxWorkers: 3,
+      checkTimeoutMs: limit(120000),
+      checks: {
+        verify: [
+          [
+            process.execPath,
+            '-e',
+            `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000)`,
+          ],
+        ],
+      },
+      launch: async (job) => {
+        signals.set(job.ticketId, job.signal)
+        return {
+          // The first worker's release entry fails before it can return a promise.
+          dispose: () => {
+            if (job.ticketId === 'B') throw Error('dispose failed')
+            return Promise.resolve()
+          },
+          result:
+            job.ticketId === 'A'
+              ? commit(job).then(() => ({ ok: true }))
+              : new Promise((resolve) => {
+                  job.signal.addEventListener('abort', () => resolve({ ok: false, detail: 'stopped' }))
+                }),
+        }
+      },
+    })
+    const q = { cwd, parentId: 'captain', runId: 'cancel-signals' }
+    try {
+      await co.start({
+        ...q,
+        manifest: {
+          spec_id: 'cancel-signals',
+          tickets: [ticket('A'), { id: 'B', title: 'B' }, { id: 'C', title: 'C' }],
+        },
+      })
+      await until(async () => {
+        const s = await co.status(q)
+        return s.tickets[0].livePhase?.stage === 'verify' && signals.size === 3
+      }, 'the check and both workers are running')
+      const pid = Number(await until(() => readFile(pidFile, 'utf8').catch(() => ''), 'the check process started'))
+      const [run] = co.runs.values()
+      const integration = run.integration
+      let aborted
+      co._reconcile = async () => {
+        aborted = [signals.get('B').aborted, signals.get('C').aborted, integration.ctrl.signal.aborted]
+        throw Error('git exploded')
+      }
+      const after = await co.cancel(q)
+      assert.deepEqual(aborted, [true, true, true], 'stop signals precede reconciliation')
+      assert.equal(after.mode, 'cancelled')
+      assert.equal(after.reconcileError, 'git exploded')
+      assert.equal(after.diagnostic, 'git exploded')
+      assert.equal(after.tickets.find((x) => x.id === 'A').livePhase, null)
+      assert.equal(after.tickets.find((x) => x.id === 'A').status, 'CANCELLED')
+      assert.equal(after.tickets.find((x) => x.id === 'C').status, 'CANCELLED')
+      // B's stop could not be proven, so it stays for inspection instead of counting as cancelled.
+      assert.equal(after.tickets.find((x) => x.id === 'B').status, 'NEEDS_ATTENTION')
+      await until(() => {
+        try {
+          process.kill(pid, 0)
+          return false
+        } catch {
+          return true
+        }
+      }, 'the check process is gone')
+    } finally {
+      await co.close()
+    }
+  },
+)
+
 test('a cancelled run is never cleaned', { timeout: limit(60000) }, async (t) => {
   const cwd = await repo(t)
   const co = new Coordinator({

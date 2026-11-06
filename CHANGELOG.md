@@ -2,6 +2,10 @@
 
 版本号以 `package.json` 为准。条目整理自 Git 提交记录。
 
+## 未发布
+
+- `dag_cancel`：取消一落盘就向在途 worker 发停止并调用释放入口、取消验收进程，Git 发布对账失败或释放入口抛错都不再跳过。对账错误写入 `reconcileError` 和 `diagnostic` 并通知队长，未决发布意图保留在新增的 `pendingPublications`；重复取消会重试对账，已发布的记为集成，未发布的放弃。
+
 ## 0.13.0
 
 - 新增只读工具 `dag_import`：读取 `/to-spec`、`/to-tickets` 发布的 spec 和工单，生成 `dag_run` 清单草稿。

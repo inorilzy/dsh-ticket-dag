@@ -555,6 +555,24 @@ test('hold stores its diagnostic with one notification, repeat observation is id
   }
 })
 
+test('a cancelled run stays final while keeping a diagnostic until the caller clears it', (t) => {
+  const db = new RunStore(tempDb(t))
+  try {
+    init(db, manifest([ticket('A')]))
+    assert.equal(db.setMode('cancelled'), true)
+    assert.equal(db.hold('Unrecognized tip', { staged: true }), true)
+    assert.equal(db.hold('Unrecognized tip'), false)
+    assert.equal(db.meta().mode, 'cancelled')
+    assert.equal(db.meta().diagnostic, 'Unrecognized tip')
+    assert.equal(db.pendingNotifications().filter((n) => n.type === 'run_blocked').length, 1)
+    assert.equal(db.clearDiagnostic(), true)
+    assert.equal(db.meta().diagnostic, null)
+    assert.equal(db.events().filter((e) => e.type === 'run_blocked').length, 1)
+  } finally {
+    db.close()
+  }
+})
+
 test('abandonIntent cancels only an unpublished intent for the exact cancelled run and lease', (t) => {
   const db = new RunStore(tempDb(t))
   try {
