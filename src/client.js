@@ -1788,7 +1788,9 @@ window.__ModuleLoader__.load({
       const presets = run.presets ?? []
       const presetOf = (id) => presets.find((p) => p.id === id)
       const plannedOwners = Object.fromEntries(run.tickets.map((t) => [t.id, t.agent ?? '']))
-      const currentOwners = owners ?? plannedOwners
+      // Overlay the user's edits on the current plan: a ticket appended while the
+      // plan is under review keeps its planned owner until the user changes it.
+      const currentOwners = { ...plannedOwners, ...(owners ?? {}) }
       // Every possible owner, in a stable order that also fixes each member colour.
       const allIds = [
         ...new Set([...presets.map((p) => p.id), ...Object.values(plannedOwners), ...Object.values(currentOwners)]),
@@ -1865,7 +1867,21 @@ window.__ModuleLoader__.load({
             headers: { 'content-type': 'application/json', 'x-dsh-ticket-dag': '1' },
             body: JSON.stringify({ key: run.key, ...body }),
           })
-          if (!response.ok) throw new Error((await response.text()) || 'HTTP ' + response.status)
+          if (!response.ok) {
+            const detail = ((await response.text()) || '').trim()
+            // The plan changed after review (an appended ticket, a concurrent
+            // approval) or this client sent no revision. Keep the user's edits,
+            // show the current plan and require a fresh confirmation.
+            if (response.status === 409 && body.action === 'approve') {
+              setError(
+                '计划已更新，正在为你刷新。请核对最新的工单、验收命令与模型后再次确认。' +
+                  (detail ? ' ' + detail : ''),
+              )
+              refresh()
+              return
+            }
+            throw new Error(detail || 'HTTP ' + response.status)
+          }
           refresh()
         } catch (err) {
           setError(err.message || '操作失败，请重试。')
@@ -1883,6 +1899,9 @@ window.__ModuleLoader__.load({
         }
         send({
           action: 'approve',
+          // Echo the exact plan version this review shows; the host refuses a
+          // different one with a 409 so nothing unseen is started.
+          revision: run.revision,
           choices: run.tickets.map((t) => ({ id: t.id, agent: currentOwners[t.id], ...routeOf(currentOwners[t.id]) })),
           ...(currentWorkers !== plannedWorkers && { maxWorkers: n }),
         })

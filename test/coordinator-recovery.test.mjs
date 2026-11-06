@@ -270,9 +270,9 @@ test('a run approved before the review listed unused checks keeps its used comma
     rmSync(dir, { recursive: true, force: true, maxRetries: 3 })
   })
   const manifest = { spec_id: 'legacy', checks: own, tickets: [{ id: 'A', title: 'A', verify: ['used'] }] }
-  await first.start({ ...q, manifest })
+  const started = await first.start({ ...q, manifest })
   const [file] = first.runs.keys()
-  await first.approve(file, [])
+  await first.approve(file, [], { revision: started.revision })
   await settled(first)
   // Appended under the old rules: from then on this command is part of the run.
   const history = [{ id: 'B', title: 'B', depends_on: ['A'], verify: ['early'] }]
