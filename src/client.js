@@ -2430,24 +2430,16 @@ window.__ModuleLoader__.load({
       for (const t of tickets) members.set(t.agent ?? '', (members.get(t.agent ?? '') ?? 0) + 1)
       return [...members]
     }
-    const runState = (run) =>
-      !run
-        ? ''
-        : run.available === false
-          ? '记录不可读'
-          : run.mode === 'staged'
-            ? '待确认'
-            : run.mode === 'discarded'
-              ? '已放弃'
-              : run.complete
-                ? '已完成'
-                : '进行中'
 
-    // Reads this conversation's run list once to find the run's sidebar address
-    // and preset names; no polling, the tab owns live progress.
+    // Reads this conversation's run once on mount (a remount reads again). The
+    // folded tool result is only the plan at dag_run time, so a successful read
+    // shows the board's status plus the snapshot's members and ticket count.
+    // No polling; the sidebar tab owns live progress.
     function RunCard({ run, sessionId, openRun }) {
       const [found, setFound] = useState(null)
-      const [presets, setPresets] = useState(null)
+      // null until the dashboard answers. false: the read failed, so the tool
+      // result is an old snapshot and must not look like the live state.
+      const [snapshot, setSnapshot] = useState(null)
       const [notice, setNotice] = useState('')
       useEffect(() => {
         let disposed = false
@@ -2460,13 +2452,21 @@ window.__ModuleLoader__.load({
         void (async () => {
           try {
             const view = await read('')
-            const hit = view?.runs?.find?.((r) => r.runId === run.runId)
+            if (!Array.isArray(view?.runs)) throw new Error('宿主未返回有效的运行快照。')
+            const hit = view.runs.find((r) => r.runId === run.runId)
             if (disposed || !hit) return
+            // The list row is enough to open the right sidebar tab if the detail read fails.
             setFound(hit)
             const detail = view.selected?.key === hit.key ? view.selected : (await read(hit.key))?.selected
-            if (!disposed && Array.isArray(detail?.presets)) setPresets(detail.presets)
+            if (disposed) return
+            if (!detail || !Array.isArray(detail.tickets)) {
+              setSnapshot(false)
+              return
+            }
+            if (detail.key) setFound(detail)
+            setSnapshot(detail)
           } catch {
-            // The card still shows what the tool result recorded.
+            if (!disposed) setSnapshot(false)
           }
         })()
         return () => {
@@ -2474,9 +2474,19 @@ window.__ModuleLoader__.load({
           ctrl.abort()
         }
       }, [sessionId, run.runId])
-      const members = runMembers(run.tickets)
+      const live = Boolean(snapshot && Array.isArray(snapshot.tickets))
+      const historical = snapshot === false
+      const unreadable = live && snapshot.available === false
+      const roster = live && !unreadable ? snapshot.tickets : run.tickets
+      const members = runMembers(roster)
       const ids = members.map(([id]) => id)
-      const state = runState(found)
+      const presets = live && !unreadable ? snapshot.presets : null
+      const state = live ? runMode(snapshot) : ''
+      const meta = historical
+        ? '旧快照 · ' + run.tickets.length + ' 张工单'
+        : unreadable
+          ? state
+          : [state, roster.length + ' 张工单'].filter(Boolean).join(' · ')
       return h(
         'section',
         { className: 'dtd-dashboard dtd-run-card', 'data-dag-run-card': run.runId },
@@ -2485,7 +2495,7 @@ window.__ModuleLoader__.load({
           'header',
           { className: 'dtd-run-card-head' },
           h('span', { className: 'dtd-run-card-title', title: run.runId }, '工单 · ' + run.runId),
-          h('span', { className: 'dtd-run-card-meta' }, [state, run.tickets.length + ' 张工单'].filter(Boolean).join(' · ')),
+          h('span', { className: 'dtd-run-card-meta', 'data-dag-run-state': historical ? '旧快照' : state }, meta),
           h(
             'button',
             {
@@ -2496,7 +2506,10 @@ window.__ModuleLoader__.load({
             '查看工单',
           ),
         ),
-        members.length > 0 &&
+        historical &&
+          h('p', { role: 'status', className: 'dtd-alert' }, '读取失败，以下是旧快照，不是当前状态。'),
+        !unreadable &&
+          members.length > 0 &&
           h(
             'div',
             { className: 'dtd-run-card-members' },
@@ -2508,6 +2521,12 @@ window.__ModuleLoader__.load({
                 memberName(id, presets) + ' · ' + count + ' 张',
               ),
             ),
+          ),
+        unreadable &&
+          h(
+            'p',
+            { role: 'status', className: 'dtd-alert' },
+            snapshot.diagnostic || '这轮运行的持久记录暂不可读取。',
           ),
         notice && h('p', { role: 'status', className: 'dtd-alert' }, notice),
       )
