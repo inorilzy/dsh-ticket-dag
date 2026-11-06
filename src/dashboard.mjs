@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, statSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { planRevision, readIntegrity } from './store.mjs'
+import { runTiming } from './timing.mjs'
 
 const route = '/api/ticket-dag.dashboard'
 const noStore = { 'cache-control': 'no-store' }
@@ -245,6 +246,7 @@ export class RunCatalog {
     if (key && !known.some((entry) => entry.key === key)) return null
     const selectedKey = key ?? known[0]?.key
     let selected = null
+    const now = Date.now()
     const runs = known.map((row) => {
       const { file, summary, summarySig, ...entry } = row
       const detail = entry.key === selectedKey
@@ -254,12 +256,12 @@ export class RunCatalog {
       let data
       try {
         if (attached) {
-          data = coordinator.peek(file)
+          data = coordinator.peek(file, detail ? now : undefined)
           if (!data) throw new Error('run is no longer attached')
         } else if (detail) {
           const signature = ledgerSignature(file)
           this.ledgerOpens++
-          data = readLedger(file, entry, true, coordinator.maxWorkers, coordinator.agents)
+          data = readLedger(file, entry, true, coordinator.maxWorkers, coordinator.agents, now)
           // Refresh the cache only when the ledger changed since it was last read.
           if (signature && this.cache.get(entry.key)?.signature !== signature)
             this.#storeSummary(entry.key, summaryOf(data), signature)
@@ -321,6 +323,9 @@ export class RunCatalog {
           planChecks: data.planChecks ?? [],
           // The opaque plan version the review shows and approval must echo back.
           revision: data.revision ?? null,
+          // The server's clock, so a live board can count from timing.runningSince.
+          timing: data.timing ?? null,
+          now,
           tickets: data.tickets.map((t) => ({
             id: t.id,
             title: t.title,
@@ -356,7 +361,7 @@ export class RunCatalog {
 // Read one ledger. `detail` also loads each ticket row; otherwise only the run
 // row and status counts are read. Exported so the history benchmark can measure
 // the pre-cache cost without duplicating the queries.
-export function readLedger(file, entry, detail, globalLimit, agents = {}) {
+export function readLedger(file, entry, detail, globalLimit, agents = {}, now = Date.now()) {
   const db = new DatabaseSync(file, { readOnly: true })
   try {
     db.exec('PRAGMA trusted_schema=OFF; PRAGMA query_only=ON; BEGIN')
@@ -423,6 +428,13 @@ export function readLedger(file, entry, detail, globalLimit, agents = {}) {
         // the exact version, including each ticket's effective preset now.
         result.revision = planRevision({ ...integrity, agents })
       }
+      result.timing = runTiming(
+        db
+          .prepare('SELECT type,ticketId,attempt,createdAt,details FROM events ORDER BY rowid')
+          .all()
+          .map((row) => ({ ...row, details: JSON.parse(row.details) })),
+        now,
+      )
     }
     return result
   } finally {

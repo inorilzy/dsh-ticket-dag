@@ -45,6 +45,36 @@ function publish(db, row, oldTip, sourceSha, candidateSha) {
   assert.equal(db.finish(row.id, row.lease, candidateSha), true)
 }
 
+test('verification events stay out of the outbox and the plan revision', (t) => {
+  const db = new RunStore(tempDb(t))
+  try {
+    init(db, manifest([ticket('A')]))
+    assert.equal(db.events()[0].details.mode, 'active')
+    const row = db.claim('A', assignment('A'))
+    submit(db, row, 'source')
+    const revision = db.revision()
+    const integrity = JSON.stringify(db.integrity())
+    const pending = db.pendingNotifications().length
+    db.recordVerifyStart('A', ['unit'])
+    db.recordCheck('A', { checkId: 'unit', ms: 12, ok: true })
+    db.recordCheck('A', { checkId: 'lint', ms: 3, ok: false, aborted: true })
+    const [started, passed, stopped] = db.events().slice(-3)
+    assert.deepEqual([started.type, started.ticketId, started.attempt], ['verify_started', 'A', 1])
+    assert.deepEqual(started.details, { checks: ['unit'] })
+    assert.equal(passed.type, 'check_finished')
+    assert.deepEqual(passed.details, { checkId: 'unit', ms: 12, ok: true })
+    assert.deepEqual(stopped.details, { checkId: 'lint', ms: 3, ok: false, aborted: true })
+    assert.equal(db.pendingNotifications().length, pending)
+    assert.equal(db.revision(), revision)
+    assert.equal(JSON.stringify(db.integrity()), integrity)
+    // They change no ticket state, so publication proceeds as before.
+    publish(db, db.get('A'), 'start', 'source', 'landed')
+    assert.equal(db.get('A').status, 'INTEGRATED')
+  } finally {
+    db.close()
+  }
+})
+
 test('plan aliases, defaults and declared artifact dependencies', () => {
   const m = manifest(
     [

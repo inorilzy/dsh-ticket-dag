@@ -495,7 +495,8 @@ export class RunStore {
       const edge = this.#db.prepare('INSERT INTO dependencies(ticketId, upstream) VALUES (?, ?)')
       manifest.tickets.forEach((t, i) => insert.run(t.id, JSON.stringify(t), i))
       for (const t of manifest.tickets) for (const upstream of t.dependsOn) edge.run(t.id, upstream)
-      this.#event('run_started', null, 'Run started', { ref, baseSha })
+      // The mode tells timing whether this start waits for an approval.
+      this.#event('run_started', null, 'Run started', { ref, baseSha, mode })
       return this.meta()
     })
   }
@@ -1025,6 +1026,19 @@ export class RunStore {
   /** Record the result of reporting an integrated ticket back to its tracker issue. */
   recordWriteback(id, status, message, details = {}) {
     this.#transaction(() => this.#event('writeback_' + status, this.get(id), message, details))
+  }
+
+  /** The integration lane starts on this ticket. Timing only; the captain is not notified. */
+  recordVerifyStart(id, checks) {
+    this.#transaction(() => this.#event('verify_started', this.get(id), id + ' verification started', { checks }))
+  }
+
+  /** One check command ended. Timing only; the captain is not notified. */
+  recordCheck(id, { checkId, ms, ok, aborted = false }) {
+    const details = aborted ? { checkId, ms, ok, aborted } : { checkId, ms, ok }
+    this.#transaction(() =>
+      this.#event('check_finished', this.get(id), checkId + (ok ? ' passed' : ' did not pass'), details),
+    )
   }
 
   events() {
