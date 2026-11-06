@@ -57,7 +57,7 @@ const runTools = [
   ['cancel', 'Cancel the run and stop its owned workers.'],
   [
     'cleanup',
-    'Remove the recorded worktrees and branches of the integrated tickets in a run, including an ended one, and return each ticket result. Unmerged or dirty worktrees are skipped with a reason; repeating it is harmless.',
+    'Remove the recorded worktrees and branches of the integrated tickets in a run, including an ended one, and return each ticket result. Unmerged worktrees and worktrees with tracked changes, untracked or ignored files are kept and skipped with a reason; repeating it is harmless.',
   ],
 ]
 const sourceKind = 'dsh-ticket-dag'
