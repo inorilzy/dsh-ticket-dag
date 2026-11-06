@@ -1,0 +1,646 @@
+{
+  "spec_id": "tank-arena",
+  "base_ref": "main",
+  "max_workers": 6,
+  "checks": {
+    "fast": [
+      [
+        "node",
+        "--test",
+        "checks/unit/"
+      ]
+    ],
+    "soak": [
+      [
+        "node",
+        "checks/soak.mjs"
+      ]
+    ]
+  },
+  "tickets": [
+    {
+      "id": "T01",
+      "title": "固定步长循环、种子随机数、输入录制",
+      "prompt": "# 01: 固定步长循环、种子随机数、输入录制\n\n**Status:** ready-for-agent\n\n**Blocked by:** None (can start immediately)\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n建立确定性内核：固定步长逻辑循环、可序列化的种子随机数、输入录制与重放，以及 src/main.js 的游戏对象骨架。之后所有系统都挂在这个骨架上。\n\n## Interface\n\n```js\n// src/core/loop.js\nexport const DT = 1 / 60\nexport function createLoop({ step, maxSubSteps = 5 })   // advance(realSeconds) -> 执行的逻辑帧数；alpha 供渲染插值\n// src/core/rng.js（PCG32 或 xorshift128+，状态为整数数组）\nexport function createRng(seed)   // { next() /* [0,1) */, int(lo, hi), pick(list), fork(label), state(), setState(s) }\n// src/core/hash.js\nexport function hashState(value)  // 键排序后的稳定序列化 + FNV-1a，返回 16 位十六进制字符串\n// src/core/recorder.js\nexport function createRecorder()  // { push(tick, input), frames(), toJSON() }；replay(game, frames)\n// src/main.js\nexport async function createGame({ seed, level = 'proving-ground', options = {} })\nexport async function loadGame(snapshot)\n```\n\n## Files\n\n- `src/core/loop.js`\n- `src/core/rng.js`\n- `src/core/hash.js`\n- `src/core/recorder.js`\n- `src/main.js`\n- `checks/unit/core-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- `src/main.js`：实现 `createGame` / `loadGame`。游戏对象含 `seed`、`tick`、`rng`、`services`（空对象，供系统公开函数）、`systems`、`step(input)`、`hash()`、`save()`、`inspect()`；`step` 按 `SYSTEMS` 顺序调用每个系统的 `step(game, input, DT)` 后 `tick++`；`save()` 返回 `{ version: 1, seed, tick, rng, systems: { [name]: system.save(game) } }`；`hash()` 为 `hashState(save())`；`inspect()` 先返回 `{ entities: [], resources: {}, emittedEvents: [], balanceReads: [] }`。`SYSTEMS` 保持为空数组导出，供后续工单插入。\n\n## Acceptance criteria\n\n- [ ] createRng 同种子序列相同，setState(state()) 后序列可续接，fork 得到独立且确定的子流\n- [ ] createLoop 在帧率抖动下逻辑帧数只由累计时间决定，单次最多 maxSubSteps 帧\n- [ ] 录制 N 帧输入后在新对局重放，最终 hash() 与原对局一致\n- [ ] createGame + step 后 soak 从 burn 模式切换为 game 模式并通过\n- [ ] 新增 `checks/unit/core-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "createRng 同种子序列相同，setState(state()) 后序列可续接，fork 得到独立且确定的子流",
+        "createLoop 在帧率抖动下逻辑帧数只由累计时间决定，单次最多 maxSubSteps 帧",
+        "录制 N 帧输入后在新对局重放，最终 hash() 与原对局一致",
+        "createGame + step 后 soak 从 burn 模式切换为 game 模式并通过",
+        "新增 `checks/unit/core-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/01-fixed-step-rng-recording.md"
+      }
+    },
+    {
+      "id": "T02",
+      "title": "实体存储与事件总线",
+      "prompt": "# 02: 实体存储与事件总线\n\n**Status:** ready-for-agent\n\n**Blocked by:** None (can start immediately)\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n实现实体存储与事件总线。实体是带递增整数 ID 的组件集合；组件类型必须先在 COMPONENTS 注册。事件必须先在 EVENT_TYPES 注册，发出未注册事件直接抛错。\n\n## Interface\n\n```js\n// src/world.js\nexport const COMPONENTS = { position: { x: 0, y: 0 }, body: { radius: 8, solid: true } }\nexport function createWorld()  // { spawn(kind, components) -> id, despawn(id), get(id), has(id, comp),\n                               //   query(...comps) -> 按 id 升序的实体数组, count(kind) }\nexport function serializeWorld(world) / restoreWorld(data)  // 纯 JSON，往返后 query 顺序与 nextId 不变\n// src/events.js\nexport const EVENT_TYPES = { 'entity:spawned': ['id', 'kind'], 'entity:despawned': ['id', 'kind'] }\nexport function createEventBus()  // { emit(type, payload), on(type, fn) -> off, drain() -> 本帧事件,\n                                  //   emitted() -> 至今发出过的类型（排序去重）, save(), load(data) }\n```\n\n## Files\n\n- `src/world.js`\n- `src/events.js`\n- `checks/unit/world-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- `src/world.js`：定义 `COMPONENTS` 并注册 `position`、`body`；`spawn` 对未注册组件抛错并用默认值补全字段。\n- `src/events.js`：定义 `EVENT_TYPES`（值为必填字段名数组）并注册 `entity:spawned`、`entity:despawned`；`emit` 校验类型已注册、必填字段齐全。\n\n## Acceptance criteria\n\n- [ ] spawn 未注册组件或 emit 未注册事件时抛出带名称的错误\n- [ ] query 结果按实体 ID 升序，despawn 后 ID 不复用\n- [ ] serializeWorld → JSON → restoreWorld 后继续 spawn 得到与未序列化时相同的 ID\n- [ ] 事件监听器按注册顺序调用，emitted() 记录全部发出过的类型\n- [ ] 新增 `checks/unit/world-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "spawn 未注册组件或 emit 未注册事件时抛出带名称的错误",
+        "query 结果按实体 ID 升序，despawn 后 ID 不复用",
+        "serializeWorld → JSON → restoreWorld 后继续 spawn 得到与未序列化时相同的 ID",
+        "事件监听器按注册顺序调用，emitted() 记录全部发出过的类型",
+        "新增 `checks/unit/world-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/02-world-and-event-bus.md"
+      }
+    },
+    {
+      "id": "T03",
+      "title": "网格地形与属性：可摧毁、不可穿越、减速、遮蔽",
+      "prompt": "# 03: 网格地形与属性：可摧毁、不可穿越、减速、遮蔽\n\n**Status:** ready-for-agent\n\n**Blocked by:** None (can start immediately)\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n实现格子地形。每种地形是属性组合：blocking（不可穿越）、destructible（带耐久，可被摧毁成 rubble）、slow（移动速度系数）、cover（遮蔽视线与弹道）。地形变更必须可订阅，路径寻找和迷雾依赖它做增量更新。\n\n## Interface\n\n```js\n// src/terrain.js\nexport const TILE = 32\nexport const TILE_TYPES = { floor, rubble, steel, crate, brine, reeds, barrel }  // 每项 { blocking, destructible, hp, slow, cover, color }\nexport function createTerrain(width, height, fill = 'floor')\n// { width, height, get(cx, cy), set(cx, cy, type), damage(cx, cy, amount) -> 被摧毁时 true,\n//   isBlocked(x, y) /* 世界坐标，越界为 true */, slowAt(x, y), coverAt(x, y),\n//   raycast(x0, y0, x1, y1) -> 第一个 blocking/cover 格或 null,\n//   onChange(fn) -> off /* fn([{cx, cy, from, to}]) */, toJSON(), static fromJSON(data) }\nexport function parseTerrain(rows, legend)  // 字符画 -> terrain，供关卡与测试使用\n```\n\n## Files\n\n- `src/terrain.js`\n- `checks/unit/terrain-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- 本工单不改共享文件；`TILE_TYPES` 的数值（耐久、减速系数）在工单 05 之后由各系统通过 `BALANCE.terrain` 覆盖，见工单 08。\n\n## Acceptance criteria\n\n- [ ] isBlocked 对越界坐标返回 true，对格子边界坐标归属一致（左闭右开）\n- [ ] damage 把 destructible 格子打到 0 时变为 rubble 并通过 onChange 批量通知\n- [ ] raycast 用 DDA 遍历格子，结果与逐像素采样一致\n- [ ] toJSON / fromJSON 往返后所有格子和剩余耐久相同\n- [ ] 新增 `checks/unit/terrain-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "isBlocked 对越界坐标返回 true，对格子边界坐标归属一致（左闭右开）",
+        "damage 把 destructible 格子打到 0 时变为 rubble 并通过 onChange 批量通知",
+        "raycast 用 DDA 遍历格子，结果与逐像素采样一致",
+        "toJSON / fromJSON 往返后所有格子和剩余耐久相同",
+        "新增 `checks/unit/terrain-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/03-grid-terrain.md"
+      }
+    },
+    {
+      "id": "T04",
+      "title": "数值表 src/data/balance.js 与校验",
+      "prompt": "# 04: 数值表 src/data/balance.js 与校验\n\n**Status:** ready-for-agent\n\n**Blocked by:** None (can start immediately)\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n实现集中数值表。所有可调数值放在 BALANCE，按系统名分节；读取统一经过 createBalance 返回的读取器，读取器记录读过的键，soak 用它检查缺失键和未使用键。\n\n## Interface\n\n```js\n// src/data/balance.js\nexport const BALANCE = { meta: { version: 1 } }\nexport function validateBalance(table)    // 返回问题列表：非有限数、负的时长/速度、节名不是小写标识符、重复键\nexport function createBalance(table = BALANCE, overrides = {})\n// { get(path) /* 'tank.maxSpeed'，缺失时抛错 */, section(name) /* 只读对象，读取字段也计入 reads */,\n//   reads() -> 读过的点分路径（排序去重）, keys() -> 全部叶子路径 }\n```\n\n## Files\n\n- `src/data/balance.js`\n- `checks/unit/balance-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- `src/data/balance.js`：建立 `BALANCE`，只放 `meta.version`。之后每张有数值的工单在这里新增以系统名为第一段的节，节名必须等于该系统的 `name`。\n\n## Acceptance criteria\n\n- [ ] get 缺失路径抛出包含路径名的错误\n- [ ] section 返回的对象被冻结，读取字段计入 reads()\n- [ ] validateBalance 能发现 NaN、Infinity、负时长和未知类型\n- [ ] overrides 只能覆盖已存在的键\n- [ ] 新增 `checks/unit/balance-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "get 缺失路径抛出包含路径名的错误",
+        "section 返回的对象被冻结，读取字段计入 reads()",
+        "validateBalance 能发现 NaN、Infinity、负时长和未知类型",
+        "overrides 只能覆盖已存在的键",
+        "新增 `checks/unit/balance-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/04-balance-table.md"
+      }
+    },
+    {
+      "id": "T05",
+      "title": "玩家坦克：带惯性的移动、独立炮塔、碰撞",
+      "prompt": "# 05: 玩家坦克：带惯性的移动、独立炮塔、碰撞\n\n**Status:** ready-for-agent\n\n**Blocked by:** 01, 02, 03, 04\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n把 01–04 接成可玩的骨架，并实现玩家坦克“犁锋号”（Ploughshare）。车体有加速度、摩擦和转向速度，炮塔独立朝向瞄准方向；与地形做圆—格子碰撞并沿墙滑动，地形减速生效。\n\n## Interface\n\n```js\n// src/systems/tank.js\nexport const tankSystem = { name: 'tank', init, step, save, load, resources }\n// 组件 tank: { hullAngle, turretAngle, vx, vy, throttle, team }；组件 health: { hp, maxHp }\n// services.tank: { playerId(), moveCircle(id, dx, dy) /* 共享的圆形碰撞移动，其他系统复用 */ }\n```\n\n## Files\n\n- `src/systems/tank.js`\n- `src/levels/proving-ground.js`\n- `src/main.js`\n- `src/world.js`\n- `src/events.js`\n- `src/data/balance.js`\n- `checks/unit/tank-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- `src/main.js`：`createGame` 创建 `game.world`、`game.events`、`game.terrain`（来自 `src/levels/proving-ground.js` 的 40×30 训练场）和 `game.balance`；`save()` 增加 `world`、`terrain`、`events`；`loadGame` 恢复它们；`inspect()` 填好 `entities`（含 hp/maxHp）、`terrain`、`resources`（汇总各系统 `resources(game)`）、`emittedEvents`、`balanceReads`。把 `tankSystem` 放进 `SYSTEMS` 第一位。\n- `src/world.js`：注册组件 `tank`、`health`。\n- `src/events.js`：注册 `tank:moved`（id, x, y）、`tank:collided`（id, cx, cy）。\n- `src/data/balance.js`：新增 `tank` 节：`maxSpeed`、`accel`、`friction`、`hullTurnRate`、`turretTurnRate`、`radius`、`maxHp`。\n\n## Acceptance criteria\n\n- [ ] 松开输入后坦克按 friction 减速而不是立即停止\n- [ ] 炮塔转向速度受 turretTurnRate 限制，与车体朝向无关\n- [ ] 以任意速度撞墙都不会嵌入不可穿越格子，沿墙方向的速度保留\n- [ ] soak 的 inspect 不变量（血量、嵌墙）在 game 模式下开始生效\n- [ ] 新增 `checks/unit/tank-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "松开输入后坦克按 friction 减速而不是立即停止",
+        "炮塔转向速度受 turretTurnRate 限制，与车体朝向无关",
+        "以任意速度撞墙都不会嵌入不可穿越格子，沿墙方向的速度保留",
+        "soak 的 inspect 不变量（血量、嵌墙）在 game 模式下开始生效",
+        "新增 `checks/unit/tank-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [
+        "T01",
+        "T02",
+        "T03",
+        "T04"
+      ],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/05-player-tank.md"
+      }
+    },
+    {
+      "id": "T06",
+      "title": "弹道：反弹、穿透、范围爆炸",
+      "prompt": "# 06: 弹道：反弹、穿透、范围爆炸\n\n**Status:** ready-for-agent\n\n**Blocked by:** 02, 03, 04\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n实现弹丸系统。三种弹种：钢芯弹（遇墙反弹 N 次）、穿甲矛（穿透 destructible 格子并衰减）、熔渣榴弹（落点或命中时范围爆炸）。弹丸用连续碰撞检测，不会在高速时穿过一格厚的墙。\n\n## Interface\n\n```js\n// src/systems/projectile.js\nexport const projectileSystem = { name: 'projectile', init, step, save, load }\n// 组件 projectile: { kind, ownerId, team, vx, vy, bounces, pierce, fuse }\n// services.projectile: { fire(ownerId, kind, x, y, angle) -> id }\n// 爆炸只发事件，不直接扣血（扣血在工单 07）\n```\n\n## Files\n\n- `src/systems/projectile.js`\n- `src/main.js`\n- `src/world.js`\n- `src/events.js`\n- `src/data/balance.js`\n- `checks/unit/projectile-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- `src/main.js`：`projectileSystem` 插在 `tank` 之后；输入 `fire` 为真且冷却结束时由本系统替玩家开火（读取 `services.tank` 若存在）。\n- `src/world.js`：注册组件 `projectile`（`body.solid` 为 false）。\n- `src/events.js`：注册 `projectile:fired`（id, ownerId, kind）、`projectile:bounced`（id, cx, cy）、`projectile:hit`（id, targetId, x, y, dirX, dirY, kind）、`projectile:exploded`（id, x, y, radius）。\n- `src/data/balance.js`：新增 `projectile` 节，每个弹种一组 `speed`、`damage`、`bounces`、`pierce`、`radius`、`cooldown`、`lifetime`。\n\n## Acceptance criteria\n\n- [ ] 速度大于一格每帧时也不会穿过一格厚的 steel\n- [ ] 反弹角度满足入射角等于反射角，用完次数后销毁\n- [ ] projectile:hit 带上从弹丸指向目标的单位方向，供工单 07 计算受击方向\n- [ ] 弹丸超出 lifetime 自动销毁，世界中不残留实体\n- [ ] 新增 `checks/unit/projectile-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "速度大于一格每帧时也不会穿过一格厚的 steel",
+        "反弹角度满足入射角等于反射角，用完次数后销毁",
+        "projectile:hit 带上从弹丸指向目标的单位方向，供工单 07 计算受击方向",
+        "弹丸超出 lifetime 自动销毁，世界中不残留实体",
+        "新增 `checks/unit/projectile-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [
+        "T02",
+        "T03",
+        "T04"
+      ],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/06-projectiles.md"
+      }
+    },
+    {
+      "id": "T07",
+      "title": "伤害与按受击方向计算的装甲",
+      "prompt": "# 07: 伤害与按受击方向计算的装甲\n\n**Status:** ready-for-agent\n\n**Blocked by:** 05, 06\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n实现伤害结算。坦克有前、侧、后三个装甲面，按受击方向与车体朝向的夹角选择装甲面并折算伤害；范围爆炸按距离衰减；血量归零发出 destroyed 事件并销毁实体。\n\n## Interface\n\n```js\n// src/systems/damage.js\nexport const damageSystem = { name: 'damage', init, step, save, load }\n// 组件 armor: { front, side, rear }（伤害倍率）\nexport function armorFacing(hullAngle, dirX, dirY) // 'front' | 'side' | 'rear'\n// services.damage: { apply(targetId, amount, { dirX, dirY, sourceId, kind }) -> 实际伤害 }\n```\n\n## Files\n\n- `src/systems/damage.js`\n- `src/main.js`\n- `src/world.js`\n- `src/events.js`\n- `src/data/balance.js`\n- `checks/unit/damage-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- `src/main.js`：`damageSystem` 插在 `projectile` 之后。订阅 `projectile:hit` 和 `projectile:exploded`。\n- `src/world.js`：注册组件 `armor`，玩家坦克生成时带上它（修改工单 05 的生成参数）。\n- `src/events.js`：注册 `damage:dealt`（targetId, amount, facing, sourceId）、`entity:destroyed`（id, kind, sourceId, x, y）。\n- `src/data/balance.js`：新增 `damage` 节：`armor.front`、`armor.side`、`armor.rear`、`falloff`、`minSplash`。\n\n## Acceptance criteria\n\n- [ ] 正面、侧面、背面的边界角度（45°/135°）结果确定且有测试\n- [ ] 血量被钳制在 0..maxHp，不会出现负数或溢出\n- [ ] 范围爆炸对同一实体每次只结算一次\n- [ ] 实体被摧毁后其弹丸 ownerId 引用不会导致异常\n- [ ] 新增 `checks/unit/damage-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "正面、侧面、背面的边界角度（45°/135°）结果确定且有测试",
+        "血量被钳制在 0..maxHp，不会出现负数或溢出",
+        "范围爆炸对同一实体每次只结算一次",
+        "实体被摧毁后其弹丸 ownerId 引用不会导致异常",
+        "新增 `checks/unit/damage-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [
+        "T05",
+        "T06"
+      ],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/07-damage-and-armor.md"
+      }
+    },
+    {
+      "id": "T08",
+      "title": "地形破坏与连锁爆炸",
+      "prompt": "# 08: 地形破坏与连锁爆炸\n\n**Status:** ready-for-agent\n\n**Blocked by:** 03, 06\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n让爆炸和穿甲矛破坏地形；barrel（燃料桶）格子被摧毁时延迟若干帧后自身爆炸，形成连锁。连锁顺序必须确定，同一帧多个爆炸按坐标排序结算。\n\n## Interface\n\n```js\n// src/systems/destruction.js\nexport const destructionSystem = { name: 'destruction', init, step, save, load }\n// 私有状态：待引爆队列 [{ cx, cy, at }]，必须进入 save()\n// services.destruction: { blast(x, y, radius, power) }\n```\n\n## Files\n\n- `src/systems/destruction.js`\n- `src/levels/proving-ground.js`\n- `src/main.js`\n- `src/world.js`\n- `src/events.js`\n- `src/data/balance.js`\n- `checks/unit/destruction-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- `src/main.js`：`destructionSystem` 插在 `projectile` 之后、`damage` 之前（若已存在）。\n- `src/world.js`：注册组件 `debris`（短寿命、`solid: false`，供渲染粒子使用）。\n- `src/events.js`：注册 `terrain:destroyed`（cx, cy, from）、`barrel:primed`（cx, cy, at）、`barrel:exploded`（cx, cy）。\n- `src/data/balance.js`：新增 `destruction` 节：`barrelDelay`、`barrelRadius`、`barrelPower`、`crateHp`、`debrisLifetime`；`terrain` 节覆盖 `TILE_TYPES` 的耐久。\n- 在试炼场放置若干 crate 和 barrel，保证 soak 对局会触发连锁。\n\n## Acceptance criteria\n\n- [ ] 一排 barrel 按确定顺序依次引爆，结果与同种子重跑一致\n- [ ] 对局中途存档时待引爆队列被保存，恢复后照常引爆\n- [ ] 被摧毁的格子变为 rubble 后坦克可以通过\n- [ ] 爆炸摧毁地形不会把实体留在不可穿越格子内\n- [ ] 新增 `checks/unit/destruction-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "一排 barrel 按确定顺序依次引爆，结果与同种子重跑一致",
+        "对局中途存档时待引爆队列被保存，恢复后照常引爆",
+        "被摧毁的格子变为 rubble 后坦克可以通过",
+        "爆炸摧毁地形不会把实体留在不可穿越格子内",
+        "新增 `checks/unit/destruction-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [
+        "T03",
+        "T06"
+      ],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/08-terrain-destruction-chain.md"
+      }
+    },
+    {
+      "id": "T09",
+      "title": "路径寻找：A* 与流场，地形变化后增量更新",
+      "prompt": "# 09: 路径寻找：A* 与流场，地形变化后增量更新\n\n**Status:** ready-for-agent\n\n**Blocked by:** 03\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n实现路径寻找。单体用 A*（8 方向、禁止切角穿墙、slow 格子代价更高）；大量敌人共用指向目标的流场。地形变化时只重算受影响区域，不全图重建。\n\n## Interface\n\n```js\n// src/pathfinding.js\nexport function findPath(terrain, from, to, { maxNodes, costOf }) -> [{cx, cy}] | null\nexport function createFlowField(terrain, { maxCost }) // { setGoal(cx, cy), directionAt(x, y) -> {x, y}, invalidate(changes), cost(cx, cy) }\n// src/systems/navigation.js\nexport const navigationSystem = { name: 'navigation', init, step, save, load }\n// services.navigation: { path(from, to), flowTo(goalKey) -> field }，流场按需构建并缓存\n```\n\n## Files\n\n- `src/pathfinding.js`\n- `src/systems/navigation.js`\n- `src/main.js`\n- `src/data/balance.js`\n- `checks/unit/navigation-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- `src/main.js`：`navigationSystem` 插在 `damage` 之后（若已存在，否则在 `tank` 之后）；`init` 中订阅 `terrain.onChange` 调用 `invalidate`。\n- `src/data/balance.js`：新增 `navigation` 节：`maxNodes`、`slowCost`、`diagonalCost`、`fieldMaxCost`、`repathInterval`。\n\n## Acceptance criteria\n\n- [ ] A* 结果与暴力 Dijkstra 的路径代价相同（多张随机地图测试）\n- [ ] 一格墙被摧毁后流场增量更新的结果与全量重建一致\n- [ ] 缓存的流场是派生数据：不进入存档，loadGame 后按需重建且结果相同\n- [ ] 目标不可达时返回 null，不死循环\n- [ ] 新增 `checks/unit/navigation-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "A* 结果与暴力 Dijkstra 的路径代价相同（多张随机地图测试）",
+        "一格墙被摧毁后流场增量更新的结果与全量重建一致",
+        "缓存的流场是派生数据：不进入存档，loadGame 后按需重建且结果相同",
+        "目标不可达时返回 null，不死循环",
+        "新增 `checks/unit/navigation-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [
+        "T03"
+      ],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/09-pathfinding.md"
+      }
+    },
+    {
+      "id": "T10",
+      "title": "敌人 AI 状态机：巡逻、追击、掩护、撤退",
+      "prompt": "# 10: 敌人 AI 状态机：巡逻、追击、掩护、撤退\n\n**Status:** ready-for-agent\n\n**Blocked by:** 05, 06, 09\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n实现敌方坦克 AI，阵营名“灰潮联合体”（Greytide Syndicate）。状态：patrol、chase、cover（寻找 cover 格子躲避）、retreat（血量低时撤退）。转换条件写成表驱动，便于测试。\n\n## Interface\n\n```js\n// src/systems/ai.js\nexport const aiSystem = { name: 'ai', init, step, save, load }\n// 组件 brain: { state, target, waypoint, timer, memory }\nexport const TRANSITIONS = [{ from, to, when(ctx) }]\nexport function decide(brain, ctx) -> 下一个状态（纯函数）\n// AI 的输出是与玩家同结构的 input，交给 services.tank 驱动，开火交给 services.projectile.fire\n```\n\n## Files\n\n- `src/systems/ai.js`\n- `src/levels/proving-ground.js`\n- `src/main.js`\n- `src/world.js`\n- `src/events.js`\n- `src/data/balance.js`\n- `checks/unit/ai-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- `src/main.js`：`aiSystem` 插在 `tank` 之前，使 AI 的输入在同一帧生效。\n- `src/world.js`：注册组件 `brain`。\n- `src/events.js`：注册 `ai:state`（id, from, to）、`ai:spotted`（id, targetId）。\n- `src/data/balance.js`：新增 `ai` 节：`sightRange`、`fireRange`、`retreatHp`、`coverSearchRadius`、`reactionTicks`、`patrolRadius`。\n- 在试炼场放置 3 辆巡逻敌人，保证 soak 对局中出现交战。\n\n## Acceptance criteria\n\n- [ ] decide 对每条转换都有单元测试\n- [ ] AI 的随机行为只使用 game.rng.fork('ai')，存档恢复后行为一致\n- [ ] brain.memory 只含 JSON 值，save/load 往返无损\n- [ ] 敌人不会卡在墙角超过 repathInterval 帧仍不重新寻路\n- [ ] 新增 `checks/unit/ai-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "decide 对每条转换都有单元测试",
+        "AI 的随机行为只使用 game.rng.fork('ai')，存档恢复后行为一致",
+        "brain.memory 只含 JSON 值，save/load 往返无损",
+        "敌人不会卡在墙角超过 repathInterval 帧仍不重新寻路",
+        "新增 `checks/unit/ai-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [
+        "T05",
+        "T06",
+        "T09"
+      ],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/10-enemy-ai.md"
+      }
+    },
+    {
+      "id": "T11",
+      "title": "四种敌人与多阶段首领",
+      "prompt": "# 11: 四种敌人与多阶段首领\n\n**Status:** ready-for-agent\n\n**Blocked by:** 07, 10\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n定义四种原创敌人：刺鳐（Skate，快速轻装）、壁虎（Gecko，正面重甲）、迫鸣（Mortarwren，远程榴弹）、织网者（Weaver，布雷减速）；以及首领“潮汐熔炉”（Tidal Forge）：三个阶段，按血量阈值切换，每阶段改变弹种和移动模式。\n\n## Interface\n\n```js\n// src/data/enemies.js\nexport const ENEMY_TYPES = { skate, gecko, mortarwren, weaver }  // { hp, armor, speed, weapon, ai: 覆盖项, color, shape }\nexport const BOSS = { id: 'tidal-forge', phases: [{ hpBelow, weapon, pattern }] }\n// src/systems/roster.js\nexport const rosterSystem = { name: 'roster', init, step, save, load }\n// services.roster: { spawnEnemy(type, x, y) -> id, spawnBoss(x, y) -> id }\n```\n\n## Files\n\n- `src/data/enemies.js`\n- `src/systems/roster.js`\n- `src/main.js`\n- `src/world.js`\n- `src/events.js`\n- `src/data/balance.js`\n- `checks/unit/roster-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- `src/main.js`：`rosterSystem` 插在 `ai` 之前。\n- `src/world.js`：注册组件 `enemy`（type）和 `boss`（phase）。\n- `src/events.js`：注册 `boss:phase`（id, phase）、`enemy:spawned`（id, type）、`mine:laid`（id, x, y）。\n- `src/data/balance.js`：新增 `roster` 节：每种敌人一组 `hp`、`speed`、`armor`、`reward`，以及 `boss.hp`、`boss.phaseThresholds`、`mine.slow`、`mine.duration`。\n- 试炼场每 600 帧生成一次首领以外的随机敌人，第 450 帧生成一次首领，使 soak 覆盖阶段切换代码路径（首领 hp 在试炼场按 `roster.boss.trainingScale` 缩放）。\n\n## Acceptance criteria\n\n- [ ] 首领在同一帧跨越两个阈值时按顺序发出两次 boss:phase\n- [ ] 织网者的地雷在存档恢复后剩余时间不变\n- [ ] 四种敌人的数值全部来自 BALANCE，代码中没有硬编码数值\n- [ ] 敌人生成位置不在不可穿越格子内\n- [ ] 新增 `checks/unit/roster-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "首领在同一帧跨越两个阈值时按顺序发出两次 boss:phase",
+        "织网者的地雷在存档恢复后剩余时间不变",
+        "四种敌人的数值全部来自 BALANCE，代码中没有硬编码数值",
+        "敌人生成位置不在不可穿越格子内",
+        "新增 `checks/unit/roster-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [
+        "T07",
+        "T10"
+      ],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/11-enemy-roster-boss.md"
+      }
+    },
+    {
+      "id": "T12",
+      "title": "波次导演与动态难度",
+      "prompt": "# 12: 波次导演与动态难度\n\n**Status:** ready-for-agent\n\n**Blocked by:** 10\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n实现波次导演：读取关卡的波次表生成敌人；根据玩家近期表现（受伤速度、击杀速度）在限定范围内调整强度系数，只影响下一波的数量和间隔，不影响当前波。\n\n## Interface\n\n```js\n// src/systems/director.js\nexport const directorSystem = { name: 'director', init, step, save, load }\n// 私有状态：{ wave, timer, intensity, history: [...] }\nexport function nextIntensity(intensity, stats, limits) // 纯函数\n// services.director: { currentWave(), intensity(), forceWave(n) }\n```\n\n## Files\n\n- `src/systems/director.js`\n- `src/main.js`\n- `src/events.js`\n- `src/data/balance.js`\n- `checks/unit/director-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- `src/main.js`：`directorSystem` 插在 `ai` 之前；生成敌人时优先调用 `services.roster.spawnEnemy`（若已注册），否则直接生成基础敌人。\n- `src/events.js`：注册 `wave:started`（wave, count, intensity）、`wave:cleared`（wave, ticks）。\n- `src/data/balance.js`：新增 `director` 节：`baseCount`、`countPerWave`、`interval`、`intensityMin`、`intensityMax`、`intensityStep`、`historyWindow`。\n\n## Acceptance criteria\n\n- [ ] nextIntensity 永远落在 [intensityMin, intensityMax]\n- [ ] 存档恢复后下一波的时间点和数量与不存档时相同\n- [ ] 同一波内调整难度不改变已排队的生成\n- [ ] 试炼场中 900 帧内至少开始两波\n- [ ] 新增 `checks/unit/director-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "nextIntensity 永远落在 [intensityMin, intensityMax]",
+        "存档恢复后下一波的时间点和数量与不存档时相同",
+        "同一波内调整难度不改变已排队的生成",
+        "试炼场中 900 帧内至少开始两波",
+        "新增 `checks/unit/director-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [
+        "T10"
+      ],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/12-wave-director.md"
+      }
+    },
+    {
+      "id": "T13",
+      "title": "友军小队与指令",
+      "prompt": "# 13: 友军小队与指令\n\n**Status:** ready-for-agent\n\n**Blocked by:** 07, 10\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n实现两辆友军僚机“锚钩”与“灯芯”（Grapnel、Wick），复用 AI 状态机但阵营相反；玩家通过输入的 order 字段下达 follow、hold、attack、regroup 指令。友军火力不伤友军。\n\n## Interface\n\n```js\n// src/systems/squad.js\nexport const squadSystem = { name: 'squad', init, step, save, load }\n// 组件 squad: { order, anchor, slot }\n// services.squad: { members(), issue(order) }\n```\n\n## Files\n\n- `src/systems/squad.js`\n- `src/main.js`\n- `src/world.js`\n- `src/events.js`\n- `src/data/balance.js`\n- `checks/unit/squad-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- `src/main.js`：`squadSystem` 插在 `ai` 之后、`tank` 之前；试炼场开局生成两名僚机。\n- `src/world.js`：注册组件 `squad`。\n- `src/events.js`：注册 `squad:order`（order, tick）、`squad:down`（id）。\n- `src/data/balance.js`：新增 `squad` 节：`followDistance`、`holdRadius`、`regroupSpeed`、`friendlyFire`（必须为 0）、`memberHp`。\n- 修改工单 07 的伤害结算：同阵营伤害乘以 `squad.friendlyFire`。\n\n## Acceptance criteria\n\n- [ ] regroup 后僚机在限定帧数内回到玩家附近的槽位\n- [ ] 友军弹丸命中友军不扣血，但仍会反弹或爆炸\n- [ ] 指令在存档恢复后保持\n- [ ] 僚机阵亡后指令只作用于存活成员\n- [ ] 新增 `checks/unit/squad-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "regroup 后僚机在限定帧数内回到玩家附近的槽位",
+        "友军弹丸命中友军不扣血，但仍会反弹或爆炸",
+        "指令在存档恢复后保持",
+        "僚机阵亡后指令只作用于存活成员",
+        "新增 `checks/unit/squad-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [
+        "T07",
+        "T10"
+      ],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/13-squad-orders.md"
+      }
+    },
+    {
+      "id": "T14",
+      "title": "道具与主动技能",
+      "prompt": "# 14: 道具与主动技能\n\n**Status:** ready-for-agent\n\n**Blocked by:** 07\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n实现道具（修理包、弹药箱、相位电池）与玩家主动技能：输入 ability 为真时释放当前技能。技能：“盐雾屏障”（短时减伤）和“回涌冲刺”（瞬间位移，不得穿墙）。技能能量是资源，必须出现在 inspect().resources。\n\n## Interface\n\n```js\n// src/systems/pickups.js\nexport const pickupSystem = { name: 'pickup', init, step, save, load, resources }\n// 组件 pickup: { kind, amount }；组件 ability: { slot, cooldown, energy, maxEnergy, activeUntil }\n// services.pickup: { drop(kind, x, y) -> id, grant(entityId, kind) }\n```\n\n## Files\n\n- `src/systems/pickups.js`\n- `src/main.js`\n- `src/world.js`\n- `src/events.js`\n- `src/data/balance.js`\n- `checks/unit/pickups-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- `src/main.js`：`pickupSystem` 插在 `damage` 之后；`entity:destroyed` 时按掉落表用 `game.rng.fork('loot')` 掉落。\n- `src/world.js`：注册组件 `pickup`（`solid: false`）、`ability`。\n- `src/events.js`：注册 `pickup:spawned`、`pickup:collected`（id, kind, by）、`ability:used`（id, kind）、`ability:ended`（id, kind）。\n- `src/data/balance.js`：新增 `pickup` 节：`repairAmount`、`ammoAmount`、`energyAmount`、`dropChance`、`shieldReduction`、`shieldDuration`、`dashDistance`、`abilityCost`、`maxEnergy`。\n- 修改工单 07：屏障生效期间伤害乘以 `pickup.shieldReduction`。\n\n## Acceptance criteria\n\n- [ ] 修理包回血不超过 maxHp，能量不超过 maxEnergy\n- [ ] 回涌冲刺遇墙时停在墙前，不嵌入地形\n- [ ] 技能持续时间和冷却在存档恢复后不变\n- [ ] 掉落只使用 loot 子随机流，不影响其他系统的随机序列\n- [ ] 新增 `checks/unit/pickup-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "修理包回血不超过 maxHp，能量不超过 maxEnergy",
+        "回涌冲刺遇墙时停在墙前，不嵌入地形",
+        "技能持续时间和冷却在存档恢复后不变",
+        "掉落只使用 loot 子随机流，不影响其他系统的随机序列",
+        "新增 `checks/unit/pickup-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [
+        "T07"
+      ],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/14-pickups-abilities.md"
+      }
+    },
+    {
+      "id": "T15",
+      "title": "经济与升级树",
+      "prompt": "# 15: 经济与升级树\n\n**Status:** ready-for-agent\n\n**Blocked by:** 04, 14\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n实现资源“锈币”（scrip）：击杀与拾取获得，用于局间升级。升级树三条分支（装甲、火力、机动），每个节点有前置节点和价格；升级效果通过 balance overrides 应用，不直接改系统代码。\n\n## Interface\n\n```js\n// src/data/upgrades.js\nexport const UPGRADE_TREE = [{ id, branch, cost, requires: [], effects: { 'tank.maxSpeed': 1.1 } }]\n// src/systems/economy.js\nexport const economySystem = { name: 'economy', init, step, save, load, resources }\nexport function canBuy(tree, owned, scrip, id) / buy(...) -> { owned, scrip }\nexport function overridesFor(tree, owned) -> balance overrides（乘法效果按购买顺序叠加）\n```\n\n## Files\n\n- `src/data/upgrades.js`\n- `src/systems/economy.js`\n- `src/main.js`\n- `src/events.js`\n- `src/data/balance.js`\n- `checks/unit/economy-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- `src/main.js`：`economySystem` 插在 `pickup` 之后；`createGame({ options: { upgrades } })` 用 `overridesFor` 创建 `game.balance`，存档保存已购升级。\n- `src/events.js`：注册 `economy:earned`（amount, reason）、`economy:purchased`（id, cost）。\n- `src/data/balance.js`：新增 `economy` 节：`killReward`、`pickupReward`、`maxScrip`、`bossReward`；`validateBalance` 校验 `UPGRADE_TREE` 的 effects 只引用存在的键。\n\n## Acceptance criteria\n\n- [ ] 锈币在 0..maxScrip 内并出现在 inspect().resources.scrip\n- [ ] 缺少前置或锈币不足时 buy 抛错且状态不变\n- [ ] 带升级创建的对局在存档恢复后仍使用相同的 overrides\n- [ ] UPGRADE_TREE 引用不存在的 balance 键时 validateBalance 报错\n- [ ] 新增 `checks/unit/economy-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "锈币在 0..maxScrip 内并出现在 inspect().resources.scrip",
+        "缺少前置或锈币不足时 buy 抛错且状态不变",
+        "带升级创建的对局在存档恢复后仍使用相同的 overrides",
+        "UPGRADE_TREE 引用不存在的 balance 键时 validateBalance 报错",
+        "新增 `checks/unit/economy-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [
+        "T04",
+        "T14"
+      ],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/15-economy-upgrades.md"
+      }
+    },
+    {
+      "id": "T16",
+      "title": "信标占领与任务目标",
+      "prompt": "# 16: 信标占领与任务目标\n\n**Status:** ready-for-agent\n\n**Blocked by:** 05, 12\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n实现信号信标：玩家方单位在半径内且无敌方时占领进度上升，敌方在场时争夺；关卡目标由若干目标项组成（占领 N 个信标、守住信标 T 帧、击毁首领、在限定帧数内撤离到撤离点）。这是本游戏的胜负核心，不存在“保护基地”目标。\n\n## Interface\n\n```js\n// src/systems/objectives.js\nexport const objectiveSystem = { name: 'objective', init, step, save, load }\n// 组件 beacon: { owner, progress, radius }\n// 目标项: { kind: 'capture' | 'hold' | 'destroy-boss' | 'extract', target, done }\n// services.objective: { status() -> 'running' | 'won' | 'lost', list() }\n```\n\n## Files\n\n- `src/systems/objectives.js`\n- `src/levels/proving-ground.js`\n- `src/main.js`\n- `src/world.js`\n- `src/events.js`\n- `src/data/balance.js`\n- `checks/unit/objectives-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- `src/main.js`：`objectiveSystem` 放在 `SYSTEMS` 末尾；导演的波次在信标被占领后加快（调用 `services.director`）。\n- `src/world.js`：注册组件 `beacon`（`solid: false`）。\n- `src/events.js`：注册 `beacon:progress`、`beacon:captured`（id, owner）、`objective:completed`（index, kind）、`match:ended`（result, tick）。\n- `src/data/balance.js`：新增 `objective` 节：`captureRate`、`contestDecay`、`beaconRadius`、`holdTicks`、`extractRadius`。\n- 试炼场放置两个信标，目标为循环占领，不会结束对局。\n\n## Acceptance criteria\n\n- [ ] 双方同时在场时进度不变或衰减，不会同时被双方占领\n- [ ] 信标进度在 0..1 内，存档恢复后不变\n- [ ] match:ended 每局只发出一次\n- [ ] 玩家坦克被摧毁时状态变为 lost\n- [ ] 新增 `checks/unit/objective-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "双方同时在场时进度不变或衰减，不会同时被双方占领",
+        "信标进度在 0..1 内，存档恢复后不变",
+        "match:ended 每局只发出一次",
+        "玩家坦克被摧毁时状态变为 lost",
+        "新增 `checks/unit/objective-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [
+        "T05",
+        "T12"
+      ],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/16-beacons-objectives.md"
+      }
+    },
+    {
+      "id": "T17",
+      "title": "战争迷雾与视野",
+      "prompt": "# 17: 战争迷雾与视野\n\n**Status:** ready-for-agent\n\n**Blocked by:** 03, 05\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n实现格子级战争迷雾：三种状态 unseen、explored、visible；视野来自玩家与友军，被 cover 格子遮挡（使用 terrain.raycast）。AI 也只能看到自己阵营视野内的目标（与工单 10 的 sightRange 共同生效）。\n\n## Interface\n\n```js\n// src/systems/fog.js\nexport const fogSystem = { name: 'fog', init, step, save, load }\nexport function computeVisibility(terrain, viewers, radius) -> Uint8Array // 纯函数\n// services.fog: { isVisible(team, x, y), explored() -> 压缩成 base64 的位图 }\n```\n\n## Files\n\n- `src/systems/fog.js`\n- `src/main.js`\n- `src/world.js`\n- `src/data/balance.js`\n- `checks/unit/fog-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- `src/main.js`：`fogSystem` 插在 `tank` 之后；每 `fog.updateInterval` 帧重算一次。\n- `src/world.js`：注册组件 `vision`（radius, team）。\n- `src/data/balance.js`：新增 `fog` 节：`playerRadius`、`squadRadius`、`enemyRadius`、`updateInterval`。\n- 存档只保存 explored 位图（base64 字符串，不保存 Uint8Array）。\n\n## Acceptance criteria\n\n- [ ] 墙后的格子在视野半径内也保持不可见\n- [ ] explored 一旦置位不再回退\n- [ ] explored 在存档恢复后相同，visible 恢复后在下一次更新时一致\n- [ ] 地形被摧毁后视野在下一次更新时扩大\n- [ ] 新增 `checks/unit/fog-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "墙后的格子在视野半径内也保持不可见",
+        "explored 一旦置位不再回退",
+        "explored 在存档恢复后相同，visible 恢复后在下一次更新时一致",
+        "地形被摧毁后视野在下一次更新时扩大",
+        "新增 `checks/unit/fog-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [
+        "T03",
+        "T05"
+      ],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/17-fog-of-war.md"
+      }
+    },
+    {
+      "id": "T18",
+      "title": "存档与回放：带版本迁移，能在对局中途保存恢复",
+      "prompt": "# 18: 存档与回放：带版本迁移，能在对局中途保存恢复\n\n**Status:** ready-for-agent\n\n**Blocked by:** 01, 02, 15\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n把 save/load 做成正式功能：存档格式带 version，提供迁移链把旧版本存档升级到当前版本；本地存档槽使用可替换的存储后端（浏览器为 localStorage，Node 为内存）；回放文件 = 种子 + 关卡 + 升级 + 输入录制。\n\n## Interface\n\n```js\n// src/save.js\nexport const SAVE_VERSION = 2\nexport const MIGRATIONS = { 1: (v1) => v2 }      // 版本 n 升到 n+1\nexport function migrate(snapshot) -> 当前版本快照  // 未知的更高版本抛错\nexport function createSaveSlots(storage)          // { list(), write(slot, game), read(slot) -> snapshot, remove(slot) }\n// src/replay.js\nexport function recordReplay(game) / playReplay(replay) -> game  // 回放结束时 hash 与原对局一致\n```\n\n## Files\n\n- `src/save.js`\n- `src/replay.js`\n- `src/main.js`\n- `src/events.js`\n- `checks/unit/save-checks.mjs`\n- `checks/fixtures/save-v1.json`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- `src/main.js`：`save()` 输出 `version: SAVE_VERSION`；`loadGame` 先 `migrate`；把经济系统的已购升级纳入存档的 `options`。\n- `src/events.js`：注册 `save:written`（slot, tick）、`save:loaded`（slot, fromVersion）。\n- 提交一份 version 1 的固定存档 fixture，验证迁移后可以加载并继续运行。\n\n## Acceptance criteria\n\n- [ ] version 1 fixture 经 migrate 后可加载，继续 300 帧不报错\n- [ ] 版本号高于 SAVE_VERSION 的存档被拒绝并给出明确错误\n- [ ] 回放 900 帧后 hash 与原对局一致\n- [ ] 任意中途存档在 soak 的存档恢复一致性检查中通过\n- [ ] 新增 `checks/unit/save-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "version 1 fixture 经 migrate 后可加载，继续 300 帧不报错",
+        "版本号高于 SAVE_VERSION 的存档被拒绝并给出明确错误",
+        "回放 900 帧后 hash 与原对局一致",
+        "任意中途存档在 soak 的存档恢复一致性检查中通过",
+        "新增 `checks/unit/save-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [
+        "T01",
+        "T02",
+        "T15"
+      ],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/18-save-replay-migrations.md"
+      }
+    },
+    {
+      "id": "T19",
+      "title": "Canvas 渲染、相机、粒子",
+      "prompt": "# 19: Canvas 渲染、相机、粒子\n\n**Status:** ready-for-agent\n\n**Blocked by:** 05, 06, 08\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n实现 Canvas 2D 渲染：只用色块与几何图形绘制地形、坦克（车体矩形 + 炮塔圆 + 炮管线条）、弹丸、爆炸和碎屑粒子。相机平滑跟随玩家并在爆炸时震动，渲染用 loop.alpha 插值。渲染只读游戏状态，不写入。\n\n## Interface\n\n```js\n// src/render/renderer.js\nexport function createRenderer(canvas, { palette }) // { draw(game, alpha), resize(w, h) }\n// src/render/camera.js（纯逻辑，可在 Node 测试）\nexport function createCamera({ lerp, shakeDecay }) // { follow(x, y, dt), shake(amount), worldToScreen(x, y), state() }\n// src/render/particles.js（纯逻辑）\nexport function createParticles(seed) // 由事件生成粒子，使用独立随机流，不影响 game.rng\n// src/render/palette.js：原创配色（锈橙、盐白、潮绿、灰潮蓝），不使用任何现有游戏的配色方案\nindex.html：全屏 canvas，加载 src/app.js\n```\n\n## Files\n\n- `src/render/renderer.js`\n- `src/render/camera.js`\n- `src/render/particles.js`\n- `src/render/palette.js`\n- `src/app.js`\n- `index.html`\n- `src/main.js`\n- `src/events.js`\n- `checks/unit/render-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- `src/main.js`：导出 `startBrowser(canvas)`，用工单 01 的 `createLoop` 驱动逻辑与渲染；渲染器只订阅事件，不加入 `SYSTEMS`。\n- `src/events.js`：注册 `camera:shake`（amount），爆炸系统在 `projectile:exploded` 与 `barrel:exploded` 时发出。\n\n## Acceptance criteria\n\n- [ ] camera 与 particles 在 Node 下可测试，不触碰 DOM\n- [ ] 同一游戏状态绘制两次不改变 hash()\n- [ ] 粒子使用独立随机流，开关渲染不改变逻辑结果\n- [ ] 浏览器中能看到坦克移动、开火、爆炸（手工验证，写明步骤）\n- [ ] 新增 `checks/unit/render-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "camera 与 particles 在 Node 下可测试，不触碰 DOM",
+        "同一游戏状态绘制两次不改变 hash()",
+        "粒子使用独立随机流，开关渲染不改变逻辑结果",
+        "浏览器中能看到坦克移动、开火、爆炸（手工验证，写明步骤）",
+        "新增 `checks/unit/render-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [
+        "T05",
+        "T06",
+        "T08"
+      ],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/19-canvas-render.md"
+      }
+    },
+    {
+      "id": "T20",
+      "title": "HUD 与小地图",
+      "prompt": "# 20: HUD 与小地图\n\n**Status:** ready-for-agent\n\n**Blocked by:** 17, 19\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n实现 HUD：血量条、弹药、技能能量、锈币、当前波次、目标列表；小地图显示已探索地形、可见敌人、信标和撤离点，遵守战争迷雾。HUD 数据由纯函数从游戏状态派生，绘制只在浏览器进行。\n\n## Interface\n\n```js\n// src/ui/hud-model.js（纯逻辑）\nexport function hudModel(game) -> { hp, maxHp, ammo, energy, scrip, wave, objectives: [...] }\nexport function minimapModel(game, { size }) -> { cells, markers: [{ kind, x, y }] } // 不包含迷雾中的敌人\n// src/ui/hud.js / src/ui/minimap.js：绘制到 canvas 覆盖层\n```\n\n## Files\n\n- `src/ui/hud-model.js`\n- `src/ui/hud.js`\n- `src/ui/minimap.js`\n- `src/app.js`\n- `checks/unit/hud-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- 本工单不改共享文件；只读取各系统在 `services` 上公开的状态。缺少某个系统时对应 HUD 项隐藏，不报错。\n\n## Acceptance criteria\n\n- [ ] minimapModel 不包含玩家阵营看不到的敌人\n- [ ] hudModel 在缺少经济、技能、目标系统时也能返回结果\n- [ ] HUD 数值与 inspect().resources 一致\n- [ ] 调用 hudModel 不改变 hash()\n- [ ] 新增 `checks/unit/hud-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "minimapModel 不包含玩家阵营看不到的敌人",
+        "hudModel 在缺少经济、技能、目标系统时也能返回结果",
+        "HUD 数值与 inspect().resources 一致",
+        "调用 hudModel 不改变 hash()",
+        "新增 `checks/unit/hud-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [
+        "T17",
+        "T19"
+      ],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/20-hud-minimap.md"
+      }
+    },
+    {
+      "id": "T21",
+      "title": "WebAudio 合成音效，由事件驱动",
+      "prompt": "# 21: WebAudio 合成音效，由事件驱动\n\n**Status:** ready-for-agent\n\n**Blocked by:** 02, 06\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n用 WebAudio 程序合成全部音效（开火、反弹、爆炸、占领、首领换阶段、按钮），不使用音频文件。音效由事件总线驱动：事件到音效的映射是纯数据，便于在 Node 下测试映射与节流。\n\n## Interface\n\n```js\n// src/audio/cues.js（纯逻辑）\nexport const CUES = { 'projectile:fired': { synth: 'thump', pitch, gain, throttle }, ... }\nexport function planCues(events, state) -> { play: [...], state }  // 同帧同类事件节流\n// src/audio/synth.js（浏览器）\nexport function createSynth(audioContext) // { play(cue), setVolume(v), mute(bool) }\n```\n\n## Files\n\n- `src/audio/cues.js`\n- `src/audio/synth.js`\n- `src/app.js`\n- `src/events.js`\n- `src/data/balance.js`\n- `checks/unit/audio-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- `src/events.js`：注册 `audio:muted`（muted）；`CUES` 的每个键必须是已注册事件（检查里断言）。\n- `src/data/balance.js`：新增 `audio` 节：`masterGain`、`throttleTicks`、`maxVoices`。音频系统不在 `SYSTEMS` 中，所以 soak 不检查这些键是否被读取；单元检查要读取它们。\n\n## Acceptance criteria\n\n- [ ] CUES 只引用 EVENT_TYPES 中存在的事件\n- [ ] 同一帧 10 次 projectile:fired 只产生 maxVoices 以内的播放\n- [ ] 没有 AudioContext 的环境下导入 cues.js 不报错\n- [ ] 静音状态不影响逻辑 hash()\n- [ ] 新增 `checks/unit/audio-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "CUES 只引用 EVENT_TYPES 中存在的事件",
+        "同一帧 10 次 projectile:fired 只产生 maxVoices 以内的播放",
+        "没有 AudioContext 的环境下导入 cues.js 不报错",
+        "静音状态不影响逻辑 hash()",
+        "新增 `checks/unit/audio-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [
+        "T02",
+        "T06"
+      ],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/21-webaudio-sfx.md"
+      }
+    },
+    {
+      "id": "T22",
+      "title": "键鼠与触控输入、改键",
+      "prompt": "# 22: 键鼠与触控输入、改键\n\n**Status:** ready-for-agent\n\n**Blocked by:** 05\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n实现输入层：键盘鼠标（WASD 移动、鼠标瞄准、左键开火、空格技能、1–4 指令）与触控（左半屏虚拟摇杆、右半屏瞄准开火、按钮）。把设备事件归一化为 spec 规定的 input 结构；支持改键并持久化。\n\n## Interface\n\n```js\n// src/input/bindings.js（纯逻辑）\nexport const DEFAULT_BINDINGS = { up: 'KeyW', ..., ability: 'Space', orderFollow: 'Digit1' }\nexport function rebind(bindings, action, code) -> 新 bindings（冲突时交换）\nexport function toInput(deviceState, bindings, { deadzone }) -> { move, aim, fire, ability, order }\n// src/input/devices.js（浏览器）：键盘、鼠标、触控监听，输出 deviceState\n```\n\n## Files\n\n- `src/input/bindings.js`\n- `src/input/devices.js`\n- `src/app.js`\n- `src/main.js`\n- `src/data/balance.js`\n- `checks/unit/input-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- `src/main.js`：`startBrowser` 每个逻辑帧用 `toInput` 生成输入交给 `game.step`，并交给工单 01 的录制器。\n- `src/data/balance.js`：新增 `input` 节：`deadzone`、`aimSmoothing`、`touchStickRadius`。\n\n## Acceptance criteria\n\n- [ ] move 向量长度不超过 1，死区内为 0\n- [ ] rebind 冲突时交换两个动作的按键，不产生重复绑定\n- [ ] toInput 的输出能被录制器序列化并重放\n- [ ] 浏览器中键鼠与触控都能操作（手工验证，写明步骤）\n- [ ] 新增 `checks/unit/input-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "move 向量长度不超过 1，死区内为 0",
+        "rebind 冲突时交换两个动作的按键，不产生重复绑定",
+        "toInput 的输出能被录制器序列化并重放",
+        "浏览器中键鼠与触控都能操作（手工验证，写明步骤）",
+        "新增 `checks/unit/input-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [
+        "T05"
+      ],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/22-input-bindings.md"
+      }
+    },
+    {
+      "id": "T23",
+      "title": "关卡数据格式、3 个以上原创关卡、关卡编辑器",
+      "prompt": "# 23: 关卡数据格式、3 个以上原创关卡、关卡编辑器\n\n**Status:** ready-for-agent\n\n**Blocked by:** 03, 16, 19\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n定义关卡 JSON 格式并制作至少 3 个原创关卡：锈蚀码头（Rust Quay）、盐沼泵站（Brine Pumpworks）、熔炉堤岸（Forge Embankment，首领关）。每关含地形字符画、出生点、信标、撤离点、波次表、目标列表。提供浏览器内关卡编辑器（画格子、放信标、导出 JSON）。\n\n## Interface\n\n```js\n// src/levels/format.js\nexport function validateLevel(level) -> 问题列表 // 出生点可达所有信标（用工单 09 的 findPath 若存在，否则 BFS）\nexport function loadLevel(level) -> { terrain, spawns, beacons, extract, waves, objectives }\n// src/levels/index.js\nexport const LEVELS = { 'proving-ground', 'rust-quay', 'brine-pumpworks', 'forge-embankment' }\n// src/editor/editor.js（浏览器）+ editor.html\n```\n\n## Files\n\n- `src/levels/format.js`\n- `src/levels/index.js`\n- `src/levels/rust-quay.json`\n- `src/levels/brine-pumpworks.json`\n- `src/levels/forge-embankment.json`\n- `src/levels/proving-ground.js`\n- `src/editor/editor.js`\n- `editor.html`\n- `src/main.js`\n- `checks/unit/levels-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- `src/main.js`：`createGame({ level })` 通过 `LEVELS` 和 `loadLevel` 创建地形与实体；试炼场改写为同一格式。\n- 关卡布局为原创设计，不得照搬任何现有游戏的地图；不得出现被砖墙包围、需要保护的基地。\n\n## Acceptance criteria\n\n- [ ] 三个原创关卡都通过 validateLevel，且每关至少一个可达信标和撤离点\n- [ ] 编辑器导出的 JSON 能被 loadLevel 读取并开局\n- [ ] 用每个关卡创建对局各跑 300 帧，同种子哈希一致\n- [ ] 试炼场仍是 createGame 的默认关卡，soak 行为不变\n- [ ] 新增 `checks/unit/levels-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "三个原创关卡都通过 validateLevel，且每关至少一个可达信标和撤离点",
+        "编辑器导出的 JSON 能被 loadLevel 读取并开局",
+        "用每个关卡创建对局各跑 300 帧，同种子哈希一致",
+        "试炼场仍是 createGame 的默认关卡，soak 行为不变",
+        "新增 `checks/unit/levels-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [
+        "T03",
+        "T16",
+        "T19"
+      ],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/23-levels-editor.md"
+      }
+    },
+    {
+      "id": "T24",
+      "title": "战役流程：菜单、胜负、进度、整合全部系统",
+      "prompt": "# 24: 战役流程：菜单、胜负、进度、整合全部系统\n\n**Status:** ready-for-agent\n\n**Blocked by:** 11, 12, 13, 14, 15, 16, 18, 20, 21, 22, 23\n\nParent spec: `.scratch/tank-arena/spec.md`（先读其中的原创性要求、技术约束、系统接口和 soak 接入约定）。\n\n## What to build\n\n把全部系统整合成完整战役：标题菜单（新战役、继续、关卡选择、改键、音量）、关卡间升级商店、胜负结算、战役进度存档。检查 SYSTEMS 顺序、事件注册、平衡表和存档覆盖了所有系统，修掉合并后才暴露的跨模块问题。\n\n## Interface\n\n```js\n// src/campaign.js（纯逻辑）\nexport function createCampaign(storage) // { state(), startLevel(id), finishLevel(result), unlocked(), save(), load() }\n// 战役顺序：rust-quay -> brine-pumpworks -> forge-embankment；通关解锁下一关并获得锈币\n// src/ui/menu.js（浏览器）：菜单与结算界面，全部用几何图形与系统字体绘制\n```\n\n## Files\n\n- `src/campaign.js`\n- `src/ui/menu.js`\n- `src/app.js`\n- `src/main.js`\n- `src/world.js`\n- `src/events.js`\n- `src/data/balance.js`\n- `checks/unit/campaign-checks.mjs`\n\n## Shared registrations\n\n只追加本工单的条目，不重排、不删除其他工单的条目（工单 24 除外）。\n\n- `src/main.js`：最终确定 `SYSTEMS` 顺序：`roster`、`director`、`ai`、`squad`、`tank`、`fog`、`projectile`、`destruction`、`damage`、`navigation`、`pickup`、`economy`、`objective`，并为顺序写检查。\n- `src/world.js`：确认每个组件都有使用者，删除无人使用的组件注册。\n- `src/events.js`：注册 `campaign:level-started`、`campaign:level-finished`（level, result, scrip）；确认每个注册事件都有发出者。\n- `src/data/balance.js`：新增 `campaign` 节：`levelReward`、`retryPenalty`；删除无人读取的键。\n\n## Acceptance criteria\n\n- [ ] 从菜单开始新战役，三关依次解锁，通关后显示结算（手工验证，写明步骤）\n- [ ] 战役进度存档包含已购升级，读档后继续下一关\n- [ ] soak 的 skipped 列表中不再有游戏、存档、不变量、事件、平衡相关的跳过项\n- [ ] 所有工单的 checks/unit 检查一起运行通过\n- [ ] 新增 `checks/unit/campaign-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过\n- [ ] `node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变\n- [ ] 同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now",
+      "acceptance": [
+        "从菜单开始新战役，三关依次解锁，通关后显示结算（手工验证，写明步骤）",
+        "战役进度存档包含已购升级，读档后继续下一关",
+        "soak 的 skipped 列表中不再有游戏、存档、不变量、事件、平衡相关的跳过项",
+        "所有工单的 checks/unit 检查一起运行通过",
+        "新增 `checks/unit/campaign-checks.mjs`，覆盖本工单的接口与边界情况，`node --test checks/unit/` 通过",
+        "`node checks/soak.mjs`（默认 60 秒）通过，且本工单的系统状态经 save/load 往返后哈希不变",
+        "同种子、同输入两次运行状态哈希相同；逻辑代码不使用 Math.random、Date.now 或 performance.now"
+      ],
+      "depends_on": [
+        "T11",
+        "T12",
+        "T13",
+        "T14",
+        "T15",
+        "T16",
+        "T18",
+        "T20",
+        "T21",
+        "T22",
+        "T23"
+      ],
+      "verify": [
+        "fast",
+        "soak"
+      ],
+      "source": {
+        "kind": "local",
+        "path": ".scratch/tank-arena/issues/24-campaign-integration.md"
+      }
+    }
+  ]
+}

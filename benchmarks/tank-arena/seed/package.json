@@ -1,0 +1,11 @@
+{
+  "name": "ferrowake",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Ferrowake: an original top-down tank campaign (benchmark baseline)",
+  "type": "module",
+  "scripts": {
+    "check": "node --test checks/unit/",
+    "soak": "node checks/soak.mjs"
+  }
+}

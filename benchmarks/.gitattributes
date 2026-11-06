@@ -1,0 +1,2 @@
+# new-trial.mjs 逐字节复制这些文件来算出固定的 HEAD SHA，所以检出时必须保持 LF。
+* text eol=lf
