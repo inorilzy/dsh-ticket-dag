@@ -1,17 +1,24 @@
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import test from 'node:test'
+import { promisify } from 'node:util'
 import { Coordinator } from '../src/coordinator.mjs'
 import * as git from '../src/git.mjs'
 import { RunStore } from '../src/store.mjs'
 
 const checks = { syntax: [[process.execPath, '--check', 'module.js']] }
+const exec = promisify(execFile)
+// For worker fixtures: a synchronous child would stall the coordinator under test.
+const gitAsync = async (cwd, ...argv) => (await exec('git', argv, { cwd, encoding: 'utf8' })).stdout.trim()
 const runId = 'cancel-recovery',
   parentId = 'captain'
+// Every Git call and check is a process start, which costs several times more on Windows.
+const timeScale = process.platform === 'win32' ? 3 : 1
+const limit = (ms) => ms * timeScale
 const gitRun = (cwd, ...argv) =>
   execFileSync('git', argv, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
 
@@ -48,8 +55,8 @@ async function failedPublication(t) {
             ? (async () => {
                 await allowA
                 writeFileSync(join(job.cwd, 'module.js'), 'export default 1\n')
-                gitRun(job.cwd, 'add', 'module.js')
-                gitRun(
+                await gitAsync(job.cwd, 'add', 'module.js')
+                await gitAsync(
                   job.cwd,
                   'commit',
                   '-qm',
@@ -67,7 +74,7 @@ async function failedPublication(t) {
     try {
       await coordinator.close()
     } finally {
-      rmSync(dir, { recursive: true, force: true })
+      rmSync(dir, { recursive: true, force: true, maxRetries: 3 })
     }
   })
   const query = { cwd: main, runId, parentId }
@@ -84,7 +91,8 @@ async function failedPublication(t) {
     },
   })
   const seen = async (check, label) => {
-    for (let i = 0; i < 600; i++) {
+    const deadline = Date.now() + limit(150000)
+    while (Date.now() < deadline) {
       const snapshot = await coordinator.status(query)
       if (check(snapshot)) return snapshot
       await sleep(100)
@@ -133,11 +141,17 @@ async function failedPublication(t) {
 
 test(
   'a failed reconciliation stops the worker, keeps the evidence, and a repeated cancel abandons what never published',
-  { timeout: 180000 },
+  { timeout: limit(180000) },
   async (t) => {
     const f = await failedPublication(t)
-    await sleep(300)
+    // Once the scheduler has served the cancel, no launch can still land; a claim would also count an attempt.
+    const deadline = Date.now() + limit(150000)
+    const idle = () =>
+      [...f.coordinator.runs.values()].every((r) => !r.pump && !r.again && !r.work.size && !r.integration)
+    while (!idle() && Date.now() < deadline) await sleep(20)
+    assert.ok(idle(), 'the scheduler goes idle after the cancel')
     assert.equal(f.workers.size, 2, 'C must not be dispatched after the cancel')
+    assert.equal((await f.coordinator.status(f.query)).tickets[2].attempt, 0, 'C was never claimed')
 
     // Repeating changes nothing while Git still cannot be reconciled.
     const blocked = f.events('run_blocked')
@@ -192,7 +206,7 @@ test(
   },
 )
 
-test('a repeated cancel accounts an intent once Git proves it was published', { timeout: 180000 }, async (t) => {
+test('a repeated cancel accounts an intent once Git proves it was published', { timeout: limit(180000) }, async (t) => {
   const f = await failedPublication(t)
   gitRun(f.main, 'update-ref', f.ref, f.candidate, f.foreign)
   const again = await f.coordinator.cancel(f.query)

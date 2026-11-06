@@ -1,11 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { registerHooks } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
+import { promisify } from 'node:util'
 
 // dag_cancel through the real plugin entry: only the DSH packages and the host
 // services are fixtures. The Coordinator, Git and SQLite are the real ones, and
@@ -34,6 +35,12 @@ hook.deregister()
 
 const gitRun = (cwd, ...argv) =>
   execFileSync('git', argv, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+const exec = promisify(execFile)
+// For worker fixtures: a synchronous child would stall the coordinator under test.
+const gitAsync = async (cwd, ...argv) => (await exec('git', argv, { cwd, encoding: 'utf8' })).stdout.trim()
+// Every Git call and check is a process start, which costs several times more on Windows.
+const timeScale = process.platform === 'win32' ? 3 : 1
+const limit = (ms) => ms * timeScale
 
 function host(cwd) {
   const roster = new Map(),
@@ -91,10 +98,10 @@ function host(cwd) {
         children.set(ticketId, child)
         const result =
           ticketId === 'A'
-            ? allowA.then(() => {
+            ? allowA.then(async () => {
                 writeFileSync(join(spec.request.cwd, 'A.txt'), 'A')
-                gitRun(spec.request.cwd, 'add', 'A.txt')
-                gitRun(
+                await gitAsync(spec.request.cwd, 'add', 'A.txt')
+                await gitAsync(
                   spec.request.cwd,
                   'commit',
                   '-qm',
@@ -137,7 +144,8 @@ function host(cwd) {
 }
 
 async function until(check, label) {
-  for (let i = 0; i < 1500; i++) {
+  const deadline = Date.now() + limit(150000)
+  while (Date.now() < deadline) {
     const value = await check()
     if (value) return value
     await sleep(20)
@@ -145,7 +153,7 @@ async function until(check, label) {
   assert.fail('Timeout: ' + label)
 }
 
-test('dag_cancel stops the host worker and fences its tools although reconciliation fails', { timeout: 180000 }, async (t) => {
+test('dag_cancel stops the host worker and fences its tools although reconciliation fails', { timeout: limit(180000) }, async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'dag-host-cancel-'))
   const main = join(dir, 'project'),
     occupant = join(dir, 'occupant')
@@ -160,7 +168,7 @@ test('dag_cancel stops the host worker and fences its tools although reconciliat
     try {
       await h.close()
     } finally {
-      rmSync(dir, { recursive: true, force: true })
+      rmSync(dir, { recursive: true, force: true, maxRetries: 3 })
     }
   })
   const runId = 'host-cancel'
@@ -212,6 +220,8 @@ test('dag_cancel stops the host worker and fences its tools although reconciliat
   const status = await h.invoke('dag_status', { runId })
   assert.match(status.diagnostic, /Unrecognized target tip/)
   assert.equal(status.pendingPublications.length, 1)
-  await sleep(200)
+  // The plugin hides its scheduler, so this one waits a scaled window; a claim would also count an attempt.
+  await sleep(limit(500))
   assert.equal(h.children.size, 2, 'C must not be dispatched after the cancel')
+  assert.equal((await h.invoke('dag_status', { runId })).tickets[2].attempt, 0, 'C was never claimed')
 })

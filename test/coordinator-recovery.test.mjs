@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -7,6 +7,7 @@ import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { setTimeout as sleep } from 'node:timers/promises'
 import test from 'node:test'
+import { promisify } from 'node:util'
 import { Coordinator } from '../src/coordinator.mjs'
 import * as git from '../src/git.mjs'
 import { RunStore, normalizeManifest } from '../src/store.mjs'
@@ -23,8 +24,38 @@ const original = {
 const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 const gitRun = (cwd, ...argv) =>
   execFileSync('git', argv, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+const exec = promisify(execFile)
+// For worker fixtures: a synchronous child would stall the coordinator under test.
+const gitAsync = async (cwd, ...argv) => (await exec('git', argv, { cwd, encoding: 'utf8' })).stdout.trim()
 const runId = 'recovery',
   parentId = 'original-captain'
+// Every Git call and check is a process start, which costs several times more on Windows.
+const timeScale = process.platform === 'win32' ? 3 : 1
+const limit = (ms) => ms * timeScale
+// One settle was measured at 368s with eight copies of this file running at once.
+async function until(check, label, ms = 240000) {
+  const deadline = Date.now() + limit(ms)
+  while (Date.now() < deadline) {
+    const value = await check()
+    if (value) return value
+    await sleep(40)
+  }
+  throw Error('Timeout: ' + (typeof label === 'function' ? label() : label))
+}
+// A snapshot once the run has reached a verdict. NEEDS_ATTENTION has no way back
+// without a retry, so it fails the run as soon as no other ticket can still change.
+function settledRun(s) {
+  if (s.complete) return s
+  const moving = s.counts.RUNNING || s.counts.SUBMITTED || s.counts.PUBLISHING
+  assert.ok(!s.counts.NEEDS_ATTENTION || moving, JSON.stringify(s))
+  return null
+}
+// Every wake has been served and no job is in flight: whatever this scheduler
+// would have launched for the state it last saw has already been launched.
+const schedulerIdle = (...coordinators) =>
+  coordinators.every((c) =>
+    [...c.runs.values()].every((r) => !r.pump && !r.again && !r.work.size && !r.integration),
+  )
 
 async function fixture(t, { intent = true, published = false, mode = 'active' } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'dag-coordinator-recover-'))
@@ -96,7 +127,7 @@ async function fixture(t, { intent = true, published = false, mode = 'active' } 
     try {
       await coordinator.close()
     } finally {
-      rmSync(dir, { recursive: true, force: true })
+      rmSync(dir, { recursive: true, force: true, maxRetries: 3 })
     }
   })
   return { ref, repo, query, base, source, candidate, lease, evidence, coordinator, dbPath, path }
@@ -149,13 +180,7 @@ test('a lost completion is adopted only after proving the old child is no longer
   assert.equal(f.evidence.launches, 0)
   f.evidence.retired = true
   await f.coordinator.retry({ ...f.query, id: 'A' })
-  let done
-  for (let i = 0; i < 200; i++) {
-    done = await f.coordinator.status(f.query)
-    if (done.complete) break
-    await sleep(20)
-  }
-  assert.ok(done.complete, JSON.stringify(done))
+  const done = await until(async () => settledRun(await f.coordinator.status(f.query)), 'adopted run complete')
   assert.equal(done.tickets[0].sourceSha, f.source)
   assert.equal(done.tickets[0].attempt, 1)
   assert.equal(f.evidence.launches, 0)
@@ -276,10 +301,10 @@ async function multiRunFixture(t) {
         launches.push(job.runId + '/' + job.ticketId)
         return {
           dispose: async () => {},
-          result: new Promise((resolve) => release.push(resolve)).then(() => {
+          result: new Promise((resolve) => release.push(resolve)).then(async () => {
             writeFileSync(join(job.cwd, job.ticketId + '.txt'), job.ticketId)
-            gitRun(job.cwd, 'add', '--', job.ticketId + '.txt')
-            gitRun(
+            await gitAsync(job.cwd, 'add', '--', job.ticketId + '.txt')
+            await gitAsync(
               job.cwd,
               'commit',
               '-qm',
@@ -298,18 +323,16 @@ async function multiRunFixture(t) {
   t.after(async () => {
     for (const go of release) go()
     await Promise.allSettled(open.map((c) => c.close()))
-    rmSync(dir, { recursive: true, force: true })
+    rmSync(dir, { recursive: true, force: true, maxRetries: 3 })
   })
-  const until = async (check, label) => {
-    for (let i = 0; i < 3000; i++) {
+  // Releases whichever workers have launched, so an unexpected one ends and is counted.
+  const advance = (check, label) =>
+    until(async () => {
       const value = await check()
-      if (value) return value
-      for (const go of release.splice(0)) go()
-      await sleep(40)
-    }
-    throw Error('Timeout: ' + label)
-  }
-  return { cwd, ledger, seed, launches, coordinator, until }
+      if (!value) for (const go of release.splice(0)) go()
+      return value
+    }, label)
+  return { cwd, ledger, seed, launches, coordinator, until: advance }
 }
 const failedIds = (scan) => scan.failures.map((f) => f.runId).sort()
 
@@ -363,11 +386,7 @@ test('locked, corrupt and unloadable runs are reported while later runs and othe
 
   // The recoverable runs finish, with later tickets scheduled after the takeover.
   const goodQuery = { cwd: f.cwd, parentId: captain, runId: 'z-good' }
-  const done = await f.until(async () => {
-    const s = await co.status(goodQuery)
-    assert.equal(s.counts.NEEDS_ATTENTION, undefined, JSON.stringify(s))
-    return s.complete && s
-  }, 'z-good complete')
+  const done = await f.until(async () => settledRun(await co.status(goodQuery)), 'z-good complete')
   assert.equal(done.counts.INTEGRATED, 2)
   await f.until(async () => (await theirs.status({ cwd: f.cwd, parentId: other, runId: 'd-other' })).complete, 'd-other')
 
@@ -378,7 +397,7 @@ test('locked, corrupt and unloadable runs are reported while later runs and othe
   const again = await co.attach({ cwd: f.cwd, parentId: captain })
   assert.deepEqual(again.attached.sort(), ['c-broken', 'z-good'])
   assert.deepEqual(failedIds(again), ['a-locked', 'b-corrupt'])
-  await sleep(100)
+  await f.until(() => schedulerIdle(holder, co, theirs), 'every scheduler idle')
   // Each ticket ran exactly once, across every scan, and only in runs that could recover.
   assert.deepEqual(f.launches.sort(), ['d-other/A', 'z-good/A', 'z-good/B'])
 })
@@ -395,13 +414,13 @@ test('concurrent and repeated scans dispatch a recoverable ticket once', async (
     return (await co.status({ ...scope, runId: 'only' })).complete
   }, 'only complete')
   await co.attach(scope)
-  await sleep(100)
+  await f.until(() => schedulerIdle(co), 'the repeated scan served')
   assert.deepEqual(f.launches, ['only/A'])
   // A later process finds nothing left to dispatch either.
   await co.close()
   const next = f.coordinator()
   assert.deepEqual(await next.attach(scope), { attached: ['only'], failures: [] })
-  await sleep(100)
+  await f.until(() => schedulerIdle(next), 'the later scan served')
   assert.deepEqual(f.launches, ['only/A'])
 })
 
@@ -428,8 +447,8 @@ test('a run approved before the review listed unused checks keeps its used comma
       dispose: async () => {},
       result: (async () => {
         writeFileSync(join(job.cwd, job.ticketId + '.txt'), job.ticketId)
-        gitRun(job.cwd, 'add', '--', job.ticketId + '.txt')
-        gitRun(
+        await gitAsync(job.cwd, 'add', '--', job.ticketId + '.txt')
+        await gitAsync(
           job.cwd,
           'commit',
           '-qm',
@@ -442,14 +461,12 @@ test('a run approved before the review listed unused checks keeps its used comma
     }),
   }
   const q = { cwd: main, parentId, runId: 'legacy' }
-  const settled = async (coordinator) => {
-    for (let i = 0; i < 3000; i++) {
-      const s = await coordinator.status(q)
-      assert.equal(s.counts.NEEDS_ATTENTION, undefined, JSON.stringify(s))
-      if (s.complete) return s
-      await sleep(40)
-    }
-    throw Error('run did not settle')
+  const settled = (coordinator) => {
+    let last
+    return until(
+      async () => settledRun((last = await coordinator.status(q))),
+      () => 'run did not settle: ' + JSON.stringify(last),
+    )
   }
   const first = new Coordinator(options)
   let reopened
