@@ -4,7 +4,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { builtinAgents } from './agents.mjs'
 import { Coordinator } from './coordinator.mjs'
-import { RunCatalog, mountApproval, mountDashboard, mountModels } from './dashboard.mjs'
+import { RunCatalog, mountApproval, mountDashboard, mountModels, validateTicketRoutes } from './dashboard.mjs'
 import { importTickets, writeback } from './tracker.mjs'
 
 export const name = 'dsh-ticket-dag'
@@ -286,7 +286,16 @@ export function apply(ctx, config = {}, { importer = importTickets, reporter = w
       ctx.logger.warn('Cannot index this run for the dashboard: ' + String(error).slice(0, 300))
     }
   }
-  const coordinator = new Coordinator({ launch, notify, canRetry, rememberRun, writeback: reporter, ...settings() })
+  const coordinator = new Coordinator({
+    launch,
+    notify,
+    canRetry,
+    rememberRun,
+    writeback: reporter,
+    // Approving a staged plan resolves every effective route before dispatch.
+    validateRoutes: (tickets) => validateTicketRoutes(tickets, () => ctx.get('llm')),
+    ...settings(),
+  })
   ctx.inject?.(['connection'], (scope) => {
     // A ticket without its own model inherits the captain's route, so the board shows it.
     mountDashboard(scope, catalog, coordinator, (parentId) => ctx.agents.get(parentId)?.options)

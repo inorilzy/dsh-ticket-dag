@@ -517,12 +517,17 @@ test(
       await co.pause(q)
       assert.equal((await co.status(q)).mode, 'staged')
       const [file] = co.runs.keys()
-      await assert.rejects(co.approve(file, [{ id: 'A', agent: 'ghost' }]), /unknown agent preset/)
-      await assert.rejects(co.approve(file, [{ id: 'A', agent: 'docs', provider: 'acme' }]), /without a model/)
-      const approved = await co.approve(file, [
-        { id: 'A', agent: 'docs', provider: 'acme', model: 'deep-2', reasoningEffort: 'high' },
-        { id: 'B', agent: 'impl', provider: '', model: '', reasoningEffort: '' },
-      ])
+      const rev = (await co.status(q)).revision
+      await assert.rejects(co.approve(file, [{ id: 'A', agent: 'ghost' }], { revision: rev }), /unknown agent preset/)
+      await assert.rejects(co.approve(file, [{ id: 'A', agent: 'docs', provider: 'acme' }], { revision: rev }), /without a model/)
+      const approved = await co.approve(
+        file,
+        [
+          { id: 'A', agent: 'docs', provider: 'acme', model: 'deep-2', reasoningEffort: 'high' },
+          { id: 'B', agent: 'impl', provider: '', model: '', reasoningEffort: '' },
+        ],
+        { revision: rev },
+      )
       assert.equal(approved.mode, 'active')
       // The captain may resubmit the original manifest: approval is not a manifest change.
       const again = await co.start({ ...q, manifest: plan })
@@ -554,6 +559,77 @@ test(
     } finally {
       await co.close()
       await reopened?.close()
+    }
+  },
+)
+
+test(
+  'approval is bound to the reviewed plan revision; stale, missing, duplicate and unknown selections start nothing',
+  { timeout: limit(90000) },
+  async (t) => {
+    const cwd = await repo(t)
+    const jobs = []
+    const seenRoutes = []
+    const co = new Coordinator({
+      checks: noopChecks,
+      requireApproval: true,
+      agents: { docs: { instructions: 'Docs.', provider: 'acme', model: 'fast-1' } },
+      validateRoutes: async (tickets) => {
+        seenRoutes.push(tickets.map((x) => [x.id, x.agent ?? null]))
+      },
+      launch: async (job) => {
+        jobs.push(job)
+        return {
+          dispose: async () => {},
+          result: (async () => {
+            await commit(job)
+            return { ok: true }
+          })(),
+        }
+      },
+    })
+    const q = { cwd, parentId: 'captain', runId: 'rev' }
+    try {
+      const started = await co.start({
+        ...q,
+        manifest: { spec_id: 'rev', tickets: [{ ...ticket('A'), agent: 'docs' }, ticket('B', ['A'])] },
+      })
+      assert.match(started.revision, /^[0-9a-f]{64}$/)
+      const [file] = co.runs.keys()
+      // A request with no revision is the old-client path: a clear diagnostic, no start.
+      await assert.rejects(co.approve(file, [{ id: 'A', agent: 'docs' }]), /revision|refresh/i)
+      assert.equal((await co.status(q)).mode, 'staged')
+      // A plan appended after review has a new revision; approving the old one is stale.
+      const before = (await co.status(q)).revision
+      const added = await co.add({ ...q, tickets: [{ id: 'C', title: 'C', depends_on: ['B'] }] })
+      assert.notEqual(added.revision, before)
+      await assert.rejects(co.approve(file, [{ id: 'A', agent: 'docs' }], { revision: before }), /plan changed/i)
+      assert.equal((await co.status(q)).mode, 'staged')
+      // Duplicate or unknown ticket IDs are malformed requests, refused before dispatch.
+      await assert.rejects(
+        co.approve(file, [{ id: 'A', agent: 'docs' }, { id: 'A', agent: 'docs' }], { revision: added.revision }),
+        /Duplicate ticket ID/,
+      )
+      await assert.rejects(co.approve(file, [{ id: 'Z' }], { revision: added.revision }), /Unknown ticket ID/)
+      assert.equal(jobs.length, 0, 'nothing was dispatched by the refused approvals')
+      // A current revision resolves every effective route before dispatch, and
+      // only one of two concurrent approvals of the same plan can win.
+      const racers = await Promise.allSettled([
+        co.approve(file, [{ id: 'A', agent: 'docs' }], { revision: added.revision }),
+        co.approve(file, [{ id: 'A', agent: 'docs' }], { revision: added.revision }),
+      ])
+      assert.equal(racers.filter((r) => r.status === 'fulfilled').length, 1, 'one concurrent approval wins')
+      assert.match(String(racers.find((r) => r.status === 'rejected')?.reason), /not waiting for approval/)
+      const approved = racers.find((r) => r.status === 'fulfilled').value
+      assert.equal(approved.mode, 'active')
+      assert.deepEqual(seenRoutes.at(-1), [
+        ['A', 'docs'],
+        ['B', null],
+        ['C', null],
+      ])
+      await until(async () => (await co.status(q)).complete, 'the approved plan integrates')
+    } finally {
+      await co.close()
     }
   },
 )
@@ -603,7 +679,7 @@ test(
       assert.equal(held.tickets[0].status, 'PENDING')
       await assert.rejects(co.resume(q), /approv/)
       // The user can still approve the plan from the board.
-      const approved = await co.approve(file, [{ id: 'A' }], { maxWorkers: 1 })
+      const approved = await co.approve(file, [{ id: 'A' }], { maxWorkers: 1, revision: after.revision })
       assert.equal(approved.maxWorkers, 1, 'the user concurrency applies to the run')
       await until(async () => (await co.status(q)).complete, 'approved run integrates', 30000)
       assert.equal(jobs.length, 1)
@@ -682,11 +758,13 @@ test(
     })
     const q = { cwd, parentId: 'captain', runId: 'deleted-preset' }
     try {
-      await co.start({ ...q, manifest: { spec_id: 'deleted', tickets: [{ ...ticket('A'), agent: 'docs' }] } })
+      const started = await co.start({ ...q, manifest: { spec_id: 'deleted', tickets: [{ ...ticket('A'), agent: 'docs' }] } })
       co.updateSettings({ checks: noopChecks, maxWorkers: 16, checkTimeoutMs: 20000, agents: {} })
       const [file] = co.runs.keys()
-      await assert.rejects(co.approve(file, [{ id: 'A', agent: 'ghost' }]), /unknown agent preset/)
-      const approved = await co.approve(file, [{ id: 'A', agent: 'docs', provider: 'acme', model: 'fast-1' }])
+      await assert.rejects(co.approve(file, [{ id: 'A', agent: 'ghost' }], { revision: started.revision }), /unknown agent preset/)
+      const approved = await co.approve(file, [{ id: 'A', agent: 'docs', provider: 'acme', model: 'fast-1' }], {
+        revision: started.revision,
+      })
       assert.equal(approved.mode, 'active')
       await until(async () => (await co.status(q)).complete, 'approved run integrates', 30000)
       assert.match(jobs[0].prompt, /Role \(docs\): Docs only\./)
@@ -1238,7 +1316,10 @@ test(
     try {
       await co.start({ ...q, manifest: plan })
       const [file] = co.runs.keys()
-      await co.approve(file, [{ id: 'A', agent: 'docs', provider: 'acme', model: 'deep-2', reasoningEffort: 'high' }])
+      const rev = (await co.status(q)).revision
+      await co.approve(file, [{ id: 'A', agent: 'docs', provider: 'acme', model: 'deep-2', reasoningEffort: 'high' }], {
+        revision: rev,
+      })
       await assert.rejects(co.add({ ...q, tickets: [{ ...ticket('X'), verify: ['nope'] }] }), /unknown verification/)
       await assert.rejects(co.add({ ...q, tickets: [ticket('X', ['Y']), ticket('Y', ['X'])] }), /cycle/)
       const batch = [
@@ -1315,7 +1396,7 @@ test('tickets appended to a staged run wait for the user and are approved with t
     assert.equal(jobs.length, 0)
     assert.equal((await co.status(q)).diagnostic, null)
     const [file] = co.runs.keys()
-    await co.approve(file, [{ id: 'A' }, { id: 'B', agent: 'docs', model: 'deep-2' }])
+    await co.approve(file, [{ id: 'A' }, { id: 'B', agent: 'docs', model: 'deep-2' }], { revision: added.revision })
     await until(async () => (await co.status(q)).complete, 'approved plan with appended ticket integrates', 30000)
     assert.deepEqual(jobs.find((j) => j.ticketId === 'B').agentOptions, { model: 'deep-2' })
     await co.cancel(q)
@@ -1651,7 +1732,7 @@ test('checks the captain writes into the manifest wait for approval even without
     )
     await co.add({ ...q, tickets: [{ id: 'B', title: 'B', depends_on: ['A'], verify: ['own-test'] }] })
     const [file] = co.runs.keys()
-    await co.approve(file, [])
+    await co.approve(file, [], { revision: (await co.status(q)).revision })
     const done = await until(async () => {
       const s = await co.status(q)
       if (s.counts.NEEDS_ATTENTION) throw Error(JSON.stringify(s))
@@ -1801,7 +1882,7 @@ test(
       assert.deepEqual(selected.checks, checks, 'the unused command is listed with its exact argv')
       assert.deepEqual(selected.planChecks, ['used', 'later'])
       assert.deepEqual(selected.tickets[0].verify, ['used'])
-      assert.equal((await post({ key: selected.key, action: 'approve', choices: [] })).status, 200)
+      assert.equal((await post({ key: selected.key, action: 'approve', revision: selected.revision, choices: [] })).status, 200)
       await settled(co, 'A integrated')
       assert.equal(await readFile(laterRan, 'utf8').catch(() => null), null, 'an unused command does not run')
 

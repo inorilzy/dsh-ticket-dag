@@ -30,7 +30,7 @@ const loadBoard = (seeds) => loadHost(seeds).slots['sidebar.right.pane.tab'].com
 // present. Effects run immediately and fetch only records the URL it was asked for.
 // respond(url) may answer a GET; by default reads never settle. Timers are
 // recorded, not run, so a test fires each scheduled poll itself.
-function loadHost(seeds, { expanded = false, config = { status: 'loading' }, respond, document } = {}) {
+function loadHost(seeds, { expanded = false, config = { status: 'loading' }, respond, postRespond, document } = {}) {
   let definition
   const source = readFileSync(resolve(import.meta.dirname, '..', 'src', 'client.js'), 'utf8')
   const urls = []
@@ -43,8 +43,10 @@ function loadHost(seeds, { expanded = false, config = { status: 'loading' }, res
     fetch: (url, init) => {
       urls.push(url)
       if (init?.method === 'POST') {
-        posts.push([url, JSON.parse(init.body)])
+        const body = JSON.parse(init.body)
+        posts.push([url, body])
         postHeaders.push(init.headers)
+        return postRespond ? postRespond(url, body) : new Promise(() => {})
       }
       return respond && init?.method !== 'POST' ? respond(url) : new Promise(() => {})
     },
@@ -769,6 +771,7 @@ function reviewRun() {
     parentId: 'session-captain',
     mode: 'staged',
     attached: true,
+    revision: 'r'.repeat(64),
     total: 5,
     counts: { PENDING: 5 },
     captain: { provider: 'magpie', model: 'auto/claude-opus-5-5' },
@@ -906,6 +909,7 @@ test('plan review: named members with their tasks and model, compact task list, 
       {
         key: selected.key,
         action: 'approve',
+        revision: selected.revision,
         choices: [
           { id: 'A', ...impl },
           { id: 'C', ...impl },
@@ -930,6 +934,7 @@ function stagedRun(tickets) {
     parentId: 'session-captain',
     mode: 'staged',
     attached: true,
+    revision: 'r'.repeat(64),
     total: tickets.length,
     counts: { PENDING: tickets.length },
     captain: { provider: 'magpie', model: 'auto/claude-opus-5-5' },
@@ -962,6 +967,71 @@ test('plan review shows the run concurrency and lets the user change it before a
   // Unchanged, the approval carries no concurrency of its own.
   find(review, (n) => n.type === 'button' && text(n) === '确认并启动').props.onClick()
   assert.equal(Object.hasOwn(host.posts[0][1], 'maxWorkers'), false)
+})
+
+test('plan review turns a 409 into a refreshed plan and asks for a fresh confirmation', async () => {
+  const selected = reviewRun()
+  const view = { runs: [{ ...selected }], selected }
+  const host = loadHost([{ runs: [selected], selected }, selected.key], {
+    respond: async () => ({ ok: true, status: 200, json: async () => view }),
+    postRespond: async () => ({ ok: false, status: 409, text: async () => 'The plan changed after you reviewed it' }),
+  })
+  const flush = () => new Promise((resolve) => setImmediate(resolve))
+  const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  await flush()
+  const readsBefore = host.urls.length
+  const review = find(pane, (n) => n.props['data-dag-review'] !== undefined)
+  find(review, (n) => n.type === 'button' && text(n) === '确认并启动').props.onClick()
+  await flush()
+  await flush()
+  const notice = host.sets.find((v) => typeof v === 'string' && /计划已更新/.test(v))
+  assert.ok(notice, 'the user is told the plan changed')
+  assert.match(notice, /再次确认/)
+  assert.ok(host.urls.length > readsBefore, 'the review re-reads the plan after the 409')
+  assert.equal(host.posts[0][1].revision, selected.revision, 'the approval echoed the revision it showed')
+})
+
+test('plan review keeps the edits that still apply when a ticket is appended', () => {
+  // The user has already changed concurrency and a member route before an
+  // appended ticket arrives; after the refresh the plan shows the new ticket
+  // and the earlier edits still apply.
+  const selected = { ...reviewRun(), maxWorkers: 4 }
+  selected.tickets = [
+    ...selected.tickets,
+    { id: 'E', title: '补丁', status: 'PENDING', dependsOn: [], attempt: 0, agent: 'docs', route: { provider: '', model: '', reasoningEffort: '' } },
+  ]
+  selected.total = 6
+  selected.counts = { PENDING: 6 }
+  const seeds = [
+    { runs: [selected], selected },
+    selected.key,
+    // Dashboard: error, lastRead
+    '',
+    null,
+    // PlanReview: owners, routes, catalog, busy, error, confirmDiscard,
+    // checked, expanded, bulk, hovered, workers
+    { D: 'implementer' },
+    null,
+    null,
+    false,
+    '',
+    false,
+    new Set(),
+    null,
+    null,
+    null,
+    '8',
+  ]
+  const host = loadHost(seeds, { respond: async () => ({ ok: true, status: 200, json: async () => ({ runs: [selected], selected }) }) })
+  const pane = host.renderSlot('sidebar.right.pane.tab', { sessionId: 'session-captain' })
+  const review = find(pane, (n) => n.props['data-dag-review'] !== undefined)
+  const tasks = findAll(review, (n) => n.props['data-dag-task'] !== undefined)
+  assert.deepEqual(tasks.map((t) => t.props['data-dag-task']), ['A', 'C', 'T', 'B', 'D', 'E'])
+  // The appended ticket keeps its planned owner rather than becoming undefined.
+  assert.match(text(tasks[5]), /文档员/)
+  // The edit the user made (D -> implementer) survived the refresh.
+  assert.match(text(tasks[4]), /实现者/)
+  assert.equal(find(review, (n) => n.props['aria-label'] === '同时运行工单数').props.value, '8')
 })
 
 test('built-in presets saved without a display name still show their Chinese name', () => {

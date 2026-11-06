@@ -423,6 +423,67 @@ test('a staged run can be discarded, and approval must name exactly the run tick
   }
 })
 
+test('the plan revision is opaque and changes with the plan and its frozen commands', (t) => {
+  const file = tempDb(t)
+  const db = new RunStore(file)
+  try {
+    const spec = manifest([ticket('A')])
+    db.init({
+      runId: 'run-1',
+      repo: { root: '/work', commonDir: '/work/.git' },
+      ref: 'refs/heads/integration/run-1',
+      baseSha: 'start',
+      parentId: 'parent',
+      policyHash: 'checks-hash',
+      manifest: spec,
+      mode: 'staged',
+    })
+    const first = db.revision()
+    assert.match(first, /^[0-9a-f]{64}$/)
+    assert.equal(first, db.revision(), 'stable while nothing changes')
+    // Appending a ticket changes the version a review would show.
+    const batch = normalizeAppend([{ id: 'B', title: 'B', depends_on: ['A'], verify: ['unit'] }], checks)
+    assert.equal(db.append(batch, { policyHash: 'p' }).added, true)
+    const afterAppend = db.revision()
+    assert.notEqual(afterAppend, first)
+    // Repeating the identical batch is idempotent and leaves the version alone.
+    assert.equal(db.append(batch, { policyHash: 'p' }).added, false)
+    assert.equal(db.revision(), afterAppend)
+  } finally {
+    db.close()
+  }
+  // The frozen command registry is part of what the user approves, so a plan
+  // with an extra captain-written command has a different revision.
+  const plain = new RunStore(file + '-plain')
+  const extra = new RunStore(file + '-extra')
+  try {
+    plain.init({
+      runId: 'run-1',
+      repo: { root: '/work', commonDir: '/work/.git' },
+      ref: 'refs/heads/integration/run-1',
+      baseSha: 'start',
+      parentId: 'parent',
+      policyHash: 'checks-hash',
+      manifest: manifest([ticket('A')]),
+      mode: 'staged',
+    })
+    extra.init({
+      runId: 'run-1',
+      repo: { root: '/work', commonDir: '/work/.git' },
+      ref: 'refs/heads/integration/run-1',
+      baseSha: 'start',
+      parentId: 'parent',
+      policyHash: 'checks-hash',
+      manifest: manifest([ticket('A')], { checks: { extra: [['node', '--test']] } }),
+      mode: 'staged',
+    })
+    assert.notEqual(extra.revision(), plain.revision())
+  } finally {
+    plain.close()
+    extra.close()
+  }
+})
+
 test('pause stops dispatch; cancellation preserves running and potentially published tickets', (t) => {
   const db = new RunStore(tempDb(t))
   try {

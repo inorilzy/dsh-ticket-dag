@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, statSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { planRevision } from './store.mjs'
 
 const route = '/api/ticket-dag.dashboard'
 const noStore = { 'cache-control': 'no-store' }
@@ -263,6 +264,8 @@ export class RunCatalog {
           // Every approved or reviewable command; the plan review shows them for approval.
           checks: data.checks ?? {},
           planChecks: data.planChecks ?? [],
+          // The opaque plan version the review shows and approval must echo back.
+          revision: data.revision ?? null,
           tickets: data.tickets.map((t) => ({
             id: t.id,
             title: t.title,
@@ -333,9 +336,10 @@ export function readLedger(file, entry, detail, globalLimit) {
         ? 'cleanup,cleanupReason'
         : 'NULL AS cleanup,NULL AS cleanupReason'
       // A ledger from before dag_add has no appended table: nothing was appended.
-      const appended = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='appended'").get()
-        ? new Map(db.prepare('SELECT ticketId,createdAt FROM appended').all().map((r) => [r.ticketId, r.createdAt]))
-        : new Map()
+      const appendedRows = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='appended'").get()
+        ? db.prepare('SELECT ticketId,batch,definition,policyHash,createdAt FROM appended ORDER BY batch,rowid').all()
+        : []
+      const appended = new Map(appendedRows.map((r) => [r.ticketId, r.createdAt]))
       result.tickets = db
         .prepare(
           `SELECT id,json_extract(definition,'$.title') AS title,
@@ -357,9 +361,25 @@ export function readLedger(file, entry, detail, globalLimit) {
         }))
       // A plan waiting for approval shows the captain's commands even before its captain reopens.
       if (run.mode === 'staged') {
-        const { checks } = db.prepare("SELECT json_extract(manifest,'$.checks') AS checks FROM run").get()
-        result.checks = checks ? JSON.parse(checks) : {}
-        result.planChecks = Object.keys(result.checks)
+        const stored = db
+          .prepare(
+            'SELECT runId,repo,ref,baseSha,manifest,parentId,policyHash,mode FROM run WHERE singleton=1',
+          )
+          .get()
+        const checks = JSON.parse(stored.manifest).checks ?? {}
+        result.checks = checks
+        result.planChecks = Object.keys(checks)
+        // The same revision RunStore.revision() computes, built from raw rows so
+        // a plan read without the coordinator still carries the exact version.
+        result.revision = planRevision({
+          run: stored,
+          tickets: db.prepare('SELECT id,position,definition FROM tickets ORDER BY position').all(),
+          dependencies: db
+            .prepare('SELECT ticketId,upstream FROM dependencies ORDER BY ticketId,upstream')
+            .all(),
+          appended: appendedRows,
+          approvals: db.prepare("SELECT details FROM events WHERE type='run_approved' ORDER BY rowid").all(),
+        })
       }
     }
     return result
@@ -471,6 +491,38 @@ async function checkChoices(choices, getLlm) {
   }
 }
 
+// Validate the routes a staged plan will actually dispatch, not only the ones a
+// user typed: a ticket that keeps its planned preset still inherits that
+// preset's provider/model/effort. The coordinator calls this inside its serial
+// region so every effective route resolves before any worker starts.
+export async function validateTicketRoutes(tickets, getLlm) {
+  let models
+  for (const ticket of tickets) {
+    const spec = ticket?.agentSpec ?? {}
+    const provider = String(spec.provider ?? '').trim()
+    const model = String(spec.model ?? '').trim()
+    const effort = String(spec.reasoningEffort ?? '').trim()
+    if (!model) {
+      if (provider || effort) throw new ChoiceError(ticket.id + ' sets a provider or reasoning effort without a model')
+      continue
+    }
+    models ??= await modelCatalog(getLlm?.())
+    const listed = models.providers.filter((p) => !provider || p.id === provider)
+    const found = listed.flatMap((p) => p.models).find((m) => m.id === model)
+    if (!found) {
+      if (!models.providers.length || (provider ? models.failures.includes(provider) : models.failures.length))
+        throw new ChoiceError('模型目录暂不可用，无法校验 ' + model + '。请稍后重试。', 503)
+      throw new ChoiceError(
+        provider && !listed.length
+          ? 'Unknown provider: ' + provider
+          : 'Unknown model: ' + [provider, model].filter(Boolean).join('/'),
+      )
+    }
+    if (effort && !found.efforts.some((e) => e.id === effort))
+      throw new ChoiceError('Model ' + model + ' does not support reasoning effort ' + effort)
+  }
+}
+
 // The user's decision on a staged plan. Like the dashboard read, the managed
 // dispatcher admits only the owner; the body names the run by its opaque key.
 export function mountApproval(ctx, catalog, coordinator, getLlm = () => undefined) {
@@ -489,13 +541,16 @@ export function mountApproval(ctx, catalog, coordinator, getLlm = () => undefine
       } catch {
         return new Response('Invalid approval request', { status: 400, headers: noStore })
       }
-      const { key, action, choices, maxWorkers } = body ?? {}
+      const { key, action, choices, maxWorkers, revision } = body ?? {}
       if (
         typeof key !== 'string' ||
         !/^[0-9a-f]{64}$/.test(key) ||
         !['approve', 'discard'].includes(action) ||
         (action === 'approve' && !Array.isArray(choices)) ||
-        (maxWorkers !== undefined && (!Number.isInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 32))
+        (maxWorkers !== undefined && (!Number.isInteger(maxWorkers) || maxWorkers < 1 || maxWorkers > 32)) ||
+        // An old client sends no revision; the coordinator answers with a
+        // refresh/upgrade diagnostic. A non-string or oversized one is malformed.
+        (revision !== undefined && (typeof revision !== 'string' || revision.length > 512))
       ) {
         return new Response('Invalid approval request', { status: 400, headers: noStore })
       }
@@ -515,11 +570,17 @@ export function mountApproval(ctx, catalog, coordinator, getLlm = () => undefine
       try {
         const snapshot =
           action === 'approve'
-            ? await coordinator.approve(entry.file, choices, maxWorkers === undefined ? {} : { maxWorkers })
+            ? await coordinator.approve(entry.file, choices, {
+                ...(maxWorkers !== undefined && { maxWorkers }),
+                ...(revision !== undefined && { revision }),
+              })
             : await coordinator.discard(entry.file)
         return Response.json(snapshot, { headers: noStore })
       } catch (error) {
-        return new Response(displayDiagnostic(error?.message) || 'Approval failed', { status: 409, headers: noStore })
+        return new Response(displayDiagnostic(error?.message) || 'Approval failed', {
+          status: error?.status ?? 409,
+          headers: noStore,
+        })
       }
     },
   })

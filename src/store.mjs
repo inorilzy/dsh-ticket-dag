@@ -1,6 +1,32 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+
+/**
+ * The opaque revision the plan review carries for a staged run. It covers every
+ * ledger field that decides what the user is approving: each ticket definition
+ * (preset and model route included), the dependency edges, the dag_add batches
+ * and their frozen commands, the submission (manifest, which holds the command
+ * registry) and the approval records. A stale approval names an older revision.
+ *
+ * Both the live coordinator (RunStore.revision) and the read-only dashboard
+ * (readLedger) build the same digest from raw ledger rows so a refresh shows the
+ * exact revision the coordinator checks in its serial region.
+ */
+export function planRevision({ run, tickets, dependencies, appended, approvals }) {
+  return createHash('sha256')
+    .update(
+      JSON.stringify([
+        run.mode,
+        [run.runId, run.repo, run.ref, run.baseSha, run.parentId, run.policyHash, run.manifest],
+        tickets.map((t) => [t.id, t.position, t.definition]),
+        dependencies.map((d) => [d.ticketId, d.upstream]),
+        appended.map((a) => [a.ticketId, a.batch, a.definition, a.policyHash, a.createdAt]),
+        approvals.map((a) => a.details),
+      ]),
+    )
+    .digest('hex')
+}
 
 const STATUSES = [
   'PENDING',
@@ -644,6 +670,16 @@ export class RunStore {
         .all(),
       approvals: this.#approvals(),
     }
+  }
+
+  /**
+   * The opaque plan revision a staged plan is approved against. It is derived
+   * from integrity(), so any change that would alter what runs or how it is
+   * accepted (an appended ticket, a frozen command, an approval record) makes
+   * an earlier snapshot's revision stale.
+   */
+  revision() {
+    return planRevision(this.integrity())
   }
 
   get(id) {

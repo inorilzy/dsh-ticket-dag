@@ -120,10 +120,15 @@ test('a cold plan under review still lists its manifest commands; other cold run
     assert.equal(review.attached, false)
     assert.deepEqual(review.checks, checks)
     assert.deepEqual(review.planChecks, ['later'])
+    // A staged plan read without the coordinator still carries the same opaque
+    // revision the coordinator's serial region will compare against.
+    assert.match(review.revision, /^[0-9a-f]{64}$/)
+    assert.equal(review.revision, db.revision())
     db.setMode('cancelled')
     const ended = catalog.read(cold, null).selected
     assert.deepEqual(ended.checks, {})
     assert.deepEqual(ended.planChecks, [])
+    assert.equal(ended.revision, null)
   } finally {
     db.close()
   }
@@ -320,6 +325,45 @@ test('approval route approves or discards only an attached staged run named by i
   const refused = await post({ key, action: 'approve', choices })
   assert.equal(refused.status, 409)
   assert.match(await refused.text(), /not waiting for approval/)
+})
+
+test('approval forwards the plan revision and refuses a malformed one before the coordinator', async () => {
+  let route
+  const calls = []
+  const key = 'b'.repeat(64)
+  const catalog = { entries: () => [{ key, file: '/runs/a/state.sqlite' }] }
+  const coordinator = {
+    runs: new Map([['/runs/a/state.sqlite', {}]]),
+    async approve(file, choices, options) {
+      calls.push(['approve', options])
+      return { mode: 'active' }
+    },
+  }
+  mountApproval({ connection: { fetch: { register: (r) => (route = r) } } }, catalog, coordinator, () => llm)
+  const post = (body) =>
+    route.fetch(
+      new Request('http://localhost' + route.path, {
+        method: 'POST',
+        headers: approvalHeaders,
+        body: JSON.stringify({ key, ...body }),
+      }),
+    )
+  const choices = [{ id: 'A', agent: 'docs', provider: 'acme', model: 'fast-1', reasoningEffort: '' }]
+  const revision = 'r'.repeat(64)
+  assert.equal((await post({ action: 'approve', choices, revision })).status, 200)
+  assert.deepEqual(calls.at(-1), ['approve', { revision }])
+  assert.equal((await post({ action: 'approve', choices, revision: 7 })).status, 400)
+  assert.equal((await post({ action: 'approve', choices, revision: 'x'.repeat(513) })).status, 400)
+  assert.equal(calls.length, 1, 'a malformed revision never reaches the coordinator')
+  // A stale revision surfaces the coordinator's diagnostic as a 409 to refresh.
+  coordinator.approve = async () => {
+    const error = new Error('The plan changed after you reviewed it')
+    error.status = 409
+    throw error
+  }
+  const stale = await post({ action: 'approve', choices, revision })
+  assert.equal(stale.status, 409)
+  assert.match(await stale.text(), /plan changed/)
 })
 
 test('model catalog route lists every provider, its models and efforts, and reports a failing provider', async () => {

@@ -223,6 +223,7 @@ export class Coordinator {
     maxConflictRetries = 2,
     trackerWriteback = 'off',
     reviewOnComplete = false,
+    validateRoutes,
     writeback,
   } = {}) {
     requireValue(typeof launch === 'function', 'A subagent launch adapter is required')
@@ -247,6 +248,7 @@ export class Coordinator {
       maxConflictRetries,
       trackerWriteback,
       reviewOnComplete,
+      validateRoutes,
       writeback,
     })
     this.runs = new Map()
@@ -641,6 +643,9 @@ export class Coordinator {
       complete: tickets.every((t) => t.status === 'INTEGRATED'),
       integrationRef: m.ref,
       verifiedSha: m.tipSha,
+      // The opaque version of the plan the review is showing. Sending it back
+      // with approval lets the serial region refuse an approval of an older plan.
+      revision: run.db.revision(),
       maxWorkers: Math.min(this.maxWorkers, run.limit),
       counts,
       cleanup: {
@@ -954,12 +959,17 @@ export class Coordinator {
    * tickets without a choice keep their planned preset. Presets resolve from
    * the current settings, except a planned preset since removed from them,
    * which keeps the copy frozen at dag_run; the result is frozen into the run.
+   * The approval must name the revision of the plan the user saw: a missing or
+   * stale revision is refused before anything is dispatched, so a plan that
+   * changed after review (an appended ticket, a concurrent approval) can only
+   * start after the user refreshes and confirms the current plan again.
    * @param file - the run ledger the board selected.
    * @param choices - per-ticket selections.
    * @param options.maxWorkers - the user's concurrency for this run, replacing the manifest's.
+   * @param options.revision - the opaque plan revision the board showed the user.
    * @returns the run snapshot after approval.
    */
-  async approve(file, choices, { maxWorkers } = {}) {
+  async approve(file, choices, { maxWorkers, revision } = {}) {
     const run = this.runs.get(file)
     requireValue(run, 'Open the captain conversation of this run first')
     await serial(run, async () => {
@@ -967,7 +977,33 @@ export class Coordinator {
       requireValue(m.mode === 'staged', 'This run is not waiting for approval')
       requireValue(Array.isArray(choices), 'choices must be an array')
       this._checkLedger(run)
-      const byId = new Map(choices.map((c) => [c?.id, c]))
+      // The plan changes whenever a ticket is appended or a frozen command and
+      // its approval record change. Refuse a request that names any other plan.
+      requireValue(
+        typeof revision === 'string' && revision.length > 0,
+        'This approval did not include the revision of the plan you reviewed. ' +
+          'Refresh the plan and confirm again; if you are on an older client, upgrade before approving a staged plan.',
+      )
+      requireValue(
+        revision === run.db.revision(),
+        'The plan changed after you reviewed it (a ticket was appended or the approved checks changed). ' +
+          'Refresh the plan and confirm the current version again.',
+      )
+      // A choice may only name a ticket of the plan, once each. Unknown or
+      // duplicate IDs are a malformed request, not a grant to start anything.
+      const planIds = new Set(run.db.plan().map((t) => t.id))
+      const named = new Set()
+      for (const c of choices) {
+        requireValue(
+          c !== null && typeof c === 'object' && !Array.isArray(c),
+          'Each approval choice must be an object',
+        )
+        requireValue(typeof c.id === 'string' && c.id.length > 0, 'Each approval choice must name a ticket ID')
+        requireValue(!named.has(c.id), 'Duplicate ticket ID in approval: ' + c.id)
+        requireValue(planIds.has(c.id), 'Unknown ticket ID in approval: ' + c.id)
+        named.add(c.id)
+      }
+      const byId = new Map(choices.map((c) => [c.id, c]))
       const tickets = run.db.plan().map((t) => {
         const c = byId.get(t.id)
         if (!c) return t
@@ -994,6 +1030,9 @@ export class Coordinator {
           ...(Object.keys(spec).length && { agentSpec: spec }),
         }
       })
+      // Every actually-effective route (including a preset the user kept) must
+      // resolve before any worker starts. The host injects the catalog check.
+      if (this.validateRoutes) await this.validateRoutes(tickets)
       requireValue(run.db.approve(tickets, { maxWorkers }), 'This run is not waiting for approval')
       run.limit = run.db.workerLimit()
       const after = ledgerDigest(run.db)
