@@ -355,15 +355,20 @@ test('approval forwards the plan revision and refuses a malformed one before the
   assert.equal((await post({ action: 'approve', choices, revision: 7 })).status, 400)
   assert.equal((await post({ action: 'approve', choices, revision: 'x'.repeat(513) })).status, 400)
   assert.equal(calls.length, 1, 'a malformed revision never reaches the coordinator')
-  // A stale revision surfaces the coordinator's diagnostic as a 409 to refresh.
+  // A stale revision surfaces the coordinator's diagnostic as a coded 409 so
+  // the board can tell "review the new plan again" from any other refusal.
   coordinator.approve = async () => {
     const error = new Error('The plan changed after you reviewed it')
     error.status = 409
+    error.code = 'stale-revision'
     throw error
   }
   const stale = await post({ action: 'approve', choices, revision })
   assert.equal(stale.status, 409)
-  assert.match(await stale.text(), /plan changed/)
+  assert.deepEqual(await stale.json(), {
+    code: 'stale-revision',
+    message: 'The plan changed after you reviewed it',
+  })
 })
 
 test('model catalog route lists every provider, its models and efforts, and reports a failing provider', async () => {

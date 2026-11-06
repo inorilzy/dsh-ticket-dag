@@ -1776,6 +1776,12 @@ window.__ModuleLoader__.load({
       const [hovered, setHovered] = useState(null)
       // The user's concurrency for this run, as typed; null keeps the plan's.
       const [workers, setWorkers] = useState(null)
+      // The plan version the user started reviewing, and the ticket IDs it held.
+      // Approval must echo this pinned revision, not whatever the 2-second poll
+      // has since replaced it with; a poll that brings a new revision only
+      // enables approval again after the user reconfirms the current plan.
+      const [pinnedRevision, setPinnedRevision] = useState(run.revision)
+      const [pinnedIds, setPinnedIds] = useState(() => run.tickets.map((t) => t.id))
       useEffect(() => {
         const ctrl = new AbortController()
         fetch('api/ticket-dag.models', { signal: ctrl.signal, cache: 'no-store' })
@@ -1822,6 +1828,25 @@ window.__ModuleLoader__.load({
       }))
       const unchecked = run.tickets.filter((t) => !(t.verify ?? []).length).map((t) => t.id)
       const changed = owners !== null || routes !== null
+      // A poll replaced the plan under review. Name the ticket difference when
+      // it is cheap to compute; a change from preset or check edits has none.
+      const planChanged = pinnedRevision !== run.revision
+      const currentIds = run.tickets.map((t) => t.id)
+      const addedIds = currentIds.filter((id) => !pinnedIds.includes(id))
+      const removedIds = pinnedIds.filter((id) => !currentIds.includes(id))
+      const planChangeSummary = [
+        addedIds.length && '新增工单 ' + addedIds.join('、'),
+        removedIds.length && '移除工单 ' + removedIds.join('、'),
+      ]
+        .filter(Boolean)
+        .join('；')
+      // Keep the owner/model edits keyed by ticket and member, so an appended
+      // ticket picks up its planned owner and every existing edit survives.
+      const reconfirm = () => {
+        setPinnedRevision(run.revision)
+        setPinnedIds(currentIds)
+        setError('')
+      }
       const allChecked = memberIds.length > 0 && memberIds.every((id) => checked.has(id))
       const toggle = (id) =>
         setChecked((old) => {
@@ -1868,11 +1893,21 @@ window.__ModuleLoader__.load({
             body: JSON.stringify({ key: run.key, ...body }),
           })
           if (!response.ok) {
-            const detail = ((await response.text()) || '').trim()
-            // The plan changed after review (an appended ticket, a concurrent
-            // approval) or this client sent no revision. Keep the user's edits,
-            // show the current plan and require a fresh confirmation.
-            if (response.status === 409 && body.action === 'approve') {
+            const raw = ((await response.text()) || '').trim()
+            // The host marks the one refusal that means "the plan you reviewed
+            // is stale" with a code; every other failure keeps its own message.
+            let payload = null
+            try {
+              payload = raw ? JSON.parse(raw) : null
+            } catch {
+              payload = null
+            }
+            const detail = (payload && typeof payload === 'object' ? String(payload.message ?? '') : raw).trim()
+            const code = payload && typeof payload === 'object' ? payload.code : undefined
+            // Only a stale plan revision means "refresh and review the current
+            // plan again". Keep the user's edits, show the current plan and
+            // require a fresh confirmation before approval can send.
+            if (response.status === 409 && body.action === 'approve' && code === 'stale-revision') {
               setError(
                 '计划已更新，正在为你刷新。请核对最新的工单、验收命令与模型后再次确认。' +
                   (detail ? ' ' + detail : ''),
@@ -1899,14 +1934,18 @@ window.__ModuleLoader__.load({
         }
         send({
           action: 'approve',
-          // Echo the exact plan version this review shows; the host refuses a
-          // different one with a 409 so nothing unseen is started.
-          revision: run.revision,
+          // Echo the plan version the user started reviewing, not the latest
+          // polled one; the host refuses a different version with a 409 so
+          // nothing unseen is started.
+          revision: pinnedRevision,
           choices: run.tickets.map((t) => ({ id: t.id, agent: currentOwners[t.id], ...routeOf(currentOwners[t.id]) })),
           ...(currentWorkers !== plannedWorkers && { maxWorkers: n }),
         })
       }
+      // A changed plan disables approval until the user reconfirms; discard
+      // still uses the plain busy/attachment guard.
       const blocked = busy || run.attached === false
+      const approveBlocked = blocked || planChanged
       return h(
         'section',
         { className: 'dtd-section dtd-review', 'data-dag-review': '', 'aria-label': '执行前计划审查' },
@@ -1926,6 +1965,24 @@ window.__ModuleLoader__.load({
             memberIds.length + ' 名成员 · ' + run.tickets.length + ' 项任务 · ' + edges + ' 条依赖 · 最多同时 ' + currentWorkers + ' 个',
           ),
         ),
+        planChanged &&
+          h(
+            'section',
+            { className: 'dtd-block dtd-plan-changed', 'data-dag-plan-changed': '', role: 'alert' },
+            h('h4', null, '计划已更新'),
+            h(
+              'p',
+              { className: 'dtd-hint' },
+              '你正在审查的计划在打开后发生了变化' +
+                (planChangeSummary ? '（' + planChangeSummary + '）' : '') +
+                '。你已修改的模型与负责人仍然保留；请核对最新的工单、验收命令与模型，然后确认这份最新计划。',
+            ),
+            h(
+              'div',
+              { className: 'dtd-actions' },
+              button('确认最新计划', reconfirm, { className: 'dtd-primary', disabled: busy }),
+            ),
+          ),
         h(
           'section',
           { className: 'dtd-block', 'aria-label': '并行' },
@@ -2137,7 +2194,7 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'dtd-actionbar', 'data-dag-actions': '' },
-          h('button', { type: 'button', className: 'dtd-primary', disabled: blocked, onClick: approve }, '确认并启动'),
+          h('button', { type: 'button', className: 'dtd-primary', disabled: approveBlocked, onClick: approve }, '确认并启动'),
           button('返回对话修改', backToChat),
           button(
             confirmDiscard ? '再次点击确认放弃' : '放弃本次计划',
