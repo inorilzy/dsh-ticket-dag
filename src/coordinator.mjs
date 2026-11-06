@@ -191,6 +191,19 @@ function openWriter(directory) {
     throw new Error('Another DSH coordinator owns this run: ' + directory, { cause: e })
   }
 }
+// Read without acquiring the owner lock, so a scan never touches another captain's run.
+function ledgerOwner(file) {
+  try {
+    const reader = new DatabaseSync(file, { readOnly: true })
+    try {
+      return reader.prepare('SELECT parentId FROM run WHERE singleton=1').get()?.parentId
+    } finally {
+      reader.close()
+    }
+  } catch (e) {
+    throw new Error('Cannot read the run ledger ' + file + ': ' + message(e), { cause: e })
+  }
+}
 
 export class Coordinator {
   constructor({
@@ -446,39 +459,44 @@ export class Coordinator {
     return run ? this._snapshot(run) : null
   }
 
+  /**
+   * The recovery scan: take over every run of this captain in the repository.
+   * One run failing (owner lock held elsewhere, corrupt ledger, failed load)
+   * is reported and the scan goes on. A ledger too damaged to name its captain
+   * is reported to every captain scanning the repository.
+   * @returns { attached: runId[], failures: { runId, error }[] }
+   */
   async attach({ cwd, parentId }) {
-    if (this.stopping) return
+    const report = { attached: [], failures: [] }
+    if (this.stopping) return report
     let repo
     try {
       repo = await git.repoInfo(cwd)
     } catch {
-      return
+      return report
     }
     const dir = dirname(dirname(dbFile(repo, 'probe')))
     let entries
     try {
       entries = await readdir(dir, { withFileTypes: true })
     } catch (err) {
-      if (err.code === 'ENOENT') return
+      if (err.code === 'ENOENT') return report
       throw err
     }
     for (const e of entries) {
       if (this.stopping || !e.isDirectory() || !runPattern.test(e.name)) continue
-      // Do not acquire or reconcile a different captain's runs.
-      const file = dbFile(repo, e.name)
-      if (!(await exists(file))) continue
-      const reader = new DatabaseSync(file, { readOnly: true })
-      let same
       try {
-        same = reader.prepare('SELECT parentId FROM run WHERE singleton=1').get()?.parentId === parentId
-      } finally {
-        reader.close()
-      }
-      if (same) {
+        // Do not acquire or reconcile a different captain's runs.
+        const file = dbFile(repo, e.name)
+        if (!(await exists(file)) || ledgerOwner(file) !== parentId) continue
         const run = await this._open({ cwd, parentId, runId: e.name })
         this._wake(run)
+        report.attached.push(e.name)
+      } catch (err) {
+        report.failures.push({ runId: e.name, error: message(err) })
       }
     }
+    return report
   }
 
   // This grant is stored outside the worker checkout and exists before DSH can

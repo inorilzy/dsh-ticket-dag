@@ -4,8 +4,8 @@ import { createHash } from 'node:crypto'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { setTimeout as sleep } from 'node:timers/promises'
 import { DatabaseSync } from 'node:sqlite'
+import { setTimeout as sleep } from 'node:timers/promises'
 import test from 'node:test'
 import { Coordinator } from '../src/coordinator.mjs'
 import * as git from '../src/git.mjs'
@@ -223,6 +223,186 @@ test('an already-executed CAS is accounted even if the restored run is cancelled
   } finally {
     reader.close()
   }
+})
+
+test('repeated attach never redispatches an interrupted attempt or launches a worker', async (t) => {
+  const f = await fixture(t, { intent: false })
+  const query = { cwd: f.query.cwd, parentId }
+  assert.deepEqual((await f.coordinator.attach(query)).attached, [runId])
+  assert.deepEqual(await f.coordinator.attach(query), { attached: [runId], failures: [] })
+  const snapshot = await f.coordinator.status(f.query)
+  assert.equal(snapshot.tickets[0].status, 'NEEDS_ATTENTION')
+  assert.equal(snapshot.tickets[0].attempt, 1)
+  assert.equal(f.evidence.launches, 0)
+})
+
+// Several runs sharing one repository, seeded on disk as a previous process left them.
+async function multiRunFixture(t) {
+  const dir = mkdtempSync(join(tmpdir(), 'dag-recovery-scan-'))
+  const cwd = join(dir, 'project')
+  mkdirSync(cwd)
+  gitRun(cwd, 'init', '-q', '--initial-branch=main')
+  gitRun(cwd, 'config', 'user.name', 'Recovery test')
+  gitRun(cwd, 'config', 'user.email', 'recovery@test.invalid')
+  gitRun(cwd, 'config', 'commit.gpgSign', 'false')
+  gitRun(cwd, 'commit', '--allow-empty', '-qm', 'seed')
+  const repo = await git.repoInfo(cwd),
+    baseSha = gitRun(cwd, 'rev-parse', 'main')
+  const ledger = (id) => join(repo.commonDir, 'dsh-ticket-dag', 'runs', id, 'state.sqlite')
+  const seed = (id, captain, tickets, mode = 'active') => {
+    mkdirSync(dirname(ledger(id)), { recursive: true })
+    const store = new RunStore(ledger(id))
+    try {
+      store.init({
+        runId: id,
+        parentId: captain,
+        ref: 'refs/heads/integration/' + id,
+        repo,
+        baseSha,
+        manifest: normalizeManifest({ specId: id, baseRef: 'main', tickets }, {}),
+        policyHash: digest([]),
+      })
+      if (mode !== 'active') store.setMode(mode)
+    } finally {
+      store.close()
+    }
+  }
+  const release = []
+  const launches = []
+  const open = []
+  const coordinator = () => {
+    const made = new Coordinator({
+      launch: async (job) => {
+        launches.push(job.runId + '/' + job.ticketId)
+        return {
+          dispose: async () => {},
+          result: new Promise((resolve) => release.push(resolve)).then(() => {
+            writeFileSync(join(job.cwd, job.ticketId + '.txt'), job.ticketId)
+            gitRun(job.cwd, 'add', '--', job.ticketId + '.txt')
+            gitRun(
+              job.cwd,
+              'commit',
+              '-qm',
+              'Deliver ' + job.ticketId,
+              '-m',
+              `DAG-Run: ${job.runId}\nDAG-Ticket: ${job.ticketId}\nDAG-Attempt: ${job.attempt}\nDAG-Complete: yes`,
+            )
+            return { ok: true }
+          }),
+        }
+      },
+    })
+    open.push(made)
+    return made
+  }
+  t.after(async () => {
+    for (const go of release) go()
+    await Promise.allSettled(open.map((c) => c.close()))
+    rmSync(dir, { recursive: true, force: true })
+  })
+  const until = async (check, label) => {
+    for (let i = 0; i < 3000; i++) {
+      const value = await check()
+      if (value) return value
+      for (const go of release.splice(0)) go()
+      await sleep(40)
+    }
+    throw Error('Timeout: ' + label)
+  }
+  return { cwd, ledger, seed, launches, coordinator, until }
+}
+const failedIds = (scan) => scan.failures.map((f) => f.runId).sort()
+
+test('locked, corrupt and unloadable runs are reported while later runs and other captains recover', async (t) => {
+  const f = await multiRunFixture(t)
+  const captain = 'captain',
+    other = 'other-captain'
+  f.seed('a-locked', captain, [{ id: 'A', title: 'A' }], 'paused')
+  f.seed('c-broken', captain, [{ id: 'A', title: 'A' }], 'paused')
+  f.seed('d-other', other, [{ id: 'A', title: 'A' }])
+  f.seed('e-held', other, [{ id: 'A', title: 'A' }], 'paused')
+  f.seed('z-good', captain, [
+    { id: 'A', title: 'A' },
+    { id: 'B', title: 'B', depends_on: ['A'] },
+  ])
+  // Garbage where the ledger belongs: nobody can tell whose run it was.
+  const garbage = Buffer.alloc(4096, 'x')
+  mkdirSync(dirname(f.ledger('b-corrupt')), { recursive: true })
+  writeFileSync(f.ledger('b-corrupt'), garbage)
+  // Readable enough to name its captain, but it cannot load.
+  const edit = new DatabaseSync(f.ledger('c-broken'))
+  const { manifest } = edit.prepare('SELECT manifest FROM run').get()
+  edit.prepare('UPDATE run SET manifest=?').run('{broken')
+  edit.close()
+
+  const holder = f.coordinator()
+  const lockedQuery = { cwd: f.cwd, parentId: captain, runId: 'a-locked' }
+  const heldQuery = { cwd: f.cwd, parentId: other, runId: 'e-held' }
+  await holder.status(lockedQuery)
+  await holder.status(heldQuery)
+
+  const co = f.coordinator()
+  const scan = await co.attach({ cwd: f.cwd, parentId: captain })
+  assert.deepEqual(scan.attached, ['z-good'])
+  assert.deepEqual(failedIds(scan), ['a-locked', 'b-corrupt', 'c-broken'])
+  const errorOf = (id) => scan.failures.find((x) => x.runId === id).error
+  assert.match(errorOf('a-locked'), /Another DSH coordinator owns this run/)
+  assert.match(errorOf('b-corrupt'), /Cannot read the run ledger.*b-corrupt.*not a database/)
+  assert.match(errorOf('c-broken'), /JSON/)
+
+  // The other coordinator keeps its lock, and the corrupt file stays as evidence.
+  assert.equal((await holder.status(lockedQuery)).mode, 'paused')
+  await assert.rejects(co.status(lockedQuery), /Another DSH coordinator owns this run/)
+  assert.deepEqual(readFileSync(f.ledger('b-corrupt')), garbage)
+
+  // This captain's scan took no lock on the other captain's runs and reported neither.
+  const theirs = f.coordinator()
+  const theirScan = await theirs.attach({ cwd: f.cwd, parentId: other })
+  assert.deepEqual(theirScan.attached, ['d-other'])
+  assert.deepEqual(failedIds(theirScan), ['b-corrupt', 'e-held'])
+
+  // The recoverable runs finish, with later tickets scheduled after the takeover.
+  const goodQuery = { cwd: f.cwd, parentId: captain, runId: 'z-good' }
+  const done = await f.until(async () => {
+    const s = await co.status(goodQuery)
+    assert.equal(s.counts.NEEDS_ATTENTION, undefined, JSON.stringify(s))
+    return s.complete && s
+  }, 'z-good complete')
+  assert.equal(done.counts.INTEGRATED, 2)
+  await f.until(async () => (await theirs.status({ cwd: f.cwd, parentId: other, runId: 'd-other' })).complete, 'd-other')
+
+  // A failed load holds nothing: once repaired, the next scan takes the run over.
+  const repair = new DatabaseSync(f.ledger('c-broken'))
+  repair.prepare('UPDATE run SET manifest=?').run(manifest)
+  repair.close()
+  const again = await co.attach({ cwd: f.cwd, parentId: captain })
+  assert.deepEqual(again.attached.sort(), ['c-broken', 'z-good'])
+  assert.deepEqual(failedIds(again), ['a-locked', 'b-corrupt'])
+  await sleep(100)
+  // Each ticket ran exactly once, across every scan, and only in runs that could recover.
+  assert.deepEqual(f.launches.sort(), ['d-other/A', 'z-good/A', 'z-good/B'])
+})
+
+test('concurrent and repeated scans dispatch a recoverable ticket once', async (t) => {
+  const f = await multiRunFixture(t)
+  f.seed('only', 'captain', [{ id: 'A', title: 'A' }])
+  const co = f.coordinator()
+  const scope = { cwd: f.cwd, parentId: 'captain' }
+  const scans = await Promise.all([co.attach(scope), co.attach(scope), co.attach(scope)])
+  for (const scan of scans) assert.deepEqual(scan, { attached: ['only'], failures: [] })
+  await f.until(async () => {
+    await co.attach(scope)
+    return (await co.status({ ...scope, runId: 'only' })).complete
+  }, 'only complete')
+  await co.attach(scope)
+  await sleep(100)
+  assert.deepEqual(f.launches, ['only/A'])
+  // A later process finds nothing left to dispatch either.
+  await co.close()
+  const next = f.coordinator()
+  assert.deepEqual(await next.attach(scope), { attached: ['only'], failures: [] })
+  await sleep(100)
+  assert.deepEqual(f.launches, ['only/A'])
 })
 
 test('a run approved before the review listed unused checks keeps its used commands but cannot presume the rest approved', async (t) => {
