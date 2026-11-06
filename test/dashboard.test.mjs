@@ -93,6 +93,87 @@ test('dashboard history survives restart, separates projects, and never attaches
   }
 })
 
+test('only the selected run carries timing, including an old ledger and an attached run', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'dag-history-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const catalog = new RunCatalog()
+  const first = addRun(root, 'repo-1', catalog, 1000)
+  const second = addRun(root, 'repo-2', catalog, 2000)
+  first.db.claim('A', { childId: 'child', path: '/fixture/work', branch: 'ticket/A', baseSha: 'start' })
+  const cold = { maxWorkers: 16, runs: new Map(), peek: () => assert.fail('Unexpected attach') }
+  try {
+    const keys = new Map(catalog.read(cold, null).runs.map((row) => [row.repoName, row.key]))
+    const before = Date.now()
+    const view = catalog.read(cold, keys.get('repo-1'))
+    assert.ok(view.selected.now >= before)
+    assert.equal(view.selected.timing.tickets.A.attempts, 1)
+    assert.equal(view.selected.timing.runningSince, view.selected.timing.startedAt)
+    assert.equal(view.selected.timing.totals.queueMs, null)
+    for (const row of view.runs) assert.equal('timing' in row, false)
+
+    // A ledger from before run_started named its mode still reads.
+    first.db.close()
+    const old = new DatabaseSync(first.file)
+    old.exec(`UPDATE events SET details='{}' WHERE type='run_started'`)
+    old.close()
+    assert.equal(catalog.read(cold, keys.get('repo-1')).selected.timing.tickets.A.attempts, 1)
+
+    // Attached rows other than the selected one are not asked for timing.
+    const asked = []
+    const attached = {
+      maxWorkers: 16,
+      runs: new Map([
+        [first.file, {}],
+        [second.file, {}],
+      ]),
+      peek(file, now) {
+        asked.push([file, now])
+        return { mode: 'active', complete: false, counts: {}, tickets: [], timing: now ? { fixture: now } : undefined }
+      },
+    }
+    const live = catalog.read(attached, keys.get('repo-2'))
+    assert.deepEqual(live.selected.timing, { fixture: live.selected.now })
+    assert.deepEqual(asked.sort(([a], [b]) => (a === second.file ? -1 : b === second.file ? 1 : 0)), [
+      [second.file, live.selected.now],
+      [first.file, undefined],
+    ])
+  } finally {
+    second.db.close()
+  }
+})
+
+test('a plan under review has no timing until it is approved', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'dag-history-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const repo = join(root, 'repo')
+  mkdirSync(repo)
+  const file = join(repo, 'state.sqlite')
+  const db = new RunStore(file)
+  const manifest = normalizeManifest({ spec_id: 'demo', tickets: [{ id: 'A', title: 'A' }] })
+  const meta = {
+    runId: 'review',
+    parentId: 'captain',
+    repo: { root: repo, commonDir: join(repo, '.git') },
+    ref: 'refs/heads/integration/review',
+    baseSha: 'start',
+    manifest,
+    policyHash: 'test',
+    mode: 'staged',
+  }
+  db.init(meta)
+  const catalog = new RunCatalog()
+  catalog.remember(file, meta, 1000)
+  const cold = { maxWorkers: 16, runs: new Map(), peek: () => assert.fail('Unexpected attach') }
+  try {
+    assert.equal(catalog.read(cold, null).selected.timing, null)
+    assert.equal(db.approve(db.plan()), true)
+    assert.equal(catalog.read(cold, null).selected.timing.tickets.A, undefined)
+    assert.equal(typeof catalog.read(cold, null).selected.timing.startedAt, 'number')
+  } finally {
+    db.close()
+  }
+})
+
 test('a cold plan under review still lists its manifest commands; other cold runs claim none', (t) => {
   const root = mkdtempSync(join(tmpdir(), 'dag-history-'))
   t.after(() => rmSync(root, { recursive: true, force: true }))

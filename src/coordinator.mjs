@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import * as git from './git.mjs'
 import { agentSpec, ledgerSnapshot, normalizeAppend, normalizeManifest, RunStore } from './store.mjs'
+import { runTiming } from './timing.mjs'
 
 const hash = (text) => createHash('sha256').update(text).digest('hex')
 const message = (err) => String(err?.message ?? err).slice(-3500)
@@ -455,9 +456,11 @@ export class Coordinator {
 
   // An owner dashboard can only observe an already-attached run through this
   // method. It cannot attach to a repository or wake its scheduler.
-  peek(file) {
+  // Only the selected run passes now: its timing reads every event of the ledger.
+  peek(file, now) {
     const run = this.runs.get(file)
-    return run ? this._snapshot(run) : null
+    if (!run) return null
+    return now === undefined ? this._snapshot(run) : { ...this._snapshot(run), timing: runTiming(run.db.events(), now) }
   }
 
   /**
@@ -724,7 +727,8 @@ export class Coordinator {
   async status(q) {
     const run = await this._open(q)
     this._wake(run)
-    return this._snapshot(run)
+    const now = Date.now()
+    return { ...this._snapshot(run), timing: runTiming(run.db.events(), now), now }
   }
   async pause(q) {
     const run = await this._open(q)
@@ -1379,9 +1383,17 @@ export class Coordinator {
     ]
     const commands = checkIds.flatMap((id) => run.checks[id].map((argv) => ({ id, argv })))
     const options = { signal: job.ctrl.signal, timeoutMs: this.checkTimeoutMs }
+    run.db.recordVerifyStart(row.id, checkIds)
     for (const [index, { id, argv }] of commands.entries()) {
       job.phase = { stage: 'verify', checkId: id, index: index + 1, total: commands.length }
-      await git.runChecks(candidatePath, [argv], options)
+      const began = Date.now()
+      let ok = false
+      try {
+        await git.runChecks(candidatePath, [argv], options)
+        ok = true
+      } finally {
+        run.db.recordCheck(row.id, { checkId: id, ms: Date.now() - began, ok, aborted: !ok && job.ctrl.signal.aborted })
+      }
     }
     job.phase = { stage: 'publish' }
     await git.assertCandidate(m.repo, candidatePath, candidate)
