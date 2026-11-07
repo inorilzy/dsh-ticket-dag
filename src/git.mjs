@@ -310,6 +310,12 @@ export async function verifySource(repo, path, branch, baseSha) {
   return state.head
 }
 
+/** Repository paths that differ between two commits. -z keeps unusual names unquoted; renames count as delete plus add. */
+export async function changedFiles(repo, fromSha, toSha) {
+  const out = await git(repo, 'diff', '--name-only', '--no-renames', '-z', oid(fromSha), oid(toSha), '--')
+  return out.split('\0').filter(Boolean)
+}
+
 function candidatePin(candidate) {
   return 'refs/dsh-ticket-dag/candidates/' + oid(candidate)
 }
@@ -320,16 +326,17 @@ export async function readCommitMessage(repo, sha) {
   return git(repo, 'show', '-s', '--format=%B', commit)
 }
 
-async function candidateOwner(wt, create) {
+async function candidateOwner(wt, create, kind = 'candidate') {
   // This file is private to the linked checkout, outside the tracked/tested tree.
+  // A candidate and a probe carry different markers, so neither helper adopts the other's checkout.
   const admin = await git(wt, 'rev-parse', '--absolute-git-dir')
-  const marker = join(admin, 'dsh-ticket-dag-candidate-v1')
+  const marker = join(admin, 'dsh-ticket-dag-' + kind + '-v1')
   const expected = await realpath(wt)
   if (create) await writeFile(marker, expected, { encoding: 'utf8', flag: 'wx' })
   else
     verify(
       (await exists(marker)) && (await readFile(marker, 'utf8')) === expected,
-      'Checkout is not a candidate owned by dsh-ticket-dag: ' + wt,
+      'Checkout is not a ' + kind + ' owned by dsh-ticket-dag: ' + wt,
     )
 }
 
@@ -439,6 +446,86 @@ export async function buildCandidate(repo, path, oldTip, sourceSha) {
   return candidate
 }
 
+/**
+ * A merge train: in a fresh plugin-owned detached checkout of oldTip, merge
+ * each source in order with --no-ff, so merge i has the parents (merge i-1 or
+ * oldTip, source i) and can be published by itself with publishCandidate. A
+ * source that conflicts is aborted and skipped; the next one merges onto the
+ * previous merge. Each merge is pinned like a candidate until it is published
+ * or unpinned. A merge that fails for another reason stops the train with
+ * err.sourceSha set and the checkout preserved for inspection.
+ * @returns { merges: [{ sourceSha, sha }], conflicts: [{ sourceSha, files }] }
+ */
+export async function buildTrain(repo, path, oldTip, sources) {
+  const wt = checkoutPath(path)
+  const old = await resolveRef(repo, oid(oldTip))
+  verify(Array.isArray(sources) && sources.length > 0, 'A merge train needs at least one source')
+  verify(!(await exists(wt)), 'Merge train checkout already exists: ' + wt)
+  await mkdir(dirname(wt), { recursive: true })
+  try {
+    await git(repo, 'worktree', 'add', '--detach', '--', wt, old)
+    await candidateOwner(wt, true)
+  } catch (err) {
+    err.trainSetup = true
+    throw err
+  }
+  const merges = [],
+    conflicts = []
+  let head = old
+  for (const value of sources) {
+    const source = await resolveRef(repo, oid(value))
+    if (await isAncestor(repo, source, head)) {
+      const error = new Error('Source ' + source + ' already belongs to the merge train base; inspect the ticket branch')
+      error.sourceSha = source
+      for (const x of merges) await git(repo, 'update-ref', '-d', candidatePin(x.sha), x.sha).catch(() => {})
+      throw error
+    }
+    try {
+      await git(wt, 'merge', '--no-ff', '--no-edit', '--no-overwrite-ignore', '-m', 'dsh-ticket-dag: verify ' + source, source)
+    } catch (err) {
+      const files = await optionalGit(wt, 'diff', '--name-only', '--diff-filter=U').catch(() => null)
+      if (files) {
+        // Back to the previous merge, clean, so the rest of the train still merges.
+        await git(wt, 'merge', '--abort')
+        conflicts.push({ sourceSha: source, files: files.split(/\r?\n/).filter(Boolean) })
+        continue
+      }
+      const error = new Error(
+        'Merge train failed to merge ' + source + '; checkout preserved at ' + wt + '. ' + err.message,
+        { cause: err },
+      )
+      error.sourceSha = source
+      // The merges before it will not be published from this train.
+      for (const x of merges) await git(repo, 'update-ref', '-d', candidatePin(x.sha), x.sha).catch(() => {})
+      throw error
+    }
+    const sha = await resolveRef(wt, 'HEAD')
+    await assertMergeParents(repo, sha, head, source)
+    await git(repo, 'update-ref', candidatePin(sha), sha)
+    merges.push({ sourceSha: source, sha })
+    head = sha
+  }
+  await assertCandidate(repo, wt, head)
+  return { merges, conflicts }
+}
+
+/**
+ * Move a clean plugin-owned candidate checkout from one commit to another
+ * (a merge train bisects in its own checkout instead of adding probes).
+ */
+export async function switchCandidate(repo, path, fromSha, toSha) {
+  const wt = checkoutPath(path)
+  await assertCandidate(repo, wt, fromSha)
+  const to = await resolveRef(repo, oid(toSha))
+  if (to !== fromSha) await git(wt, 'switch', '--detach', '--no-overwrite-ignore', to)
+  return assertCandidate(repo, wt, to)
+}
+
+/** Drop the reachability pin of a train merge that will not be published. */
+export async function unpinCandidate(repo, sha) {
+  await git(repo, 'update-ref', '-d', candidatePin(sha), oid(sha))
+}
+
 /** Remove only a clean plugin-owned trial at the requested SHA. Never force deletion. */
 export async function releaseCandidate(repo, path, expectedSha) {
   const wt = checkoutPath(path)
@@ -453,6 +540,48 @@ export async function releaseCandidate(repo, path, expectedSha) {
   )
   verify(!leftovers, 'Candidate contains ignored or untracked files; retained at ' + wt)
   await git(repo, 'worktree', 'remove', '--', wt)
+}
+
+async function assertProbe(repo, wt, sha) {
+  await checkoutInfo(repo, wt)
+  await candidateOwner(wt, false, 'probe')
+  const state = await workState(wt)
+  verify(
+    state.branch === null && state.head === sha && state.clean && !state.inProgress,
+    'Probe checkout changed, is on a branch, or has local changes: ' + wt,
+  )
+}
+
+/**
+ * A detached plugin-owned checkout of an already published commit, where the
+ * final full check and its bisection run. Re-adopts a clean probe of the same
+ * commit left by an interrupted process; refuses anything else at the path.
+ */
+export async function addProbe(repo, path, sha) {
+  const wt = checkoutPath(path)
+  const commit = await resolveRef(repo, oid(sha))
+  if (!(await exists(wt))) {
+    await mkdir(dirname(wt), { recursive: true })
+    await git(repo, 'worktree', 'add', '--detach', '--', wt, commit)
+    await candidateOwner(wt, true, 'probe')
+  }
+  await assertProbe(repo, wt, commit)
+  return wt
+}
+
+/** Remove only a clean probe this plugin created, at the expected commit. Never forces. */
+export async function releaseProbe(repo, path, sha) {
+  const wt = checkoutPath(path)
+  await assertProbe(repo, wt, oid(sha))
+  const leftovers = await git(wt, 'status', '--porcelain=v1', '--ignored=matching', '--untracked-files=all', '-z')
+  verify(!leftovers, 'Probe contains ignored or untracked files; retained at ' + wt)
+  await git(repo, 'worktree', 'remove', '--', wt)
+}
+
+/** The first-parent commits after base up to tip, oldest first: on an integration ref, one merge per landed ticket. */
+export async function firstParentCommits(repo, baseSha, tipSha) {
+  const out = await git(repo, 'rev-list', '--first-parent', '--reverse', oid(baseSha) + '..' + oid(tipSha), '--')
+  return out.split(/\r?\n/).filter(Boolean).map(oid)
 }
 
 /** Compare-and-swap the unoccupied integration ref. All external writers must obey the same ownership convention. */

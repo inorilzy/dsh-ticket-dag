@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, statSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { planRevision, readIntegrity } from './store.mjs'
+import { END_MODES, integrationOf, latestWorkerResults, planRevision, readIntegrity } from './store.mjs'
 import { runTiming } from './timing.mjs'
 
 const route = '/api/ticket-dag.dashboard'
@@ -321,6 +321,12 @@ export class RunCatalog {
           // Every approved or reviewable command; the plan review shows them for approval.
           checks: data.checks ?? {},
           planChecks: data.planChecks ?? [],
+          // The integration mode frozen into the run manifest.
+          integration: data.integration ?? { mode: 'each', selectChecksByFiles: false },
+          // The final full check or its bisection while the live coordinator runs it.
+          finalPhase: data.finalPhase ?? null,
+          // A merge train while the live coordinator runs it.
+          trainPhase: data.trainPhase ?? null,
           // The opaque plan version the review shows and approval must echo back.
           revision: data.revision ?? null,
           // The server's clock, so a live board can count from timing.runningSince.
@@ -346,6 +352,8 @@ export class RunCatalog {
             retryAt: t.retryAt,
             message: displayDiagnostic(t.message),
             livePhase: t.livePhase ?? null,
+            // Worker modes: the latest worker-side check result of this ticket.
+            workerVerify: t.workerVerify ?? null,
             cleanup: t.cleanup ?? null,
             cleanupReason: displayDiagnostic(t.cleanupReason),
             appended: t.appended ?? false,
@@ -368,7 +376,8 @@ export function readLedger(file, entry, detail, globalLimit, agents = {}, now = 
     const run = db
       .prepare(
         `SELECT mode,diagnostic,ref AS integrationRef,tipSha AS verifiedSha,
-        json_extract(manifest, '$.maxWorkers') AS maxWorkers FROM run
+        json_extract(manifest, '$.maxWorkers') AS maxWorkers,
+        json_extract(manifest, '$.integration.mode') AS integrationMode FROM run
         WHERE singleton=1 AND runId=? AND parentId=?`,
       )
       .get(entry.runId, entry.parentId)
@@ -380,14 +389,21 @@ export function readLedger(file, entry, detail, globalLimit, agents = {}, now = 
         .map((row) => [row.status, row.n]),
     )
     const total = Object.values(counts).reduce((sum, n) => sum + n, 0)
+    // An end-mode run completes only once the final full check passed at its tip, as in Coordinator#_snapshot.
+    const { integrationMode, ...fields } = run
+    const finalPending =
+      END_MODES.has(integrationMode) &&
+      !db
+        .prepare("SELECT 1 FROM events WHERE type='final_verified' AND json_extract(details,'$.tipSha')=? LIMIT 1")
+        .get(run.verifiedSha)
     const result = {
-      ...run,
+      ...fields,
       maxWorkers: Math.min(globalLimit, run.maxWorkers),
       // Kept raw so a later host-limit change re-applies without reopening the ledger.
       rawMaxWorkers: run.maxWorkers ?? null,
       total,
       counts,
-      complete: total > 0 && counts.INTEGRATED === total,
+      complete: total > 0 && counts.INTEGRATED === total && !finalPending,
     }
     if (detail) {
       // A ledger from before worktree cleanup has no cleanup columns: not cleaned.
@@ -398,7 +414,9 @@ export function readLedger(file, entry, detail, globalLimit, agents = {}, now = 
       // One shared read of the integrity rows: the same rows RunStore.integrity()
       // returns, so the append list and plan revision cannot drift from the writer.
       const integrity = readIntegrity(db)
+      result.integration = integrationOf(JSON.parse(integrity.run.manifest))
       const appended = new Map(integrity.appended.map((r) => [r.ticketId, r.createdAt]))
+      const workerResults = latestWorkerResults(db)
       result.tickets = db
         .prepare(
           `SELECT id,json_extract(definition,'$.title') AS title,
@@ -415,6 +433,7 @@ export function readLedger(file, entry, detail, globalLimit, agents = {}, now = 
           verify: checkIds ? JSON.parse(checkIds) : [],
           model: modelId ? [provider, modelId].filter(Boolean).join('/') : null,
           livePhase: null,
+          workerVerify: workerResults.get(row.id) ?? null,
           appended: appended.has(row.id),
           appendedAt: appended.get(row.id) ?? null,
         }))

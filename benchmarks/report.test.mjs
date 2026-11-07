@@ -113,7 +113,7 @@ test('one round reports the runTiming numbers in the table and in --json', async
   const dir = await trial(root, 'a', gh1())
   assert.equal(
     dataRow(reportTable('each=' + dir), 'each'),
-    '| each | 1 | 830ms（830ms–830ms） | 530ms | 540ms | 200ms | 100ms | 2 | 0 | 1 | 5 |',
+    '| each | each | 1 | 830ms（830ms–830ms） | 530ms | 540ms | 200ms | 100ms | 2 | 0 | 0 | 1 | 5 |',
   )
   const [group] = reportJson('each=' + dir)
   assert.equal(group.label, 'each')
@@ -126,10 +126,12 @@ test('one round reports the runTiming numbers in the table and in --json', async
     verifyMs: 100,
     checkRuns: 2,
     checkFailures: 0,
+    skippedChecks: 0,
     conflicts: 1,
     attempts: 5,
   })
   assert.equal(group.trials[0].runs[0].timing.attentionMs, 300)
+  assert.equal(group.mode, 'each', 'a ledger without frozen integration settings ran each')
 })
 
 test('repeated labels give medians with min and max, per label in argument order', async (t) => {
@@ -149,7 +151,7 @@ test('repeated labels give medians with min and max, per label in argument order
   assert.deepEqual(groups[1].summary.accumulatedMs, { median: 1660, min: 830, max: 2490 })
   assert.equal(
     dataRow(reportTable(...args), 'each'),
-    '| each | 3 | 1.7s（830ms–8.3s） | 1.1s | 1.1s | 400ms | 200ms | 2 | 0 | 1 | 5 |',
+    '| each | each | 3 | 1.7s（830ms–8.3s） | 1.1s | 1.1s | 400ms | 200ms | 2 | 0 | 0 | 1 | 5 |',
   )
 })
 
@@ -235,7 +237,7 @@ test('unfinished and multi-run trials are named and left out of the summary', as
   assert.deepEqual(group.trials.map((x) => x.metrics !== null), [true, false, false, false, false])
 
   const table = reportTable(...args)
-  assert.match(dataRow(table, 'each'), /^\| each \| 1 \| 830ms/)
+  assert.match(dataRow(table, 'each'), /^\| each \| each \| 1 \| 830ms/)
   const section = table.slice(table.indexOf('## 未计入汇总'))
   const line = (dir) => section.split('\n').find((l) => l.includes(dir))
   assert.equal(line(good), undefined)
@@ -248,7 +250,7 @@ test('unfinished and multi-run trials are named and left out of the summary', as
 test('a label with no usable round still shows, with dashes instead of zeros', async (t) => {
   const root = await tempDir(t)
   const missing = join(root, 'never-created')
-  assert.equal(dataRow(reportTable('x=' + missing), 'x'), '| x | 0 | — | — | — | — | — | — | — | — | — |')
+  assert.equal(dataRow(reportTable('x=' + missing), 'x'), '| x | — | 0 | — | — | — | — | — | — | — | — | — | — |')
 })
 
 test('an unreadable ledger is reported instead of ending the report', async (t) => {
@@ -259,7 +261,7 @@ test('an unreadable ledger is reported instead of ending the report', async (t) 
   await mkdir(join(file, '..'), { recursive: true })
   await writeFile(file, 'not a database, long enough that sqlite actually looks at the header')
   const table = reportTable('x=' + good, 'x=' + broken)
-  assert.match(dataRow(table, 'x'), /^\| x \| 1 \|/)
+  assert.match(dataRow(table, 'x'), /^\| x \| each \| 1 \|/)
   assert.match(table, /账本读取失败/)
 })
 
@@ -268,7 +270,7 @@ test('an old ledger shows dashes for what it never recorded, a recorded zero sta
   const old = await trial(root, 'old', oldLedger())
   assert.equal(
     dataRow(reportTable('old=' + old), 'old'),
-    '| old | 1 | 830ms（830ms–830ms） | 530ms | 540ms | — | — | — | — | 1 | 5 |',
+    '| old | each | 1 | 830ms（830ms–830ms） | 530ms | 540ms | — | — | — | — | 0 | 1 | 5 |',
   )
   const [group] = reportJson('old=' + old)
   assert.equal(group.summary.queueMs, null)
@@ -277,7 +279,7 @@ test('an old ledger shows dashes for what it never recorded, a recorded zero sta
 
   // 一轮缺数据时不用其余轮的值代替。
   const fresh = await trial(root, 'fresh', gh1())
-  assert.match(dataRow(reportTable('m=' + old, 'm=' + fresh), 'm'), /^\| m \| 2 \| 830ms.* \| — \| — \| — \| — \| 1 \| 5 \|$/)
+  assert.match(dataRow(reportTable('m=' + old, 'm=' + fresh), 'm'), /^\| m \| each \| 2 \| 830ms.* \| — \| — \| — \| — \| 0 \| 1 \| 5 \|$/)
 
   // 工单确实没有验收命令：记录下来的 0 不是缺数据。
   const noChecks = await trial(
@@ -295,7 +297,7 @@ test('an old ledger shows dashes for what it never recorded, a recorded zero sta
   )
   assert.equal(
     dataRow(reportTable('z=' + noChecks), 'z'),
-    '| z | 1 | 40ms（40ms–40ms） | 40ms | 10ms | 10ms | 0ms | 0 | 0 | 0 | 1 |',
+    '| z | each | 1 | 40ms（40ms–40ms） | 40ms | 10ms | 10ms | 0ms | 0 | 0 | 0 | 0 | 1 |',
   )
 })
 
@@ -323,8 +325,8 @@ test('long durations read as minutes and hours', async (t) => {
       { A: 'INTEGRATED' },
     )
   const table = reportTable('m=' + (await round('m', 125000)), 'h=' + (await round('h', 3723000)))
-  assert.match(dataRow(table, 'm'), /^\| m \| 1 \| 2m05s（2m05s–2m05s） /)
-  assert.match(dataRow(table, 'h'), /^\| h \| 1 \| 1h02m03s（1h02m03s–1h02m03s） /)
+  assert.match(dataRow(table, 'm'), /^\| m \| each \| 1 \| 2m05s（2m05s–2m05s） /)
+  assert.match(dataRow(table, 'h'), /^\| h \| each \| 1 \| 1h02m03s（1h02m03s–1h02m03s） /)
 })
 
 test('bad arguments stop with usage instead of an empty report', async (t) => {
@@ -335,6 +337,54 @@ test('bad arguments stop with usage instead of an empty report', async (t) => {
     assert.match(out.stderr, /usage: /)
     assert.equal(out.stdout, '')
   }
+})
+
+// 在手写账本里补一行 run，清单带上冻结的 integration，模拟按文件选测试的一轮。
+async function modeTrial(root, name, integration, skipped = []) {
+  const events = [
+    [0, 'run_started', null, { mode: 'active' }],
+    [10, 'claimed', 'A'],
+    [20, 'submitted', 'A'],
+    [25, 'checks_selected', 'A', { stage: 'lane', run: ['fast'], skipped, fallback: null, changed: 1 }],
+    [30, 'verify_started', 'A', { checks: ['fast'] }],
+    [35, 'check_finished', 'A', { checkId: 'fast', ms: 5, ok: true }],
+    [40, 'integrated', 'A'],
+    [40, 'run_completed'],
+  ]
+  const dir = join(root, name)
+  const file = await ledger(dir, 'r1', events, { A: 'INTEGRATED' })
+  const db = new DatabaseSync(file)
+  try {
+    const manifest = { specId: 's', baseRef: 'main', maxWorkers: 1, tickets: [], ...(integration && { integration }) }
+    db.prepare("INSERT INTO run VALUES (1,'r1','{}','ref','b',?,'p','h','b','active',NULL)").run(JSON.stringify(manifest))
+  } finally {
+    db.close()
+  }
+  return dir
+}
+
+test('the table names the mode each round actually ran and counts skipped checks', async (t) => {
+  const root = await tempDir(t)
+  const f = await modeTrial(root, 'f', { mode: 'each', selectChecksByFiles: true }, ['slow'])
+  const each = await modeTrial(root, 'each', null)
+  const table = reportTable('f=' + f, 'base=' + each)
+  assert.equal(dataRow(table, 'f'), '| f | each+F | 1 | 40ms（40ms–40ms） | 40ms | 10ms | 10ms | 5ms | 1 | 0 | 1 | 0 | 1 |')
+  assert.match(dataRow(table, 'base'), /^\| base \| each \| 1 \| .* \| 1 \| 0 \| 0 \| 0 \| 1 \|$/)
+  assert.doesNotMatch(table, /## 警告/)
+  const groups = reportJson('f=' + f)
+  assert.equal(groups[0].mode, 'each+F')
+  assert.deepEqual(groups[0].trials[0].runs[0].integration, { mode: 'each', selectChecksByFiles: true })
+  assert.equal(groups[0].summary.skippedChecks.median, 1)
+})
+
+test('rounds of one label that ran different modes are flagged', async (t) => {
+  const root = await tempDir(t)
+  const f = await modeTrial(root, 'f', { mode: 'each', selectChecksByFiles: true }, ['slow'])
+  const each = await modeTrial(root, 'each', null)
+  const table = reportTable('x=' + f, 'x=' + each)
+  assert.match(dataRow(table, 'x'), /^\| x \| each\+F\/each \| 2 \|/)
+  assert.match(table, /## 警告\n\n- label x 下各轮的实际模式不一致：each\+F、each/)
+  assert.deepEqual(reportJson('x=' + f, 'x=' + each)[0].warnings.length, 1)
 })
 
 const exec = promisify(execFile)

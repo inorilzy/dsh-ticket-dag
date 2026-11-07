@@ -2,6 +2,14 @@
 
 版本号以 `package.json` 为准。条目整理自 Git 提交记录。
 
+## 0.16.0
+
+- 新增集成模式 `integrationMode`：`each`（每张完整验收）、`end`（A 先合并、最后测：集成通道只跑快验收，全部集成后跑一次全量，失败按合并点二分定位并自动追加修复工单 `fix-<工单>-<n>`，上限 `maxFinalRepairs`）、`worker`（E 提交后立即在该提交上验收）、`worker-end`（A+E）、`train`（B 合并列车，`trainSize`）。新增 `selectChecksByFiles`（F 按改动文件选验收命令）和每个验收 ID 的 `checkMeta`（`files`、`fast`）。清单可用 `integration`、`check_meta` 覆盖，`dag_run` 时冻结。
+- **默认改为 A+F**（`end` + 按改动文件选验收命令），依据 plane-bench 真实 AI 对比：集成通道占用 A+F 32 秒、A+E+F 40 秒、B 4 分钟。显式设为 `each` 的 profile 和没有 `integration` 字段的旧运行行为不变。
+- `end` 类模式下清单一条快验收都没标时，集成通道跑全部累计验收，不再只做试合并就集成。队长提示词要求为用到的每个验收 ID 写 `check_meta` 并说明哪些标了 fast。
+- 看板运行概况和计划审查显示冻结的集成模式，以及最终全量、二分、worker 侧验收和列车的进度；配置页新增“集成模式”“按改动文件选验收命令”“合并列车长度”。
+- `benchmarks/`：`simulate.mjs` 脚本工单模拟对比，`report.mjs` 增加“实际模式”列（读账本冻结的模式，同一 label 模式不一致时警告）和“跳过验收数”列。
+
 ## 0.15.2
 
 - 依赖图节点也有 **查看对话** 按钮，点它打开该工单子会话的对话记录。

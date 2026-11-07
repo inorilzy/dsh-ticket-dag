@@ -1,0 +1,14 @@
+# 坦克基准 A+F（先合并、最后测 + 按改动文件选测试）的 profile 片段。合并进当前 profile 的 dsh-ticket-dag 配置，保留其他字段。
+# 集成通道只跑 fast，且只在改动文件匹配它的 files 时跑；最终全量不按文件过滤，fast 和 soak 都跑。
+- id: dsh-ticket-dag
+  config:
+    integrationMode: end
+    selectChecksByFiles: true
+    maxFinalRepairs: 2
+    checkMeta:
+      fast:
+        files: [src/**, checks/unit/**]
+        fast: true
+      soak:
+        files: [src/**, checks/soak.mjs, checks/harness.mjs]
+        fast: false

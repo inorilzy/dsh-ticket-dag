@@ -46,6 +46,22 @@ export const Config = z.object({
   trackerWriteback: z.union(['off', 'comment', 'close']).default('off').volatile(),
   // Ask the captain for one code-review round when a run first completes.
   reviewOnComplete: z.boolean().default(false).volatile(),
+  // How submitted tickets are verified and merged. Every value is accepted here so
+  // a profile stays valid across builds; dag_run refuses a mode this build lacks.
+  // end + selectChecksByFiles (A+F) is the default: the plane-bench runs showed the
+  // lowest lane cost with conflicts still found at the trial merge.
+  integrationMode: z.union(['each', 'end', 'worker', 'worker-end', 'train']).default('end').volatile(),
+  // Run only the checks whose checkMeta files match the candidate's changed files.
+  selectChecksByFiles: z.boolean().default(true).volatile(),
+  // Per check ID: the files it is responsible for (globs) and whether it is a fast check.
+  checkMeta: z
+    .dict(z.object({ files: z.array(z.string()).default([]), fast: z.boolean().default(false) }))
+    .default({})
+    .volatile(),
+  // End modes: how many fix tickets a failed final full check may append before the run is held.
+  maxFinalRepairs: z.natural().max(10).default(2).volatile(),
+  // Train mode: how many submitted tickets one merge train verifies together at most.
+  trainSize: z.natural().min(2).max(16).default(4).volatile(),
 })
 
 const runId = { type: 'string', required: true, description: 'The runId returned by dag_run.' }
@@ -89,7 +105,44 @@ const writebackMode = (value) => (['comment', 'close'].includes(value) ? value :
 const importRule =
   'When the goal points at a spec or its tickets (a GitHub issue number or URL, or a local .scratch/<slug> folder, spec.md or issues folder from /to-spec and /to-tickets), call dag_import with it first and build the manifest from its draft. If dependencyMode is declared, keep every ticket and its depends_on exactly as imported: add only verify, agent and manifest checks, and report a dependency that looks wrong instead of changing it. If dependencyMode is none, keep the imported tickets and infer depends_on yourself. If it is no-tickets, split the spec into tickets yourself. Whenever you infer an edge, write its reason into the dependent ticket prompt so the user sees it in the plan review. Keep each ticket source field so the run can report back to the issue.'
 
-export function captainSection({ checks, agents, trackerWriteback, reviewOnComplete, checkTimeoutMs, maxWorkers }) {
+// One sentence on how this profile integrates, so the captain can explain skipped checks.
+function integrationNote(integrationMode, selectChecksByFiles) {
+  const mode = integrationMode ?? 'each'
+  if (mode === 'each' && selectChecksByFiles !== true) return ''
+  return (
+    'Integration mode: ' + mode +
+    (selectChecksByFiles === true
+      ? ', with checks selected by changed files: a check whose checkMeta files match none of a candidate changed files is skipped and recorded as checks_selected.'
+      : '.') +
+    (mode === 'worker' || mode === 'worker-end'
+      ? ' Each submitted commit is checked by the coordinator in its own checkout as soon as the worker commits, in parallel and outside integration (never from the worker report); a failure goes back to the same worker with the output, and to you as needs attention after maxConflictRetries.' +
+        (mode === 'worker'
+          ? ' Integration then trial-merges and runs the fast checks, and runs every check again when the integration branch moved since the commit was checked.'
+          : '')
+      : '') +
+    (mode === 'end' || mode === 'worker-end'
+      ? ' Integration runs only the checks marked fast in checkMeta (every check when none is marked fast); every check runs once on the integrated tip after the last ticket lands. A failure there is bisected to one ticket and a fix-<ticket>-<n> ticket is appended automatically (you are notified); the run is held when it cannot be located or the repair limit is reached.'
+      : '') +
+    (mode === 'end' || mode === 'worker-end' || selectChecksByFiles === true
+      ? ' For every check id a ticket verifies, add "check_meta": {"<id>": {"files": ["<glob>", ...], "fast": true|false}} to the manifest: fast true for quick checks that should gate every merge (unit tests, lint, type check), false for slow ones (end-to-end, soak, long benchmarks); files are the globs whose changes that check covers, written wide rather than narrow, because a check whose files match no changed file is skipped. Tell the user which checks you marked fast.'
+      : '') +
+    (mode === 'train'
+      ? ' Integration runs as a merge train: up to trainSize submitted tickets, oldest submission first, are merged one after another and checked once together on the last merge; a pass lands them one by one. A failure is bisected inside the train, the passing tickets ahead of the failing one land, the failing ticket goes back to its worker with the output (to you as needs attention after maxConflictRetries), and the rest wait for the next train.'
+      : '') +
+    ' A manifest may override it with "integration": {"mode", "select_checks_by_files"} and "check_meta".'
+  )
+}
+
+export function captainSection({
+  checks,
+  agents,
+  trackerWriteback,
+  reviewOnComplete,
+  checkTimeoutMs,
+  maxWorkers,
+  integrationMode,
+  selectChecksByFiles,
+}) {
   const presets = Object.keys(agents ?? {})
   const limits =
     'Give each ticket the preset that matches its kind of work (for example UI tickets to a frontend preset, real-host acceptance to a verifier preset) instead of one preset for every ticket. Set max_workers explicitly' +
@@ -106,6 +159,7 @@ export function captainSection({ checks, agents, trackerWriteback, reviewOnCompl
       ', then call dag_run in the current repository. ' +
       checkList(checks),
     limits,
+    integrationNote(integrationMode, selectChecksByFiles),
     importRule +
       (writebackMode(trackerWriteback) === 'off'
         ? ' This profile does not report back to GitHub issues; do not close or comment on them yourself unless the user asks.'
@@ -189,6 +243,11 @@ export function apply(ctx, config = {}, { importer = importTickets, reporter = w
     checkTimeoutMs: setting(config.checkTimeoutMs, 120000),
     trackerWriteback: writebackMode(setting(config.trackerWriteback, 'off')),
     reviewOnComplete: setting(config.reviewOnComplete, false) === true,
+    integrationMode: setting(config.integrationMode, 'end'),
+    selectChecksByFiles: setting(config.selectChecksByFiles, true) === true,
+    checkMeta: setting(config.checkMeta, {}),
+    maxFinalRepairs: setting(config.maxFinalRepairs, 2),
+    trainSize: setting(config.trainSize, 4),
   })
   const live = new Map()
   const notifying = new Map()

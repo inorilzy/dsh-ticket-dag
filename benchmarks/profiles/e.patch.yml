@@ -1,0 +1,15 @@
+# 坦克基准 E（验收在 worker 侧，integrationMode worker）的 profile 片段。合并进当前 profile 的 dsh-ticket-dag 配置，保留其他字段。
+# worker 提交后，插件立即在它的提交上、集成通道之外并行跑全部累计验收（fast 和 soak），不采信 worker 自报。
+# 失败退回原 worker 续做（最多 maxConflictRetries 次）。集成通道只收已通过的提交：试合并后跑 fast；
+# 集成分支在 worker 侧验收之后前进过时，再补跑全部累计验收（事件 reverify）。
+- id: dsh-ticket-dag
+  config:
+    integrationMode: worker
+    selectChecksByFiles: false
+    checkMeta:
+      fast:
+        files: [src/**, checks/unit/**]
+        fast: true
+      soak:
+        files: [src/**, checks/soak.mjs, checks/harness.mjs]
+        fast: false

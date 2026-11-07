@@ -2251,3 +2251,123 @@ test('a ticket row lists its own durations and attempts in its details', () => {
   assert.equal(find(row('B'), (n) => n.type === 'details'), undefined)
   assert.equal(find(row('constructor'), (n) => n.type === 'details'), undefined)
 })
+
+test('the run overview and the plan review name the frozen integration mode', () => {
+  const line = (root) => text(find(root, (n) => n.props['data-dag-integration'] !== undefined))
+  // A run without the field (older hosts, default runs) is each with selection off.
+  const board = boardFor(sample)
+  assert.equal(line(board), '集成模式：each 每张完整验收（按文件选测试：关）')
+  assert.ok(find(find(board, (n) => n.props['aria-label'] === '运行概况'), (n) => n.props['data-dag-integration'] !== undefined))
+  const { root } = (() => {
+    const { paint } = elapsedBoard(timingOf(), { integration: { mode: 'each', selectChecksByFiles: true } })
+    return { root: paint() }
+  })()
+  assert.equal(line(root), '集成模式：each 每张完整验收（按文件选测试：开）')
+  const selected = { ...reviewRun(), integration: { mode: 'end', selectChecksByFiles: false } }
+  const review = loadHost([{ runs: [selected], selected }, selected.key]).renderSlot('sidebar.right.pane.tab', {
+    sessionId: 'session-captain',
+  })
+  assert.equal(line(find(review, (n) => n.props['data-dag-review'] !== undefined)), '集成模式：A 先合并、最后测（按文件选测试：关）')
+})
+
+test('settings carry the integration mode and the file-selection switch, end and on by default', () => {
+  const mode = (root) => find(root, (n) => n.props['aria-label'] === '集成模式')
+  const select = (root) => find(root, (n) => n.props['aria-label'] === '按改动文件选验收命令')
+  const plain = editorFor({}, catalog)
+  assert.equal(mode(plain).props.value, 'end')
+  assert.equal(select(plain).props.checked, true)
+  // An explicit each / off in the profile still shows as each / off.
+  const legacy = editorFor({ integrationMode: 'each', selectChecksByFiles: false }, catalog)
+  assert.equal(mode(legacy).props.value, 'each')
+  assert.equal(select(legacy).props.checked, false)
+  // Every mode this build runs can be picked.
+  const options = findAll(mode(plain), (n) => n.type === 'option')
+  assert.deepEqual(options.map((o) => [o.props.value, Boolean(o.props.disabled)]), [
+    ['each', false],
+    ['end', false],
+    ['worker', false],
+    ['worker-end', false],
+    ['train', false],
+  ])
+  const on = editorFor({ integrationMode: 'each', selectChecksByFiles: true }, catalog)
+  assert.equal(select(on).props.checked, true)
+  assert.equal(mode(editorFor({ integrationMode: 'bogus' }, catalog)).props.value, 'end')
+})
+
+test('an end-mode run overview shows the final check and its bisection while they run', () => {
+  const final = (over) => find(blockOf(elapsedBoard(timingOf(), over).paint()), (n) => n.props['data-dag-final'] !== undefined)
+  const integration = { mode: 'end', selectChecksByFiles: false }
+  assert.equal(final({ integration }), undefined, 'nothing while no final check runs')
+  const running = final({ integration, finalPhase: { stage: 'final', checkId: 'slow', index: 2, total: 3 } })
+  assert.equal(running.props['data-dag-final'], 'final')
+  assert.equal(text(running), '最终验收（全量） · slow 2/3')
+  const bisect = final({ integration, finalPhase: { stage: 'bisect', checkId: 'slow', index: 1, total: 1, step: 2 } })
+  assert.equal(bisect.props['data-dag-final'], 'bisect')
+  assert.equal(text(bisect), '最终验收失败，二分定位出错工单 · 第 2 步 · slow 1/1')
+  assert.equal(text(final({ integration, finalPhase: { stage: 'final' } })), '最终验收（全量）')
+})
+
+test('worker modes: a ticket row shows its worker-side checks running, failed or passed', () => {
+  const sha = 'a'.repeat(40)
+  const root = boardFor(
+    [
+      { id: 'R', status: 'SUBMITTED', attempt: 1, sourceSha: sha, livePhase: { stage: 'worker', checkId: 'slow', index: 1, total: 2 } },
+      { id: 'F', status: 'RUNNING', attempt: 2, livePhase: { stage: 'agent' }, workerVerify: { sourceSha: sha, coveredTip: null, ok: false, failed: ['slow'] } },
+      { id: 'N', status: 'NEEDS_ATTENTION', attempt: 3, sourceSha: sha, workerVerify: { sourceSha: sha, coveredTip: null, ok: false, failed: ['slow', 'fast'] } },
+      { id: 'P', status: 'SUBMITTED', attempt: 1, sourceSha: sha, workerVerify: { sourceSha: sha, coveredTip: sha, ok: true, failed: [] } },
+      // A newer commit than the failed one is not shown as failed; an integrated ticket shows nothing.
+      { id: 'S', status: 'SUBMITTED', attempt: 2, sourceSha: 'b'.repeat(40), workerVerify: { sourceSha: sha, ok: false, failed: ['slow'] } },
+      { id: 'I', status: 'INTEGRATED', attempt: 1, sourceSha: sha, workerVerify: { sourceSha: sha, ok: true, failed: [] } },
+    ].map((t) => ({ dependsOn: [], ...t })),
+  )
+  const line = (id) => find(find(root, (n) => n.props['data-dag-ticket'] === id), (n) => n.props['data-dag-worker-verify'] !== undefined)
+  assert.equal(line('R').props['data-dag-worker-verify'], 'running')
+  assert.equal(text(line('R')), 'worker 侧验收中 · slow 1/2')
+  assert.equal(line('F').props['data-dag-worker-verify'], 'failed')
+  assert.equal(text(line('F')), 'worker 侧验收失败：slow')
+  assert.equal(line('F').props.className, 'dtd-alert')
+  assert.equal(text(line('N')), 'worker 侧验收失败：slow、fast')
+  assert.equal(line('P').props['data-dag-worker-verify'], 'passed')
+  assert.equal(text(line('P')), 'worker 侧验收已通过，等待集成')
+  assert.equal(line('S'), undefined)
+  assert.equal(line('I'), undefined)
+  // The dependency map names the state too, and a running worker-side check counts as work.
+  const node = find(root, (n) => n.props['data-dag-node'] === 'R')
+  assert.equal(node.props['data-tone'], 'work')
+  assert.match(node.props['aria-label'], /worker 侧验收中 · slow 1\/2/)
+})
+
+test('the settings offer the worker modes under their names', () => {
+  const mode = find(editorFor({ integrationMode: 'worker-end' }, catalog), (n) => n.props['aria-label'] === '集成模式')
+  assert.equal(mode.props.value, 'worker-end')
+  const options = findAll(mode, (n) => n.type === 'option').map((o) => [o.props.value, text(o)])
+  assert.deepEqual(options.slice(2, 4), [
+    ['worker', 'E 验收在 worker 侧'],
+    ['worker-end', 'A+E 验收在 worker 侧、最后全量'],
+  ])
+  const line = text(find(elapsedBoard(timingOf(), { integration: { mode: 'worker', selectChecksByFiles: true } }).paint(), (n) => n.props['data-dag-integration'] !== undefined))
+  assert.equal(line, '集成模式：E 验收在 worker 侧（按文件选测试：开）')
+})
+
+test('train mode: the settings offer B with its train size, and the overview shows the train', () => {
+  const editor = editorFor({ integrationMode: 'train', trainSize: 6 }, catalog)
+  const mode = find(editor, (n) => n.props['aria-label'] === '集成模式')
+  assert.equal(mode.props.value, 'train')
+  assert.deepEqual(findAll(mode, (n) => n.type === 'option').map((o) => [o.props.value, text(o)]).at(-1), ['train', 'B 合并列车'])
+  assert.equal(find(editor, (n) => n.props['aria-label'] === '合并列车长度').props.value, '6')
+  // The size control only appears for train.
+  assert.equal(find(editorFor({ integrationMode: 'each' }, catalog), (n) => n.props['aria-label'] === '合并列车长度'), undefined)
+  const integration = { mode: 'train', selectChecksByFiles: false }
+  const board = (over) => elapsedBoard(timingOf(), { integration, ...over }).paint()
+  assert.equal(text(find(board({}), (n) => n.props['data-dag-integration'] !== undefined)), '集成模式：B 合并列车（按文件选测试：关）')
+  const train = (phase) => find(blockOf(board({ trainPhase: phase })), (n) => n.props['data-dag-train'] !== undefined)
+  assert.equal(train(null), undefined)
+  const running = train({ size: 3, stage: 'train', checkId: 'slow', index: 1, total: 2 })
+  assert.equal(running.props['data-dag-train'], 'train')
+  assert.equal(text(running), '列车 3 张 · slow 1/2')
+  const bisect = train({ size: 3, stage: 'train', checkId: 'slow', index: 1, total: 1, bisect: true, step: 1 })
+  assert.equal(bisect.props['data-dag-train'], 'bisect')
+  assert.equal(text(bisect), '列车 3 张 · 验收失败，列车内二分 第 1 步 · slow 1/1')
+  assert.equal(text(train({ size: 2, stage: 'publish', index: 1, total: 2 })), '列车 2 张 · 逐张发布 1/2')
+  assert.equal(text(train({ size: 2, stage: 'merge' })), '列车 2 张 · 依次合并')
+})

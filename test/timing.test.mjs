@@ -96,7 +96,19 @@ test('the gh1-fixes-02 sequence gives the documented numbers', () => {
       B: { attempts: 2, workerMs: 270, queueMs: 140, verifyMs: 50, attentionMs: 0 },
       C: { attempts: 1, workerMs: 90, queueMs: 10, verifyMs: 0, attentionMs: 0 },
     },
-    totals: { workerMs: 540, queueMs: 200, verifyMs: 100, checkRuns: 2, checkFailures: 0, conflicts: 1, attempts: 5 },
+    totals: {
+      workerMs: 540,
+      queueMs: 200,
+      verifyMs: 100,
+      checkRuns: 2,
+      checkFailures: 0,
+      conflicts: 1,
+      attempts: 5,
+      // A ledger without selection or run-level stages records none of these.
+      skippedChecks: 0,
+      finalVerifyMs: 0,
+      workerVerifyMs: 0,
+    },
   })
 })
 

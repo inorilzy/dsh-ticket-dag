@@ -289,11 +289,134 @@ function checkGraph(tickets, externalInputs) {
   if (ready.length !== tickets.length) throw new TypeError('ticket dependency cycle')
 }
 
-/** Accept the spec author's snake_case or the stored camelCase representation. */
-export function normalizeManifest(input, checkRegistry = {}, agentRegistry = {}) {
+/**
+ * Latest worker_verify_finished per ticket, without the output tail. Shared by
+ * RunStore and the read-only dashboard so both show the same result.
+ * @param db - an open DatabaseSync on a run ledger.
+ */
+export function latestWorkerResults(db) {
+  const out = new Map()
+  for (const row of db
+    .prepare("SELECT ticketId,details FROM events WHERE type='worker_verify_finished' AND ticketId IS NOT NULL ORDER BY rowid")
+    .all()) {
+    const { sourceSha, coveredTip, ok, failed } = JSON.parse(row.details)
+    out.set(row.ticketId, { sourceSha, coveredTip: coveredTip ?? null, ok: ok === true, failed: failed ?? [] })
+  }
+  return out
+}
+
+/** Every integration mode the profile and manifest accept; the set is fixed so configs stay valid across builds. */
+export const INTEGRATION_MODES = Object.freeze(['each', 'end', 'worker', 'worker-end', 'train'])
+/** The modes this build can run; the rest are refused at dag_run instead of silently running as each. */
+export const IMPLEMENTED_MODES = Object.freeze(new Set(['each', 'end', 'worker', 'worker-end', 'train']))
+/** Modes whose lane runs only fast checks and whose run completes after one final full check. */
+export const END_MODES = Object.freeze(new Set(['end', 'worker-end']))
+/** Modes that check each submitted commit in a probe, in parallel and outside the integration lane. */
+export const WORKER_MODES = Object.freeze(new Set(['worker', 'worker-end']))
+const defaultFinalRepairs = 2
+const defaultTrainSize = 4
+
+/**
+ * The integration settings a run froze into its manifest. A manifest without
+ * the field (every run from before 0.16, and every default run) is each with
+ * file selection off.
+ */
+export function integrationOf(manifest) {
+  const frozen = manifest?.integration
+  return {
+    mode: typeof frozen?.mode === 'string' ? frozen.mode : 'each',
+    selectChecksByFiles: frozen?.selectChecksByFiles === true,
+  }
+}
+
+/** How many fix tickets a failed final check may append automatically; only end modes freeze it. */
+export function maxFinalRepairsOf(manifest) {
+  const value = manifest?.integration?.maxFinalRepairs
+  return Number.isSafeInteger(value) && value >= 0 ? value : defaultFinalRepairs
+}
+
+/** How many submitted tickets one merge train takes at most; only train freezes it. */
+export function trainSizeOf(manifest) {
+  const value = manifest?.integration?.trainSize
+  return Number.isSafeInteger(value) && value >= 1 ? value : defaultTrainSize
+}
+
+function integrationMode(value, field) {
+  if (!INTEGRATION_MODES.includes(value))
+    throw new TypeError(field + ' must be one of ' + INTEGRATION_MODES.join(', '))
+  if (!IMPLEMENTED_MODES.has(value))
+    throw new TypeError('integration mode ' + value + ' is not implemented in this build')
+  return value
+}
+
+function normalizeIntegration(raw, defaults) {
+  if (raw !== undefined) record(raw, 'integration')
+  const mode = integrationMode(raw?.mode ?? defaults.integrationMode ?? 'each', 'integration.mode')
+  const select = raw?.select_checks_by_files ?? raw?.selectChecksByFiles ?? defaults.selectChecksByFiles ?? false
+  if (typeof select !== 'boolean') throw new TypeError('integration.select_checks_by_files must be a boolean')
+  if (mode === 'train') {
+    const size = raw?.train_size ?? raw?.trainSize ?? defaults.trainSize ?? defaultTrainSize
+    if (!Number.isSafeInteger(size) || size < 2 || size > 16)
+      throw new RangeError('integration.train_size must be an integer between 2 and 16')
+    return { mode, selectChecksByFiles: select, trainSize: size }
+  }
+  if (!END_MODES.has(mode)) return { mode, selectChecksByFiles: select }
+  const repairs = raw?.max_final_repairs ?? raw?.maxFinalRepairs ?? defaults.maxFinalRepairs ?? defaultFinalRepairs
+  if (!Number.isSafeInteger(repairs) || repairs < 0 || repairs > 10)
+    throw new RangeError('integration.max_final_repairs must be an integer between 0 and 10')
+  return { mode, selectChecksByFiles: select, maxFinalRepairs: repairs }
+}
+
+function metaEntry(value, field) {
+  record(value, field)
+  const entry = {}
+  if (value.files !== undefined) entry.files = strings(value.files, field + '.files')
+  if (value.fast !== undefined) {
+    if (typeof value.fast !== 'boolean') throw new TypeError(field + '.fast must be a boolean')
+    entry.fast = value.fast
+  }
+  return entry
+}
+
+// Metadata for the check IDs the tickets use: the profile's as the base, the
+// manifest's field by field on top. A manifest entry for an unused or unknown
+// ID is an error (the captain wrote it); a profile entry for one is ignored.
+function normalizeCheckMeta(raw, profile, used) {
+  const merged = {}
+  if (profile !== undefined && profile !== null) {
+    record(profile, 'checkMeta')
+    for (const id of Object.keys(profile))
+      if (used.has(id)) merged[id] = metaEntry(profile[id], 'checkMeta.' + id)
+  }
+  if (raw !== undefined) {
+    record(raw, 'check_meta')
+    for (const id of Object.keys(raw)) {
+      if (!used.has(id)) throw new TypeError('check_meta names ' + id + ', which no ticket verifies')
+      merged[id] = { ...merged[id], ...metaEntry(raw[id], 'check_meta.' + id) }
+    }
+  }
+  const out = {}
+  // Ticket order keeps the stored JSON stable for the same plan.
+  for (const id of used) {
+    const entry = merged[id]
+    if (!entry) continue
+    const files = entry.files ?? []
+    const fast = entry.fast ?? false
+    if (files.length || fast) out[id] = { files, fast }
+  }
+  return out
+}
+
+/**
+ * Accept the spec author's snake_case or the stored camelCase representation.
+ * defaults carries the profile's integrationMode, selectChecksByFiles and
+ * checkMeta; the manifest's own integration / check_meta win over them.
+ */
+export function normalizeManifest(input, checkRegistry = {}, agentRegistry = {}, defaults = {}) {
   record(input, 'manifest')
   record(checkRegistry, 'checkRegistry')
   record(agentRegistry, 'agentRegistry')
+  record(defaults, 'defaults')
   const specId = safeId(input.specId ?? input.spec_id, 'specId')
   const baseRef = gitRef(input.baseRef ?? input.base_ref ?? 'main')
   const maxWorkers = input.maxWorkers ?? input.max_workers ?? 16
@@ -305,6 +428,11 @@ export function normalizeManifest(input, checkRegistry = {}, agentRegistry = {})
   const checks = planChecks(input.checks, checkRegistry)
   const tickets = normalizeTickets(input.tickets, { ...checkRegistry, ...checks }, agentRegistry)
   checkGraph(tickets, externalInputs)
+  const integration = normalizeIntegration(input.integration, defaults)
+  const used = new Set(tickets.flatMap((t) => t.verify))
+  const checkMeta = normalizeCheckMeta(input.check_meta ?? input.checkMeta, defaults.checkMeta, used)
+  // Both fields are written only when they change something, so a default
+  // manifest keeps the exact JSON (and run identity) of earlier versions.
   return {
     specId,
     baseRef,
@@ -312,6 +440,8 @@ export function normalizeManifest(input, checkRegistry = {}, agentRegistry = {})
     tickets,
     ...(externalInputs.length ? { externalInputs } : {}),
     ...(Object.keys(checks).length ? { checks } : {}),
+    ...(integration.mode !== 'each' || integration.selectChecksByFiles ? { integration } : {}),
+    ...(Object.keys(checkMeta).length ? { checkMeta } : {}),
   }
 }
 
@@ -642,9 +772,38 @@ export class RunStore {
     text(policyHash, 'policyHash')
     if (limit !== Infinity && (!Number.isInteger(limit) || limit < 0))
       throw new TypeError('limit must be a nonnegative integer')
+    return this.#transaction(() => this.#append(tickets, policyHash, limit))
+  }
+
+  /**
+   * A failed final check located at one ticket: append its fix ticket and
+   * record final_verify_failed (notifying the captain) in one transaction, so
+   * the repair count read from the events never misses an appended fix.
+   * Not bounded by maxAppendedTickets; maxFinalRepairs bounds it.
+   * @param ticket - one normalized ticket definition.
+   * @param details - { tipSha, failed, culprit, culpritSha }.
+   */
+  appendRepair(ticket, { policyHash, details }) {
+    text(policyHash, 'policyHash')
+    record(details, 'final failure')
+    return this.#transaction(() => {
+      const result = this.#append([ticket], policyHash, Infinity)
+      this.#event(
+        'final_verify_failed',
+        null,
+        'Final check failed (' + details.failed.join(', ') + ') at ' + details.tipSha + '; located ' +
+          details.culprit + ', appended ' + ticket.id,
+        { ...details, repair: ticket.id },
+        true,
+      )
+      return result
+    })
+  }
+
+  #append(tickets, policyHash, limit) {
     // Presets resolve to a route at append time; the request is the ticket without it.
     const request = ({ agentSpec, ...rest }) => JSON.stringify(rest)
-    return this.#transaction(() => {
+    {
       const run = this.meta()
       if (!run) throw new Error('run is not initialized')
       if (run.mode === 'cancelled') throw new Error('A cancelled run cannot take more tickets; start a new run')
@@ -691,7 +850,7 @@ export class RunStore {
       const ids = tickets.map((t) => t.id)
       this.#event('tickets_appended', null, 'Appended ' + ids.join(', '), { batch, tickets: ids })
       return { batch, appendedAt: createdAt, tickets: ids, added: true }
-    })
+    }
   }
 
   /** Each dag_add batch in order: { batch, createdAt, policyHash, tickets: definitions }. */
@@ -887,7 +1046,11 @@ export class RunStore {
     })
   }
 
-  finish(id, lease, landedSha) {
+  /**
+   * @param options.complete - false in end modes: the last integration does not
+   * complete the run, completeRun does after the final full check.
+   */
+  finish(id, lease, landedSha, { complete = true } = {}) {
     return this.#transaction(() => {
       const publishing = this.#db
         .prepare('SELECT oldTip,candidateSha FROM intents WHERE ticketId=? AND lease=?')
@@ -907,6 +1070,7 @@ export class RunStore {
       this.#db.prepare('DELETE FROM intents WHERE ticketId=? AND lease=?').run(id, lease)
       this.#event('integrated', this.get(id), id + ' integrated', { lease, landedSha })
       if (
+        complete &&
         run.mode !== 'cancelled' &&
         !this.#db.prepare("SELECT 1 FROM tickets WHERE status != 'INTEGRATED' LIMIT 1").get()
       ) {
@@ -914,6 +1078,85 @@ export class RunStore {
       }
       return true
     })
+  }
+
+  /**
+   * The final full check passed at tipSha. Records final_verified and, while
+   * tipSha is still the tip and every ticket is integrated, run_completed.
+   * @returns true when the run completed.
+   */
+  completeRun(tipSha, details = {}) {
+    text(tipSha, 'tipSha')
+    return this.#transaction(() => {
+      const run = this.meta()
+      if (!run || run.mode === 'cancelled') return false
+      this.#event('final_verified', null, 'Final checks passed at ' + tipSha, { ...details, tipSha })
+      if (run.tipSha !== tipSha || this.#db.prepare("SELECT 1 FROM tickets WHERE status != 'INTEGRATED' LIMIT 1").get())
+        return false
+      this.#event(
+        'run_completed',
+        null,
+        'All tickets integrated and the final checks passed at ' + tipSha,
+        { landedSha: tipSha, finalVerified: true },
+        true,
+      )
+      return true
+    })
+  }
+
+  /** Whether a final full check already passed at this tip. */
+  finalVerified(tipSha) {
+    return Boolean(
+      this.#db
+        .prepare("SELECT 1 FROM events WHERE type='final_verified' AND json_extract(details,'$.tipSha')=? LIMIT 1")
+        .get(tipSha),
+    )
+  }
+
+  /** Fix tickets a failed final check has appended so far in this run. */
+  finalRepairs() {
+    return this.#db
+      .prepare("SELECT COUNT(*) AS n FROM events WHERE type='final_verify_failed' AND json_extract(details,'$.repair') IS NOT NULL")
+      .get().n
+  }
+
+  /**
+   * A final-check progress event: final_verify_started { tipSha, checks },
+   * bisect_step { sha, ok, checks }, or final_verify_failed without a repair
+   * (the run is held next). Timing only; the captain is not notified.
+   */
+  recordFinal(type, message, details) {
+    if (!['final_verify_started', 'bisect_step', 'final_verify_failed'].includes(type))
+      throw new TypeError('not a final-check event: ' + type)
+    text(message, 'message')
+    record(details, 'details')
+    this.#transaction(() => this.#event(type, null, message, details))
+  }
+
+  /**
+   * A merge-train progress event: train_started { tipSha, tickets, merges, conflicts, checks },
+   * train_bisect_step { sha, ok, checks }, train_failed { tipSha, failed, culprit, culpritSha, published }
+   * or train_passed { tipSha, lastSha, tickets }. Timing only; the captain is not notified.
+   */
+  recordTrain(type, message, details) {
+    if (!['train_started', 'train_bisect_step', 'train_failed', 'train_passed'].includes(type))
+      throw new TypeError('not a merge-train event: ' + type)
+    text(message, 'message')
+    record(details, 'details')
+    this.#transaction(() => this.#event(type, null, message, details))
+  }
+
+  /**
+   * When each ticket last entered SUBMITTED, as the ledger sequence of that
+   * submitted event: the merge train takes submissions first in, first out.
+   */
+  submittedOrder() {
+    const out = new Map()
+    for (const row of this.#db
+      .prepare("SELECT ticketId, MAX(rowid) AS seq FROM events WHERE type='submitted' AND ticketId IS NOT NULL GROUP BY ticketId")
+      .all())
+      out.set(row.ticketId, row.seq)
+    return out
   }
 
   /**
@@ -941,6 +1184,69 @@ export class RunStore {
       this.#event('conflict_requeued', this.get(id), message, { oldLease: lease, conflictRetries: used + 1 })
       return true
     })
+  }
+
+  /**
+   * Send a submitted ticket whose checks failed (worker-side checks, or the
+   * merge train located it) back to its own branch, like requeueConflict: the
+   * next attempt resumes the same worktree with the failure as its diagnostic.
+   * Counted apart from conflicts.
+   * @returns true when the ticket was requeued; false past maxRetries or on a stale lease.
+   */
+  requeueCheckFailure(id, lease, { message, maxRetries = 2 }) {
+    if (!Number.isSafeInteger(maxRetries) || maxRetries < 0)
+      throw new TypeError('maxRetries must be a nonnegative integer')
+    text(message, 'check failure message')
+    return this.#transaction(() => {
+      if (this.meta()?.mode !== 'active' || this.#hasIntent(id)) return false
+      const used = this.#db
+        .prepare("SELECT COUNT(*) AS n FROM events WHERE type='check_requeued' AND ticketId=?")
+        .get(id).n
+      if (used >= maxRetries) return false
+      const result = this.#db
+        .prepare(
+          "UPDATE tickets SET status='PENDING', lease=NULL, retryAt=0, message=? WHERE id=? AND status='SUBMITTED' AND lease=?",
+        )
+        .run(message, id, lease)
+      if (result.changes !== 1) return false
+      this.#event('check_requeued', this.get(id), message, { oldLease: lease, checkRetries: used + 1 })
+      return true
+    })
+  }
+
+  /**
+   * The worker-side checks of one submitted commit ended. Timing only; the
+   * captain is not notified. The ledger keeps the result so a restart reuses it.
+   * @param details - { sourceSha, coveredTip, ok, checks, failed, output }.
+   */
+  recordWorkerVerify(id, details) {
+    record(details, 'worker verification')
+    text(details.sourceSha, 'sourceSha')
+    const note = id + ' worker-side checks ' + (details.ok ? 'passed' : 'failed') + ' at ' + details.sourceSha
+    this.#transaction(() => this.#event('worker_verify_finished', this.get(id), note, details))
+  }
+
+  /** The latest worker-side result for this exact commit of the ticket, or null. */
+  workerVerify(id, sourceSha) {
+    const row = this.#db
+      .prepare(
+        "SELECT details FROM events WHERE type='worker_verify_finished' AND ticketId=? AND json_extract(details,'$.sourceSha')=? ORDER BY rowid DESC LIMIT 1",
+      )
+      .get(id, sourceSha)
+    return row ? JSON.parse(row.details) : null
+  }
+
+  /** The latest worker-side result of every ticket that has one, by ticket ID. */
+  workerResults() {
+    return latestWorkerResults(this.#db)
+  }
+
+  /** The worker-mode lane runs every check again: reason is tip-moved or not-covered. Timing only. */
+  recordReverify(id, details) {
+    record(details, 'reverify')
+    this.#transaction(() =>
+      this.#event('reverify', this.get(id), id + ' checks run again in the lane (' + details.reason + ')', details),
+    )
   }
 
   /** Call only after this generation's writer has demonstrably quiesced. */
@@ -1033,12 +1339,30 @@ export class RunStore {
     this.#transaction(() => this.#event('verify_started', this.get(id), id + ' verification started', { checks }))
   }
 
-  /** One check command ended. Timing only; the captain is not notified. */
-  recordCheck(id, { checkId, ms, ok, aborted = false }) {
+  /**
+   * One check command ended. Timing only; the captain is not notified.
+   * @param id - the ticket, or null for a run-level check (final, bisect, train).
+   * @param stage - lane (the default, not stored), worker, final, bisect or train.
+   */
+  recordCheck(id, { checkId, ms, ok, aborted = false, stage = 'lane' }) {
     const details = aborted ? { checkId, ms, ok, aborted } : { checkId, ms, ok }
+    if (stage !== 'lane') details.stage = stage
     this.#transaction(() =>
-      this.#event('check_finished', this.get(id), checkId + (ok ? ' passed' : ' did not pass'), details),
+      this.#event('check_finished', id ? this.get(id) : null, checkId + (ok ? ' passed' : ' did not pass'), details),
     )
+  }
+
+  /**
+   * Which checks a candidate runs after file selection. Timing only; the captain is not notified.
+   * @param id - the ticket, or null for a run-level selection.
+   * @param details - { stage, run, skipped, fallback, changed }.
+   */
+  recordSelection(id, details) {
+    record(details, 'selection')
+    const note =
+      (details.run?.length ?? 0) + ' checks selected, ' + (details.skipped?.length ?? 0) + ' skipped' +
+      (details.fallback ? ' (' + details.fallback + ')' : '')
+    this.#transaction(() => this.#event('checks_selected', id ? this.get(id) : null, note, details))
   }
 
   events() {

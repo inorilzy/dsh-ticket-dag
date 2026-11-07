@@ -1,0 +1,16 @@
+# 坦克基准 A+E+F（worker 侧验收 + 最后全量 + 按改动文件选测试）的 profile 片段。合并进当前 profile 的 dsh-ticket-dag 配置，保留其他字段。
+# worker 侧：插件在 worker 的提交上跑累计验收，按“已覆盖的集成 tip（或基线）→ 提交”的改动文件过滤。
+# 集成通道：试合并后只跑 fast（按 tip..候选 的改动文件过滤），从不补跑 soak。
+# 最终全量：全部集成后跑全部验收（不过滤），失败二分定位并自动追加 fix-<工单>-<n>，最多 maxFinalRepairs 张。
+- id: dsh-ticket-dag
+  config:
+    integrationMode: worker-end
+    selectChecksByFiles: true
+    maxFinalRepairs: 2
+    checkMeta:
+      fast:
+        files: [src/**, checks/unit/**]
+        fast: true
+      soak:
+        files: [src/**, checks/soak.mjs, checks/harness.mjs]
+        fast: false

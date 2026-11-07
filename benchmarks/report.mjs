@@ -6,6 +6,7 @@
 import { existsSync, readdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { integrationOf } from '../src/store.mjs'
 import { runTiming } from '../src/timing.mjs'
 
 const USAGE = 'usage: node benchmarks/report.mjs [--json] <label=trial-directory> ...'
@@ -17,6 +18,7 @@ const COLUMNS = [
   ['验收', 'verifyMs', duration],
   ['验收命令次数', 'checkRuns', count],
   ['验收失败次数', 'checkFailures', count],
+  ['跳过验收数', 'skippedChecks', count],
   ['冲突次数', 'conflicts', count],
   ['尝试次数', 'attempts', count],
 ]
@@ -70,10 +72,17 @@ function readRun(file, now) {
       .all()
       .map((row) => ({ ...row, details: JSON.parse(row.details) }))
     const timing = runTiming(events, now)
-    return { file, counts, timing, problem: runProblem(counts, events, timing) }
+    const row = db.prepare('SELECT manifest FROM run WHERE singleton=1').get()
+    const integration = integrationOf(row ? JSON.parse(row.manifest) : null)
+    return { file, counts, timing, integration, mode: modeName(integration), problem: runProblem(counts, events, timing) }
   } finally {
     db.close()
   }
+}
+
+// 运行实际用的集成模式，取自冻结在账本清单里的设置；按文件选测试记为 +F。
+function modeName({ mode, selectChecksByFiles }) {
+  return mode + (selectChecksByFiles ? '+F' : '')
 }
 
 // 全部 INTEGRATED 还不够：暂停或取消后才收尾的运行，时钟停在收尾之前，用时偏小。
@@ -103,13 +112,15 @@ function metricsOf({ accumulatedMs, attentionMs, totals }) {
     verifyMs: totals.verifyMs,
     checkRuns: recorded ? totals.checkRuns : null,
     checkFailures: recorded ? totals.checkFailures : null,
+    // 旧版 runTiming 没有这一项；旧账本也确实没有跳过任何验收。
+    skippedChecks: totals.skippedChecks ?? 0,
     conflicts: totals.conflicts,
     attempts: totals.attempts,
   }
 }
 
 function readTrial({ label, dir }, now) {
-  const trial = { label, dir, runs: [], reasons: [], metrics: null }
+  const trial = { label, dir, runs: [], reasons: [], metrics: null, mode: null }
   try {
     for (const file of ledgerFiles(dir)) trial.runs.push(readRun(file, now))
   } catch (err) {
@@ -119,6 +130,7 @@ function readTrial({ label, dir }, now) {
   if (!trial.runs.length) trial.reasons.push('没有找到运行账本')
   if (trial.runs.length > 1) trial.reasons.push(`有 ${trial.runs.length} 轮运行，一个 trial 只应有一轮`)
   for (const run of trial.runs) if (run.problem) trial.reasons.push(run.problem)
+  if (trial.runs.length === 1) trial.mode = trial.runs[0].mode
   if (!trial.reasons.length) trial.metrics = metricsOf(trial.runs[0].timing)
   return trial
 }
@@ -144,7 +156,10 @@ function summarize(trials) {
   return [...groups].map(([label, members]) => {
     const rounds = members.filter((t) => t.metrics).map((t) => t.metrics)
     const summary = Object.fromEntries(METRICS.map((key) => [key, stats(rounds.map((m) => m[key]))]))
-    return { label, rounds: rounds.length, summary, trials: members }
+    // label 只是名字：实际模式看计入汇总的各轮账本。
+    const modes = [...new Set(members.filter((t) => t.metrics).map((t) => t.mode))]
+    const warnings = modes.length > 1 ? [`label ${label} 下各轮的实际模式不一致：${modes.join('、')}`] : []
+    return { label, rounds: rounds.length, mode: modes.length === 1 ? modes[0] : null, modes, warnings, summary, trials: members }
   })
 }
 
@@ -164,13 +179,14 @@ function count(n) {
 
 function markdown(groups) {
   const row = (cells) => '| ' + cells.map((c) => String(c).replaceAll('|', '\\|')).join(' | ') + ' |'
-  const headers = ['label', '轮数', '累计用时（中位数，最小–最大）', ...COLUMNS.map(([title]) => title)]
+  const headers = ['label', '实际模式', '轮数', '累计用时（中位数，最小–最大）', ...COLUMNS.map(([title]) => title)]
   const lines = [row(headers), row(headers.map(() => '---'))]
-  for (const { label, rounds, summary } of groups) {
+  for (const { label, mode, modes, rounds, summary } of groups) {
     const total = summary.accumulatedMs
     lines.push(
       row([
         label,
+        mode ?? (modes.length ? modes.join('/') : MISSING),
         rounds,
         total ? `${duration(total.median)}（${duration(total.min)}–${duration(total.max)}）` : MISSING,
         ...COLUMNS.map(([, key, format]) => (summary[key] ? format(summary[key].median) : MISSING)),
@@ -178,6 +194,11 @@ function markdown(groups) {
     )
   }
   lines.push('', `除累计用时的最小最大外，各列都是各轮的中位数。${MISSING} 表示账本里没有这项数据，不是 0。`)
+  const warnings = groups.flatMap((g) => g.warnings)
+  if (warnings.length) {
+    lines.push('', '## 警告', '')
+    for (const w of warnings) lines.push('- ' + w + '。模式不同的轮次不应放在同一个 label 下比较。')
+  }
   const excluded = groups.flatMap((g) => g.trials).filter((t) => !t.metrics)
   if (excluded.length) {
     lines.push('', '## 未计入汇总', '')

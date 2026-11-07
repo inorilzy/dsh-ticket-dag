@@ -13,6 +13,13 @@
 // verifyMs sums its finished check commands. A ticket with no verify_started has
 // neither number (null), and totals are null while any integrated ticket lacks
 // one: a ledger from before these events cannot split the two.
+//
+// A run-level check_finished (no ticket: a final full check, a bisect step or a
+// merge train) counts in the run totals but in no ticket. skippedChecks sums the
+// checks file selection skipped; finalVerifyMs and workerVerifyMs split verifyMs
+// by the stage the check ran in. Older ledgers have none of these: all 0.
+// Worker-side checks (worker modes) are recorded on their ticket, so they count
+// in that ticket's verifyMs as well as in workerVerifyMs.
 
 // Each of these means the ticket left whatever state it was in.
 const SETTLES_TICKET = new Set([
@@ -24,6 +31,7 @@ const SETTLES_TICKET = new Set([
   'needs_attention',
   'cancelled',
   'conflict_requeued',
+  'check_requeued',
   'retry_deferred',
   'retry_requested',
   'isolated_retry_requested',
@@ -57,6 +65,10 @@ export function runTiming(events, now) {
   let settled = false
   let cancelled = false
   const totals = { workerMs: 0, queueMs: 0, verifyMs: 0, checkRuns: 0, checkFailures: 0, conflicts: 0, attempts: 0 }
+  let runVerifyMs = 0
+  let skippedChecks = 0
+  let finalVerifyMs = 0
+  let workerVerifyMs = 0
   const tickets = new Map()
   const inAttention = new Set()
 
@@ -123,6 +135,17 @@ export function runTiming(events, now) {
         break
     }
     applyRunState(at)
+    if (e.type === 'checks_selected') skippedChecks += Array.isArray(e.details?.skipped) ? e.details.skipped.length : 0
+    if (e.type === 'check_finished') {
+      const ms = Number.isFinite(e.details?.ms) ? e.details.ms : 0
+      const stage = e.details?.stage
+      if (stage === 'final' || stage === 'bisect') finalVerifyMs += ms
+      else if (stage === 'worker') workerVerifyMs += ms
+      totals.checkRuns++
+      // A check stopped by cancel or shutdown says nothing about the code.
+      if (e.details?.ok === false && !e.details.aborted) totals.checkFailures++
+      if (!e.ticketId) runVerifyMs += ms
+    }
     if (!e.ticketId) continue
     const t = ticketOf(e.ticketId)
     if (SETTLES_TICKET.has(e.type)) {
@@ -153,9 +176,6 @@ export function runTiming(events, now) {
         break
       case 'check_finished':
         t.verifyMs += Number.isFinite(e.details?.ms) ? e.details.ms : 0
-        totals.checkRuns++
-        // A check stopped by cancel or shutdown says nothing about the code.
-        if (e.details?.ok === false && !e.details.aborted) totals.checkFailures++
         break
     }
   }
@@ -185,6 +205,8 @@ export function runTiming(events, now) {
     } else if (t.integrated) timedAll = false
   }
   if (!timedAny || !timedAll) totals.queueMs = totals.verifyMs = null
+  else totals.verifyMs += runVerifyMs
+  Object.assign(totals, { skippedChecks, finalVerifyMs, workerVerifyMs })
 
   return {
     startedAt: origin.createdAt,

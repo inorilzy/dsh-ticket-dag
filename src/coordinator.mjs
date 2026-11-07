@@ -3,7 +3,19 @@ import { access, lstat, mkdir, readFile, readdir, writeFile } from 'node:fs/prom
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import * as git from './git.mjs'
-import { agentSpec, ledgerSnapshot, normalizeAppend, normalizeManifest, RunStore } from './store.mjs'
+import { selectChecks } from './selection.mjs'
+import {
+  agentSpec,
+  END_MODES,
+  integrationOf,
+  ledgerSnapshot,
+  maxFinalRepairsOf,
+  normalizeAppend,
+  normalizeManifest,
+  RunStore,
+  trainSizeOf,
+  WORKER_MODES,
+} from './store.mjs'
 import { runTiming } from './timing.mjs'
 
 const hash = (text) => createHash('sha256').update(text).digest('hex')
@@ -13,6 +25,15 @@ const transient =
   /\b(TRANSPORT|TIMEOUT|ECONNRESET|ETIMEDOUT|STREAM_CLOSED|RATE_LIMIT)\b|unexpected EOF|before a terminal event/i
 const capacityCode = 'ACTIVATION_LIMIT_REACHED'
 const runPattern = /^[a-z0-9][a-z0-9_-]{0,62}$/
+// End modes defer every non-fast check to one final full check of the integrated tip.
+const endMode = (manifest) => END_MODES.has(integrationOf(manifest).mode)
+// Worker modes check every submitted commit in a probe before the lane takes it.
+const workerMode = (manifest) => WORKER_MODES.has(integrationOf(manifest).mode)
+// The merge train verifies several submissions at once on a chain of merges.
+const trainMode = (manifest) => integrationOf(manifest).mode === 'train'
+const usedChecks = (tickets) => [...new Set(tickets.flatMap((t) => t.verify))]
+// Whether the frozen plan marked any check fast; an end-mode lane relies on it.
+const hasFastCheck = (manifest) => Object.values(manifest?.checkMeta ?? {}).some((entry) => entry?.fast === true)
 
 function requireValue(test, text, code) {
   if (!test) {
@@ -130,7 +151,17 @@ function specPrompt(meta, row, upstream) {
     row.prompt,
     'Acceptance: ' + JSON.stringify(row.acceptance) + '. ' +
       (row.verify.length
-        ? 'Required check IDs: ' + JSON.stringify(row.verify) + ' (the coordinator runs them after you commit).'
+        ? 'Required check IDs: ' + JSON.stringify(row.verify) +
+          (workerMode(meta.manifest)
+            ? ' (the coordinator runs all of them on your commit as soon as you commit, before it may integrate it' +
+              (endMode(meta.manifest)
+                ? ', and all of them once more after every ticket is integrated'
+                : ', and again at integration only if the integration branch moved since') +
+              '. Before committing, always merge the latest integration branch ' + branch +
+              ' so those checks cover it, and run them yourself.)'
+            : endMode(meta.manifest)
+            ? ' (the coordinator runs the fast ones when it integrates your commit and all of them once every ticket is integrated, so run them yourself before committing).'
+            : ' (the coordinator runs them after you commit).')
         : 'No automatic check is attached: the coordinator only trial-merges your commit, so test your own change before committing.'),
     'Before the final commit, run git merge ' +
       branch +
@@ -223,6 +254,11 @@ export class Coordinator {
     maxConflictRetries = 2,
     trackerWriteback = 'off',
     reviewOnComplete = false,
+    integrationMode = 'each',
+    selectChecksByFiles = false,
+    checkMeta = {},
+    maxFinalRepairs = 2,
+    trainSize = 4,
     validateRoutes,
     writeback,
   } = {}) {
@@ -248,6 +284,11 @@ export class Coordinator {
       maxConflictRetries,
       trackerWriteback,
       reviewOnComplete,
+      integrationMode,
+      selectChecksByFiles,
+      checkMeta,
+      maxFinalRepairs,
+      trainSize,
       validateRoutes,
       writeback,
     })
@@ -276,6 +317,11 @@ export class Coordinator {
     checkTimeoutMs,
     trackerWriteback = this.trackerWriteback,
     reviewOnComplete = this.reviewOnComplete,
+    integrationMode = this.integrationMode,
+    selectChecksByFiles = this.selectChecksByFiles,
+    checkMeta = this.checkMeta,
+    maxFinalRepairs = this.maxFinalRepairs,
+    trainSize = this.trainSize,
   }) {
     requireValue(
       Number.isInteger(maxWorkers) && maxWorkers >= 1 && maxWorkers <= 32,
@@ -287,7 +333,8 @@ export class Coordinator {
     )
     requireValue(Number.isInteger(maxAppendedTickets) && maxAppendedTickets >= 0, 'Invalid maxAppendedTickets')
     // Already-open runs retain their immutable verification command and agent
-    // preset snapshots. A running worker or a verification process keeps its handle.
+    // preset snapshots, and the integration settings frozen in their manifest.
+    // A running worker or a verification process keeps its handle.
     Object.assign(this, {
       checks,
       agents,
@@ -298,6 +345,11 @@ export class Coordinator {
       checkTimeoutMs,
       trackerWriteback,
       reviewOnComplete,
+      integrationMode,
+      selectChecksByFiles,
+      checkMeta,
+      maxFinalRepairs,
+      trainSize,
     })
     for (const run of this.runs.values()) this._wake(run)
   }
@@ -307,7 +359,13 @@ export class Coordinator {
       !this.stopping && typeof parentId === 'string' && parentId.length,
       'A live captain is required',
     )
-    const manifest = normalizeManifest(input, checks, this.agents)
+    const manifest = normalizeManifest(input, checks, this.agents, {
+      integrationMode: this.integrationMode,
+      selectChecksByFiles: this.selectChecksByFiles,
+      checkMeta: this.checkMeta,
+      maxFinalRepairs: this.maxFinalRepairs,
+      trainSize: this.trainSize,
+    })
     const id = safeId(runId ?? 'r-' + hash(parentId + '\0' + manifest.specId).slice(0, 20))
     // Commands the captain wrote run only after the user approves them, even
     // with requireApproval off.
@@ -419,6 +477,10 @@ export class Coordinator {
         again: false,
         work: new Map(),
         integration: null,
+        // Worker-side checks in flight, by ticket ID; at most run.limit of them.
+        verifying: new Map(),
+        // Probe checkouts that could not be created, by ticket: { tries, at } for a bounded delayed retry.
+        probeRetry: new Map(),
         notifier: null,
         timer: null,
         due: 0,
@@ -611,8 +673,9 @@ export class Coordinator {
     for (const i of open) {
       const actual = await git.resolveRef(m.repo, m.ref)
       await git.assertMergeParents(m.repo, i.candidateSha, i.oldTip, i.sourceSha)
+      const complete = { complete: !endMode(m.manifest) }
       if (actual === i.candidateSha) {
-        requireValue(run.db.finish(i.id, i.lease, i.candidateSha), 'Cannot repair the published ledger')
+        requireValue(run.db.finish(i.id, i.lease, i.candidateSha, complete), 'Cannot repair the published ledger')
         this._writeback(run, i.id)
       } else if (actual === i.oldTip) {
         if (m.mode === 'cancelled') {
@@ -622,7 +685,7 @@ export class Coordinator {
         if (m.mode !== 'active' || !publish) continue
         this._checkPolicy(run)
         await git.publishCandidate(m.repo, m.ref, i.oldTip, i.candidateSha)
-        requireValue(run.db.finish(i.id, i.lease, i.candidateSha), 'Cannot finish recovered publication')
+        requireValue(run.db.finish(i.id, i.lease, i.candidateSha, complete), 'Cannot finish recovered publication')
         this._writeback(run, i.id)
       } else throw new Error('Unrecognized target tip during publication recovery: ' + i.id)
     }
@@ -640,11 +703,20 @@ export class Coordinator {
     const planCommands = Object.entries(m.manifest.checks ?? {}).filter(([id]) => !unapproved.includes(id))
     const counts = Object.create(null)
     for (const t of tickets) counts[t.status] = (counts[t.status] ?? 0) + 1
+    const workerResults = run.db.workerResults()
     return {
       runId: m.runId,
       specId: m.manifest.specId,
       mode: m.mode,
-      complete: tickets.every((t) => t.status === 'INTEGRATED'),
+      // An end-mode run completes only once the final full check passed at its tip.
+      complete:
+        tickets.every((t) => t.status === 'INTEGRATED') && (!endMode(m.manifest) || run.db.finalVerified(m.tipSha)),
+      // The settings frozen at dag_run, not the live profile.
+      integration: integrationOf(m.manifest),
+      // The final full check or its bisection while it runs: { stage, checkId, index, total }.
+      finalPhase: run.integration?.final ? run.integration.phase : null,
+      // A merge train while it runs: { size, stage, checkId, index, total, step? }.
+      trainPhase: run.integration?.train ? { size: run.integration.size, ...run.integration.phase } : null,
       integrationRef: m.ref,
       verifiedSha: m.tipSha,
       // The opaque version of the plan the review is showing. Sending it back
@@ -699,9 +771,14 @@ export class Coordinator {
           livePhase:
             status === 'RUNNING'
               ? (run.work.get(id)?.phase ?? null)
-              : run.integration?.id === id && (status === 'SUBMITTED' || status === 'PUBLISHING')
+              : (run.integration?.id === id || run.integration?.ids?.includes(id)) &&
+                  (status === 'SUBMITTED' || status === 'PUBLISHING')
                 ? run.integration.phase
-                : null,
+                : status === 'SUBMITTED'
+                  ? (run.verifying.get(id)?.phase ?? null)
+                  : null,
+          // Worker modes: the latest worker-side result { sourceSha, coveredTip, ok, failed }.
+          workerVerify: workerResults.get(id) ?? null,
           attempt,
           dependsOn,
           verify,
@@ -823,7 +900,7 @@ export class Coordinator {
   async cancel(q) {
     const run = await this._open(q)
     await serial(run, () => this._setMode(run, 'cancelled'))
-    const jobs = [...run.work.values(), run.integration].filter(Boolean)
+    const jobs = [...run.work.values(), ...run.verifying.values(), run.integration].filter(Boolean)
     for (const j of jobs) {
       j.ctrl.abort()
       if (j.handle) Promise.resolve().then(() => j.handle.dispose()).catch(() => {})
@@ -1130,21 +1207,150 @@ export class Coordinator {
     if (run.db.intents().length) await this._reconcile(run)
     const rows = run.db.tickets(),
       byId = new Map(rows.map((t) => [t.id, t]))
+    // Restart, resume and a landed fix all reach this same test, so the final
+    // check runs again for every integrated tip it has not passed at.
+    if (
+      endMode(m.manifest) &&
+      rows.length &&
+      rows.every((t) => t.status === 'INTEGRATED') &&
+      !run.db.finalVerified(m.tipSha)
+    ) {
+      if (run.integration) return
+      this._checkPolicy(run)
+      const tip = await this._trustedTip(run)
+      const job = { id: null, final: true, phase: { stage: 'final' }, ctrl: new AbortController() }
+      run.integration = job
+      job.promise = this._finalVerify(run, tip, job)
+        .catch((err) => {
+          // Cancel and shutdown stop the check; a held ledger already says why.
+          if (job.ctrl.signal.aborted || this.stopping || err.ledger) return
+          return serial(run, () => this._hold(run, err))
+        })
+        .finally(() => {
+          run.integration = null
+          this._wake(run)
+        })
+        .catch((err) => this._holdQuietly(run, err))
+      return
+    }
     if (this._cleanupDue(run, rows)) {
       await this._cleanup(run, false)
       return
     }
-    const submitted = rows.find((t) => t.status === 'SUBMITTED')
+    // Worker modes: the lane only takes a submission whose own commit passed its
+    // worker-side checks; the others are checked first, in parallel.
+    const worker = workerMode(m.manifest)
+    const results = worker ? run.db.workerResults() : new Map()
+    const resultOf = (t) => {
+      const r = results.get(t.id)
+      return r?.sourceSha === t.sourceSha ? r : null
+    }
+    const waiting = worker ? rows.filter((t) => t.status === 'SUBMITTED' && !run.verifying.has(t.id)) : []
+    const unverified = waiting.filter((t) => {
+      if (resultOf(t)) return false
+      const again = run.probeRetry.get(t.id)
+      if (again?.sha === t.sourceSha && again.at > Date.now()) {
+        this._later(run, again.at)
+        return false
+      }
+      return true
+    })
+    // A failure recorded just before a crash still has to send its ticket back.
+    const rejected = waiting.filter((t) => resultOf(t)?.ok === false)
+    // A merge train takes the oldest submissions first (by their submitted event)
+    // and up to trainSize of them; every other mode takes one in ticket order.
+    const train = trainMode(m.manifest)
+    const order = train ? run.db.submittedOrder() : null
+    const queue = train
+      ? rows
+          .filter((t) => t.status === 'SUBMITTED')
+          .sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0))
+          .slice(0, trainSizeOf(m.manifest))
+      : []
+    const submitted = train
+      ? queue[0]
+      : rows.find((t) => t.status === 'SUBMITTED' && (!worker || resultOf(t)?.ok === true))
     const ready = rows.filter(
       (t) => t.status === 'PENDING' && t.dependsOn.every((d) => byId.get(d)?.status === 'INTEGRATED'),
     )
-    if (!submitted && !ready.length) return
+    if (!submitted && !ready.length && !unverified.length && !rejected.length) return
     this._checkPolicy(run)
     const tip = await this._trustedTip(run)
+    for (const t of rejected) {
+      const fresh = run.db.get(t.id)
+      if (fresh.status === 'SUBMITTED' && fresh.lease === t.lease && fresh.sourceSha === t.sourceSha)
+        this._workerFailed(run, fresh, run.db.workerVerify(t.id, t.sourceSha))
+    }
+    for (const t of unverified) {
+      if (this.stopping || run.verifying.size >= run.limit) break
+      const fresh = run.db.get(t.id)
+      if (fresh.status !== 'SUBMITTED' || fresh.lease !== t.lease || fresh.sourceSha !== t.sourceSha) continue
+      const job = { id: t.id, phase: { stage: 'worker' }, ctrl: new AbortController() }
+      run.verifying.set(t.id, job)
+      job.promise = this._workerVerify(run, fresh, job)
+        .catch((err) => {
+          if (job.ctrl.signal.aborted || this.stopping || err.ledger) return
+          // Creating the probe races with concurrent git worktree add (a git commondir
+          // read error); that is no verdict on the commit, so try again a few times.
+          const tries = run.probeRetry.get(t.id)?.sha === t.sourceSha ? run.probeRetry.get(t.id).tries : 0
+          if (err.probeSetup && tries < 3) {
+            run.probeRetry.set(t.id, { sha: t.sourceSha, tries: tries + 1, at: Date.now() + 300 * (tries + 1) })
+            return
+          }
+          // A probe that cannot even run is the ticket's problem to look at, not the run's.
+          return serial(run, () => {
+            const now = run.db.get(t.id)
+            if (now.status !== 'SUBMITTED' || now.lease !== t.lease || now.sourceSha !== t.sourceSha) return
+            run.db.move(t.id, t.lease, 'SUBMITTED', 'NEEDS_ATTENTION', {
+              message: 'Worker-side checks could not run: ' + message(err),
+            })
+          })
+        })
+        .finally(() => {
+          run.verifying.delete(t.id)
+          this._wake(run)
+        })
+        .catch((err) => this._holdQuietly(run, err))
+    }
     // Re-read after the awaits above: an integration that finished meanwhile may
     // have moved this row, and a stale submission must not be trial-merged again.
-    const fresh = submitted && run.db.get(submitted.id)
+    const same = (t) => {
+      const now = run.db.get(t.id)
+      return now.status === 'SUBMITTED' && now.lease === t.lease && now.sourceSha === t.sourceSha
+    }
+    // A train whose checkout could not be created waits a moment before the next try.
+    const trainWait = train && run.trainAt > Date.now()
+    if (trainWait) this._later(run, run.trainAt)
+    const cars = train && !run.integration && !trainWait ? queue.filter(same) : []
+    if (cars.length) {
+      const job = { id: null, train: true, ids: cars.map((t) => t.id), size: cars.length, phase: { stage: 'merge' }, ctrl: new AbortController() }
+      run.integration = job
+      job.promise = this._integrateTrain(run, cars, tip, job)
+        .catch((err) => {
+          // Cancel and shutdown stop the train; a held ledger already says why.
+          if (job.ctrl.signal.aborted || this.stopping || err.ledger) return
+          // Creating the train checkout races with concurrent git worktree add; try again shortly.
+          if (err.trainSetup && (run.trainRetry ?? 0) < 3) {
+            run.trainRetry = (run.trainRetry ?? 0) + 1
+            run.trainAt = Date.now() + 300 * run.trainRetry
+            return
+          }
+          return serial(run, () => {
+            // A merge that failed for a reason other than a conflict belongs to its ticket.
+            const t = err.sourceSha && cars.find((c) => c.sourceSha === err.sourceSha)
+            if (t && same(t)) run.db.move(t.id, t.lease, 'SUBMITTED', 'NEEDS_ATTENTION', { message: message(err) })
+            else this._hold(run, err)
+          })
+        })
+        .finally(() => {
+          run.integration = null
+          this._wake(run)
+        })
+        .catch((err) => this._holdQuietly(run, err))
+    }
+    const fresh = !train && submitted && run.db.get(submitted.id)
     if (
+      !train &&
       submitted &&
       !run.integration &&
       fresh.status === 'SUBMITTED' &&
@@ -1360,6 +1566,33 @@ export class Coordinator {
       .catch(() => {})
   }
 
+  /**
+   * The check IDs a candidate runs. Without file selection frozen into the run
+   * this is checkIds unchanged and nothing is recorded, as before 0.16.
+   * @param id - the ticket, or null for a run-level candidate.
+   * @param stage - lane, worker, final, bisect or train; goes into checks_selected.
+   * @returns the IDs to run, in checkIds order.
+   */
+  async _selectChecks(run, id, stage, checkIds, fromSha, toSha) {
+    const m = run.db.meta()
+    if (!integrationOf(m.manifest).selectChecksByFiles) return checkIds
+    let changed = null
+    try {
+      changed = await git.changedFiles(m.repo, fromSha, toSha)
+    } catch {
+      // An unknown diff selects everything (fallback no-diff), never nothing.
+    }
+    const picked = selectChecks(checkIds, m.manifest.checkMeta ?? {}, changed)
+    run.db.recordSelection(id, {
+      stage,
+      run: picked.run,
+      skipped: picked.skipped,
+      fallback: picked.fallback,
+      changed: changed?.length ?? null,
+    })
+    return picked.run
+  }
+
   async _integrate(run, row, tip, job) {
     await serial(run, () => this._checkLedger(run))
     const m = run.db.meta()
@@ -1376,14 +1609,30 @@ export class Coordinator {
       if (err.conflicts) await git.releaseCandidate(m.repo, candidatePath, tip).catch(() => {})
       throw err
     }
-    const checkIds = [
-      ...new Set(
-        [row, ...run.db.tickets().filter((t) => t.status === 'INTEGRATED')].flatMap((t) => t.verify),
-      ),
-    ]
-    const commands = checkIds.flatMap((id) => run.checks[id].map((argv) => ({ id, argv })))
+    let checkIds = usedChecks([row, ...run.db.tickets().filter((t) => t.status === 'INTEGRATED')])
+    const end = endMode(m.manifest)
+    const fastOnly = (ids) => ids.filter((id) => m.manifest.checkMeta?.[id]?.fast === true)
+    // An end-mode lane runs only the fast checks. A plan that marked none fast
+    // runs every check here instead, so a missing check_meta never lands a
+    // ticket with no check at all before the final full check.
+    if (end && hasFastCheck(m.manifest)) checkIds = fastOnly(checkIds)
+    else if (workerMode(m.manifest)) {
+      // worker: the worker-side checks covered this tip exactly, so only the fast
+      // ones run again; once the tip moved, everything runs again on the candidate.
+      const covered = run.db.workerVerify(row.id, row.sourceSha)?.coveredTip ?? null
+      if (covered === tip) checkIds = fastOnly(checkIds)
+      else
+        run.db.recordReverify(row.id, {
+          reason: covered ? 'tip-moved' : 'not-covered',
+          coveredTip: covered,
+          tipSha: tip,
+          checks: checkIds,
+        })
+    }
+    const runIds = await this._selectChecks(run, row.id, 'lane', checkIds, tip, candidate)
+    const commands = runIds.flatMap((id) => run.checks[id].map((argv) => ({ id, argv })))
     const options = { signal: job.ctrl.signal, timeoutMs: this.checkTimeoutMs }
-    run.db.recordVerifyStart(row.id, checkIds)
+    run.db.recordVerifyStart(row.id, runIds)
     for (const [index, { id, argv }] of commands.entries()) {
       job.phase = { stage: 'verify', checkId: id, index: index + 1, total: commands.length }
       const began = Date.now()
@@ -1419,7 +1668,10 @@ export class Coordinator {
       )
       try {
         await git.publishCandidate(m.repo, m.ref, tip, candidate)
-        requireValue(run.db.finish(row.id, row.lease, candidate), 'Ledger did not accept published candidate')
+        requireValue(
+          run.db.finish(row.id, row.lease, candidate, { complete: !end }),
+          'Ledger did not accept published candidate',
+        )
       } catch (err) {
         this._hold(run, err)
         throw err
@@ -1433,6 +1685,381 @@ export class Coordinator {
         /* Preserve checkout if cleanup cannot be proven safe. */
       }
     }
+  }
+
+  /**
+   * Run checkIds in a fresh probe checkout of sha, one check_finished per ID,
+   * on ticketId (worker-side checks) or on the run (null: final, bisect).
+   * @returns { failed: id[], output: { id: tail } }; throws if the job was aborted.
+   */
+  async _probeChecks(run, job, sha, checkIds, stage, phase = {}, ticketId = null) {
+    const m = run.db.meta()
+    // A fresh path each time: a probe an interrupted check left dirty is kept, never reused.
+    const path = join(run.root, 'probes', sha.slice(0, 12) + '-' + randomUUID().slice(0, 8))
+    try {
+      await git.addProbe(m.repo, path, sha)
+    } catch (err) {
+      err.probeSetup = true
+      throw err
+    }
+    try {
+      return await this._checksIn(run, job, path, checkIds, stage, phase, ticketId)
+    } finally {
+      await git.releaseProbe(m.repo, path, sha).catch(() => {
+        /* A probe the checks dirtied stays for inspection. */
+      })
+    }
+  }
+
+  // Run checkIds in an existing checkout, one check_finished per ID; a failure is collected, an abort thrown.
+  async _checksIn(run, job, path, checkIds, stage, phase = {}, ticketId = null) {
+    const failed = [],
+      output = {}
+    for (const [index, id] of checkIds.entries()) {
+      job.phase = { stage, checkId: id, index: index + 1, total: checkIds.length, ...phase }
+      const began = Date.now()
+      let ok = false
+      try {
+        await git.runChecks(path, run.checks[id], { signal: job.ctrl.signal, timeoutMs: this.checkTimeoutMs })
+        ok = true
+      } catch (err) {
+        if (job.ctrl.signal.aborted) throw err
+        failed.push(id)
+        output[id] = message(err).slice(-3000)
+      } finally {
+        run.db.recordCheck(ticketId, { checkId: id, ms: Date.now() - began, ok, aborted: !ok && job.ctrl.signal.aborted, stage })
+      }
+    }
+    return { failed, output }
+  }
+
+  /**
+   * Train mode: merge up to trainSize submissions (oldest first) onto tip as a
+   * chain of two-parent merges M1..Mn, skipping each that conflicts, and run the
+   * cumulative checks once on Mn. A pass publishes M1..Mn one by one, each with
+   * the ordinary single-ticket intent/CAS/finish, so publication recovery is
+   * unchanged. A failure bisects the chain on the failed IDs, publishes the
+   * passing prefix, sends the first failing ticket back to its worker and leaves
+   * the rest submitted for the next train. Conflicts go back to their workers
+   * after the verdict, so they merge the integration branch with the cars that landed.
+   */
+  async _integrateTrain(run, cars, tip, job) {
+    await serial(run, () => this._checkLedger(run))
+    const m = run.db.meta()
+    const path = join(run.root, 'candidates', 'train-' + tip.slice(0, 12) + '-' + randomUUID().slice(0, 8))
+    const { merges, conflicts } = await git.buildTrain(m.repo, path, tip, cars.map((t) => t.sourceSha))
+    run.trainRetry = 0
+    const carOf = new Map(cars.map((t) => [t.sourceSha, t]))
+    const last = merges.at(-1)?.sha ?? tip
+    // Where the train checkout is; the bisection moves it.
+    let at = last
+    const landing = merges.map((x) => carOf.get(x.sourceSha))
+    let published = []
+    try {
+      if (merges.length) {
+        const integrated = run.db.tickets().filter((t) => t.status === 'INTEGRATED')
+        const checkIds = usedChecks([...landing, ...integrated])
+        const runIds = await this._selectChecks(run, null, 'train', checkIds, tip, last)
+        run.db.recordTrain('train_started', 'Merge train of ' + merges.length + ' at ' + tip, {
+          tipSha: tip,
+          tickets: landing.map((t) => t.id),
+          merges: merges.map((x) => x.sha),
+          conflicts: conflicts.map((c) => carOf.get(c.sourceSha).id),
+          checks: runIds,
+        })
+        for (const t of landing) run.db.recordVerifyStart(t.id, runIds)
+        const { failed, output } = await this._checksIn(run, job, path, runIds, 'train')
+        if (!failed.length) {
+          // As in the each lane: the checks must not have moved or dirtied the checkout they passed in.
+          await git.assertCandidate(m.repo, path, last)
+          published = await this._publishTrain(run, job, tip, merges, landing)
+          run.db.recordTrain('train_passed', 'Merge train passed at ' + last, {
+            tipSha: tip,
+            lastSha: last,
+            tickets: published,
+          })
+        } else {
+          // First failing merge: M(hi). The tip passed before this train; Mn is known to fail.
+          let lo = -1,
+            hi = merges.length - 1
+          for (let step = 1; hi - lo > 1; step++) {
+            const mid = Math.floor((lo + hi) / 2)
+            const used = new Set(usedChecks([...landing.slice(0, mid + 1), ...integrated]))
+            const ids = failed.filter((id) => used.has(id))
+            let ok = true
+            if (ids.length) {
+              // Bisect in the train checkout itself: no further git worktree add.
+              at = await git.switchCandidate(m.repo, path, at, merges[mid].sha)
+              ok = !(await this._checksIn(run, job, path, ids, 'train', { bisect: true, step })).failed.length
+            }
+            run.db.recordTrain('train_bisect_step', merges[mid].sha + (ok ? ' passes' : ' fails'), { sha: merges[mid].sha, ok, checks: ids })
+            if (ok) lo = mid
+            else hi = mid
+          }
+          const culprit = landing[hi]
+          published = await this._publishTrain(run, job, tip, merges.slice(0, hi), landing.slice(0, hi))
+          const tails = failed.map((id) => id + ':\n' + output[id]).join('\n\n').slice(-3000)
+          await serial(run, () => {
+            if (this.stopping || run.db.meta().mode !== 'active') return
+            this._checkLedger(run)
+            run.db.recordTrain('train_failed', 'Merge train checks failed; first failing merge landed ' + culprit.id, {
+              tipSha: tip,
+              failed,
+              culprit: culprit.id,
+              culpritSha: merges[hi].sha,
+              published,
+            })
+            // Only a ticket the whole prefix landed before is blamed on its own merge.
+            if (published.length !== hi) return
+            const t = run.db.get(culprit.id)
+            if (t.status !== 'SUBMITTED' || t.lease !== culprit.lease || t.sourceSha !== culprit.sourceSha) return
+            this._checkFailed(
+              run,
+              t,
+              'Merge-train checks failed: ' + failed.join(', ') + '. The coordinator merged your commit ' + t.sourceSha +
+                ' in a merge train after ' + (hi ? landing.slice(0, hi).map((x) => x.id).join(', ') : 'the integration tip') +
+                ' and bisecting the train located its merge ' + merges[hi].sha +
+                ' as the first that fails; your own report does not count. Make the checks pass, merge the latest integration branch, and commit again.\n\nOutput tail:\n' +
+                tails,
+              'merge-train',
+            )
+          })
+        }
+      }
+      // Conflicts after the verdict: the worker then merges a branch that holds the cars ahead of it.
+      await serial(run, () => {
+        if (this.stopping || run.db.meta().mode !== 'active') return
+        for (const c of conflicts) {
+          const car = carOf.get(c.sourceSha)
+          const t = run.db.get(car.id)
+          if (t.status !== 'SUBMITTED' || t.lease !== car.lease || t.sourceSha !== car.sourceSha) continue
+          const note = 'Trial merge conflicts with the integration tip in: ' + c.files.join(', ') + ' (merge train)'
+          if (!run.db.requeueConflict(t.id, t.lease, { message: note, maxRetries: this.maxConflictRetries }))
+            run.db.move(t.id, t.lease, 'SUBMITTED', 'NEEDS_ATTENTION', { message: note })
+        }
+      })
+    } finally {
+      // An open publication intent still needs its merge reachable for recovery.
+      const open = new Set(run.db.intents().map((i) => i.candidateSha))
+      for (const x of merges.filter((x) => !published.includes(carOf.get(x.sourceSha).id) && !open.has(x.sha)))
+        await git.unpinCandidate(m.repo, x.sha).catch(() => {})
+      await git.releaseCandidate(m.repo, path, at).catch(() => {
+        /* Preserve the train checkout if cleanup cannot be proven safe. */
+      })
+    }
+  }
+
+  /**
+   * Publish a verified prefix of a train merge chain, one ticket at a time with
+   * the single-ticket intent, CAS and finish. Stops at the first ticket that
+   * changed meanwhile: the merges after it are built on it and cannot land.
+   * @returns the IDs that landed, in order.
+   */
+  async _publishTrain(run, job, tip, merges, landing) {
+    const m = run.db.meta()
+    const done = []
+    let prev = tip
+    for (const [i, x] of merges.entries()) {
+      const row = landing[i]
+      job.phase = { stage: 'publish', index: i + 1, total: merges.length }
+      const ok = await serial(run, async () => {
+        if (this.stopping || run.db.meta().mode !== 'active') return false
+        const t = run.db.get(row.id)
+        if (t.status !== 'SUBMITTED' || t.lease !== row.lease || t.sourceSha !== row.sourceSha) return false
+        this._checkLedger(run)
+        this._checkPolicy(run)
+        // The chain only lands on the tip it was built from, link by link.
+        requireValue((await this._trustedTip(run)) === prev, 'Integration tip moved during the merge train')
+        // A ticket that changed under the train stops it there, as one in the each lane would stop.
+        try {
+          requireValue((await stampedSource(m, t)) === row.sourceSha, 'Worker branch moved after submission')
+          for (const id of t.dependsOn) {
+            const p = run.db.get(id)
+            requireValue(
+              p.status === 'INTEGRATED' && (await git.isAncestor(m.repo, p.landedSha, prev)),
+              'Dependency changed before publication',
+            )
+          }
+        } catch (err) {
+          run.db.move(t.id, t.lease, 'SUBMITTED', 'NEEDS_ATTENTION', { message: message(err) })
+          return false
+        }
+        await git.assertMergeParents(m.repo, x.sha, prev, row.sourceSha)
+        requireValue(
+          run.db.intent(row.id, row.lease, { oldTip: prev, sourceSha: row.sourceSha, candidateSha: x.sha }),
+          'Could not record publication intent',
+        )
+        try {
+          await git.publishCandidate(m.repo, m.ref, prev, x.sha)
+          requireValue(run.db.finish(row.id, row.lease, x.sha), 'Ledger did not accept published candidate')
+        } catch (err) {
+          this._hold(run, err)
+          // Held with the open intent on record; the train's catch must not hold again.
+          err.ledger = true
+          throw err
+        }
+        return true
+      })
+      if (!ok) break
+      this._writeback(run, row.id)
+      done.push(row.id)
+      prev = x.sha
+    }
+    return done
+  }
+
+  /**
+   * Worker modes: run the cumulative checks (this ticket's plus every integrated
+   * one's) on the submitted commit itself, in a probe outside the lane. The
+   * worker's own report never counts. coveredTip is the integration tip the
+   * commit already contains, or null; file selection diffs from it (else from
+   * the frozen base). The result goes into the ledger, where a restart finds it.
+   */
+  async _workerVerify(run, row, job) {
+    await serial(run, () => this._checkLedger(run))
+    const m = run.db.meta()
+    // Tip and integrated set are read together, before any await, so they agree.
+    const tip = m.tipSha
+    const checkIds = usedChecks([row, ...run.db.tickets().filter((t) => t.status === 'INTEGRATED')])
+    const covered = (await git.isAncestor(m.repo, tip, row.sourceSha)) ? tip : null
+    const runIds = await this._selectChecks(run, row.id, 'worker', checkIds, covered ?? m.baseSha, row.sourceSha)
+    const { failed, output } = runIds.length
+      ? await this._probeChecks(run, job, row.sourceSha, runIds, 'worker', {}, row.id)
+      : { failed: [], output: {} }
+    await serial(run, () => {
+      if (this.stopping || run.db.meta().mode !== 'active') return
+      const t = run.db.get(row.id)
+      if (t.status !== 'SUBMITTED' || t.lease !== row.lease || t.sourceSha !== row.sourceSha) return
+      this._checkLedger(run)
+      const details = {
+        sourceSha: row.sourceSha,
+        coveredTip: covered,
+        ok: !failed.length,
+        checks: runIds,
+        failed,
+        output: failed.map((id) => id + ':\n' + output[id]).join('\n\n').slice(-3000),
+      }
+      run.db.recordWorkerVerify(row.id, details)
+      if (failed.length) this._workerFailed(run, t, details)
+    })
+  }
+
+  // Back to the ticket's own worker with the failure, a bounded number of times; then the captain.
+  _workerFailed(run, t, details) {
+    this._checkFailed(
+      run,
+      t,
+      'Worker-side checks failed on your commit ' + details.sourceSha + ': ' + details.failed.join(', ') +
+        '. The coordinator ran them; your own report does not count. Make them pass, merge the latest integration branch, and commit again.\n\nOutput tail:\n' +
+        (details.output ?? ''),
+      'worker-side',
+    )
+  }
+
+  // A failed check sends the ticket back through requeueCheckFailure; kind names the gate in the note to the captain.
+  _checkFailed(run, t, note, kind) {
+    if (run.db.requeueCheckFailure(t.id, t.lease, { message: note, maxRetries: this.maxConflictRetries })) return
+    run.db.move(t.id, t.lease, 'SUBMITTED', 'NEEDS_ATTENTION', {
+      message: note.slice(0, 3400) + '\n\nThe automatic ' + kind + ' retries (maxConflictRetries) are used up.',
+    })
+  }
+
+  /**
+   * End modes: every ticket is integrated at tip. Run every check the run uses
+   * (no file selection) on tip; a pass completes the run. A failure bisects the
+   * first-parent merges, rerunning only the failed IDs, to the first merge that
+   * fails, appends a fix ticket for the ticket that landed it, and tells the
+   * captain. Past maxFinalRepairs, or when no merge can be blamed, the run is held.
+   */
+  async _finalVerify(run, tip, job) {
+    await serial(run, () => this._checkLedger(run))
+    const m = run.db.meta()
+    const tickets = run.db.tickets()
+    const checkIds = usedChecks(tickets)
+    run.db.recordFinal('final_verify_started', 'Final checks started at ' + tip, { tipSha: tip, checks: checkIds })
+    const { failed, output } = await this._probeChecks(run, job, tip, checkIds, 'final')
+    if (!failed.length) {
+      await serial(run, () => {
+        if (this.stopping || run.db.meta().mode !== 'active') return
+        this._checkLedger(run)
+        run.db.completeRun(tip, { checks: checkIds })
+      })
+      return
+    }
+    const culprit = await this._bisect(run, job, tip, failed, tickets)
+    await serial(run, async () => {
+      if (this.stopping || run.db.meta().mode !== 'active') return
+      this._checkLedger(run)
+      requireValue((await this._trustedTip(run)) === tip, 'Integration tip moved during the final checks')
+      const tails = failed.map((id) => id + ':\n' + output[id]).join('\n\n').slice(-3000)
+      const limit = maxFinalRepairsOf(m.manifest)
+      const used = run.db.finalRepairs()
+      const details = { tipSha: tip, failed, culprit: culprit?.id ?? null, culpritSha: culprit?.landedSha ?? null }
+      if (!culprit || used >= limit) {
+        const why = !culprit
+          ? 'no integrated merge could be blamed (the failure may be flaky or need several tickets together)'
+          : 'the run already appended ' + used + ' automatic fix tickets (maxFinalRepairs ' + limit + ')'
+        run.db.recordFinal('final_verify_failed', 'Final checks failed at ' + tip + '; ' + why, { ...details, repair: null })
+        this._hold(
+          run,
+          new Error(
+            'Final checks ' + failed.join(', ') + ' failed at ' + tip +
+              (culprit ? '; first failing merge ' + culprit.landedSha + ' landed ' + culprit.id : '') +
+              '. Held: ' + why + '. Add a fix ticket with dag_add and dag_resume, or start a new run.\n' + tails,
+          ),
+        )
+        return
+      }
+      const fix = normalizeAppend(
+        [
+          {
+            id: 'fix-' + culprit.id.slice(0, 70) + '-' + (used + 1),
+            title: 'Fix final check failure from ' + culprit.id,
+            prompt:
+              'The final full check of this run failed after every ticket was integrated. Failed check IDs: ' +
+              JSON.stringify(failed) + '. Bisecting the integration merges located the first failing merge ' +
+              culprit.landedSha + ', which landed ticket ' + culprit.id + ' (' + culprit.title + ').\n\n' +
+              'Fix the failure on top of the current integration branch (your worktree starts from it). ' +
+              'Do not revert other tickets; change only what makes the failed checks pass again.\n\n' +
+              'Output tail:\n' + tails,
+            verify: [...new Set([...culprit.verify, ...failed])],
+            acceptance: ['Checks ' + failed.join(', ') + ' pass on the integrated tip'],
+            ...(culprit.agent && { agent: culprit.agent }),
+          },
+        ],
+        run.checks,
+        culprit.agent ? { [culprit.agent]: culprit.agentSpec ?? {} } : {},
+      )
+      run.db.appendRepair(fix[0], { policyHash: policyHash({ tickets: fix }, run.checks), details })
+      // The ledger now holds this append; it is the new trusted state, as in add().
+      const after = ledgerDigest(run.db)
+      run.trust = { ...run.trust, plan: after.plan, approval: after.approval }
+      this._drainOutbox(run)
+    })
+  }
+
+  /**
+   * The ticket whose merge first fails, or null. Assumes failure is monotonic
+   * along the first-parent merges: the base passes and tip fails. At merge Mi
+   * only the failed IDs that tickets landed up to Mi use are run; none means pass.
+   */
+  async _bisect(run, job, tip, failed, tickets) {
+    const m = run.db.meta()
+    const merges = await git.firstParentCommits(m.repo, m.baseSha, tip)
+    const bySha = new Map(tickets.map((t) => [t.landedSha, t]))
+    let lo = -1,
+      hi = merges.length - 1
+    for (let step = 1; hi - lo > 1; step++) {
+      const mid = Math.floor((lo + hi) / 2)
+      const landed = merges.slice(0, mid + 1).map((sha) => bySha.get(sha)).filter(Boolean)
+      const used = new Set(landed.flatMap((t) => t.verify))
+      const ids = failed.filter((id) => used.has(id))
+      const ok = ids.length ? !(await this._probeChecks(run, job, merges[mid], ids, 'bisect', { step })).failed.length : true
+      run.db.recordFinal('bisect_step', merges[mid] + (ok ? ' passes' : ' fails'), { sha: merges[mid], ok, checks: ids })
+      if (ok) lo = mid
+      else hi = mid
+    }
+    return bySha.get(merges[hi]) ?? null
   }
 
   close() {
@@ -1451,6 +2078,7 @@ export class Coordinator {
       try {
         clearTimeout(r.timer)
         r.integration?.ctrl.abort()
+        for (const j of r.verifying.values()) j.ctrl.abort()
         for (const j of r.work.values()) {
           j.ctrl.abort()
           if (j.handle) Promise.resolve().then(() => j.handle.dispose()).catch(() => {})
@@ -1463,7 +2091,9 @@ export class Coordinator {
     for (const r of runs) {
       try {
         await Promise.allSettled(
-          [...r.work.values()].map((j) => j.promise).concat([r.integration?.promise, r.notifier, r.writebacks]),
+          [...r.work.values(), ...r.verifying.values()]
+            .map((j) => j.promise)
+            .concat([r.integration?.promise, r.notifier, r.writebacks]),
         )
         await r.serial
       } catch (err) {

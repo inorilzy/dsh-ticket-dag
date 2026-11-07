@@ -1,0 +1,16 @@
+# 坦克基准 B（合并列车，integrationMode train）的 profile 片段。合并进当前 profile 的 dsh-ticket-dag 配置，保留其他字段。
+# 集成通道按提交先后取最多 trainSize 张已提交工单，在一个候选工作树里依次合并（冲突的跳过并退回原 worker），
+# 在最后一个合并上跑一次全部累计验收（fast 和 soak）。通过则逐张发布；失败则在列车内二分，
+# 发布出错工单之前已确认通过的那些，出错工单退回原 worker（最多 maxConflictRetries 次），其余等下一趟。
+- id: dsh-ticket-dag
+  config:
+    integrationMode: train
+    selectChecksByFiles: false
+    trainSize: 4
+    checkMeta:
+      fast:
+        files: [src/**, checks/unit/**]
+        fast: true
+      soak:
+        files: [src/**, checks/soak.mjs, checks/harness.mjs]
+        fast: false

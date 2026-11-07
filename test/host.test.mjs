@@ -417,6 +417,24 @@ test('dag_import is captain-only, reads in the captain cwd, and the captain is t
   await h.close()
 })
 
+test('A+F is the default: end mode with file selection, and the captain is told to write check_meta', async () => {
+  const h = harness()
+  assert.equal(h.api.integrationMode, 'end')
+  assert.equal(h.api.selectChecksByFiles, true)
+  const text = h.sections.find((s) => s.name === 'tool:dsh-ticket-dag').text()
+  assert.match(text, /Integration mode: end, with checks selected by changed files/)
+  assert.match(text, /every check when none is marked fast/)
+  assert.match(text, /"check_meta": \{"<id>": \{"files": \["<glob>", \.\.\.\], "fast": true\|false\}\}/)
+  assert.match(text, /Tell the user which checks you marked fast/)
+  await h.close()
+  // A profile that set each and off explicitly keeps the old behavior and prompt.
+  const each = harness({ integrationMode: 'each', selectChecksByFiles: false })
+  assert.equal(each.api.integrationMode, 'each')
+  assert.equal(each.api.selectChecksByFiles, false)
+  assert.doesNotMatch(each.sections.find((s) => s.name === 'tool:dsh-ticket-dag').text(), /Integration mode|check_meta/)
+  await each.close()
+})
+
 test('the captain section states the check timeout, the worker cap, preset choice and how conflicts are handled', async () => {
   const h = harness({ checkTimeoutMs: 600000, maxWorkers: 16 })
   const text = h.sections.find((s) => s.name === 'tool:dsh-ticket-dag').text()

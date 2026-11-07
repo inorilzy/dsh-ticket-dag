@@ -246,6 +246,9 @@ window.__ModuleLoader__.load({
         requireApproval: value.requireApproval ?? true,
         trackerWriteback: ['comment', 'close'].includes(value.trackerWriteback) ? value.trackerWriteback : 'off',
         reviewOnComplete: value.reviewOnComplete === true,
+        integrationMode: integrationModes.some(([id]) => id === value.integrationMode) ? value.integrationMode : 'end',
+        selectChecksByFiles: value.selectChecksByFiles !== false,
+        trainSize: String(value.trainSize ?? 4),
         checkTimeoutMs: String(value.checkTimeoutMs ?? 120000),
         rules: Object.entries(value.checks ?? {}).map(([id, commands]) => ({ id, commands })),
         agents: Object.entries(value.agents ?? builtinAgents).map(([id, preset]) => agentRow(id, preset)),
@@ -318,6 +321,13 @@ window.__ModuleLoader__.load({
       if (base.reviewOnComplete !== draft.reviewOnComplete) {
         changed.push({ op: 'set', path: ['reviewOnComplete'], value: draft.reviewOnComplete })
       }
+      for (const field of ['integrationMode', 'selectChecksByFiles']) {
+        if (base[field] !== draft[field]) changed.push({ op: 'set', path: [field], value: draft[field] })
+      }
+      const trainSize = Number(draft.trainSize)
+      if (!/^\d+$/.test(draft.trainSize) || trainSize < 2 || trainSize > 16)
+        throw new Error('合并列车长度须为 2 到 16 之间的整数。')
+      if (trainSize !== Number(base.trainSize)) changed.push({ op: 'set', path: ['trainSize'], value: trainSize })
       if (JSON.stringify(base.rules) !== JSON.stringify(draft.rules)) {
         changed.push({ op: 'set', path: ['checks'], value: checksFrom(draft.rules) })
       }
@@ -763,6 +773,75 @@ window.__ModuleLoader__.load({
                 '只作用于用 dag_import 从 GitHub 导入的工单：工单集成到本轮集成分支后，插件用 gh 在对应 issue 下评论；选“关闭”时同时关闭该 issue。集成分支尚未合入默认分支，关闭前请确认这符合你的流程。',
               ),
             ),
+          !agentsOnly &&
+            h(
+              'label',
+              null,
+              h('span', null, '集成模式'),
+              h(
+                'select',
+                {
+                  'aria-label': '集成模式',
+                  value: draft.integrationMode,
+                  onChange: (e) =>
+                    change((d) => {
+                      d.integrationMode = e.target.value
+                    }),
+                },
+                ...integrationModes.map(([id, name, ready]) =>
+                  h('option', { key: id, value: id, disabled: !ready && draft.integrationMode !== id }, name + (ready ? '' : '（本版本未实现）')),
+                ),
+              ),
+              h(
+                'small',
+                null,
+                '新运行在 dag_run 时冻结当前模式，已开始的运行不受影响。默认 A 配合按改动文件选验收命令：集成时只跑 checkMeta 中标为 fast 的命令（一条都没标时跑全部），全部工单集成后跑一次全量，失败时自动定位并追加修复工单（最多 maxFinalRepairs 次）；E 在 worker 提交后立即在其提交上验收；B 按提交先后把多张工单依次合并成一趟列车，在最后一个合并上验收一次，失败时在列车内二分定位并退回出错的工单。',
+              ),
+            ),
+          !agentsOnly &&
+            draft.integrationMode === 'train' &&
+            h(
+              'label',
+              null,
+              h('span', null, '合并列车长度'),
+              h('input', {
+                'aria-label': '合并列车长度',
+                type: 'number',
+                min: 2,
+                max: 16,
+                step: 1,
+                value: draft.trainSize,
+                onChange: (e) =>
+                  change((d) => {
+                    d.trainSize = e.target.value
+                  }),
+              }),
+              h('small', null, '一趟列车最多同时验收几张已提交的工单，可设 2–16。新运行在 dag_run 时冻结。'),
+            ),
+          !agentsOnly &&
+            h(
+              'label',
+              { className: 'dtd-check' },
+              h('input', {
+                type: 'checkbox',
+                'aria-label': '按改动文件选验收命令',
+                checked: draft.selectChecksByFiles,
+                onChange: (e) =>
+                  change((d) => {
+                    d.selectChecksByFiles = e.target.checked
+                  }),
+              }),
+              h(
+                'span',
+                null,
+                h('strong', null, '按改动文件选验收命令'),
+                h(
+                  'small',
+                  null,
+                  '打开时，试合并后只运行负责文件（配置键 checkMeta 的 files）与改动文件有交集的验收命令；没有声明 files 的命令总是运行。新运行在 dag_run 时冻结此设置。',
+                ),
+              ),
+            ),
           h(
             'section',
             { className: 'dtd-section', 'aria-label': '预设 Agent' },
@@ -881,6 +960,38 @@ window.__ModuleLoader__.load({
     }
 
     const modes = { staged: '待确认', active: '运行中', paused: '已暂停', cancelled: '已取消' }
+    // Every integrationMode the profile accepts, in src/index.mjs order; implemented
+    // ones match IMPLEMENTED_MODES in src/store.mjs. dag_run refuses the others.
+    const integrationModes = [
+      ['each', 'each 每张完整验收', true],
+      ['end', 'A 先合并、最后测', true],
+      ['worker', 'E 验收在 worker 侧', true],
+      ['worker-end', 'A+E 验收在 worker 侧、最后全量', true],
+      ['train', 'B 合并列车', true],
+    ]
+    // One line naming the integration settings frozen into the run.
+    function integrationText(integration) {
+      const mode = integration?.mode ?? 'each'
+      const name = integrationModes.find(([id]) => id === mode)?.[1] ?? mode
+      return '集成模式：' + name + '（按文件选测试：' + (integration?.selectChecksByFiles === true ? '开' : '关') + '）'
+    }
+    // Progress of an end-mode run's final full check, or its bisection after a failure.
+    function finalText(phase) {
+      if (!phase) return ''
+      const head = phase.stage === 'bisect' ? '最终验收失败，二分定位出错工单' + (phase.step ? ' · 第 ' + phase.step + ' 步' : '') : '最终验收（全量）'
+      const check = phase.checkId ? ' · ' + phase.checkId + (phase.index && phase.total ? ' ' + phase.index + '/' + phase.total : '') : ''
+      return head + check
+    }
+    // Progress of a merge train: its size, then checking, bisecting or publishing.
+    function trainText(phase) {
+      if (!phase) return ''
+      const check = phase.checkId ? ' · ' + phase.checkId + (phase.index && phase.total ? ' ' + phase.index + '/' + phase.total : '') : ''
+      const head = '列车 ' + phase.size + ' 张'
+      if (phase.stage === 'merge') return head + ' · 依次合并'
+      if (phase.stage === 'publish') return head + ' · 逐张发布' + (phase.index && phase.total ? ' ' + phase.index + '/' + phase.total : '')
+      if (phase.bisect) return head + ' · 验收失败，列车内二分' + (phase.step ? ' 第 ' + phase.step + ' 步' : '') + check
+      return head + check
+    }
     const states = {
       RUNNING: ['执行中', 'work'],
       SUBMITTED: ['等待集成', 'work'],
@@ -900,6 +1011,24 @@ window.__ModuleLoader__.load({
       cleanup: '清理工作树与分支',
     }
 
+    // Worker-side checks of the ticket's current commit: running, failed (sent back
+    // to the worker or to the captain) or passed and waiting for the lane.
+    function workerView(ticket) {
+      const phase = ticket.livePhase
+      if (ticket.status === 'SUBMITTED' && phase?.stage === 'worker') {
+        const check = phase.checkId ? ' · ' + phase.checkId + (phase.index && phase.total ? ' ' + phase.index + '/' + phase.total : '') : ''
+        return { state: 'running', text: 'worker 侧验收中' + check }
+      }
+      const result = ticket.workerVerify
+      if (!result || ticket.status === 'INTEGRATED' || ticket.status === 'CANCELLED') return null
+      // A newer submitted commit has not been judged yet; the failure belongs to the old one.
+      if (result.ok === false && (ticket.status !== 'SUBMITTED' || result.sourceSha === ticket.sourceSha))
+        return { state: 'failed', text: 'worker 侧验收失败：' + (result.failed ?? []).join('、') }
+      if (ticket.status === 'SUBMITTED' && result.sourceSha === ticket.sourceSha && !phase)
+        return { state: 'passed', text: 'worker 侧验收已通过，等待集成' }
+      return null
+    }
+
     function ticketView(ticket, byId, mode) {
       const missing = ticket.dependsOn.filter((id) => byId.get(id)?.status !== 'INTEGRATED')
       let [label, tone] = states[ticket.status] ?? [ticket.status, 'neutral']
@@ -917,11 +1046,20 @@ window.__ModuleLoader__.load({
       const phase = ticket.livePhase
       let stage =
         ['RUNNING', 'SUBMITTED', 'PUBLISHING'].includes(ticket.status) && phase && stages[phase.stage]
-      if (stage && phase.stage === 'verify' && phase.checkId) {
+      // A merge-train car shares the train's checks; the stepper keeps its verify step.
+      if (['SUBMITTED', 'PUBLISHING'].includes(ticket.status) && phase?.stage === 'train')
+        stage = '合并列车验收' + (phase.checkId ? ' ' + phase.checkId + (phase.index && phase.total ? ' · ' + phase.index + '/' + phase.total : '') : '')
+      else if (stage && phase.stage === 'verify' && phase.checkId) {
         stage = '验收 ' + phase.checkId
         if (phase.index && phase.total) stage += ' · ' + phase.index + '/' + phase.total
       }
-      return { label, tone, stage, missing }
+      // Worker modes check the submitted commit itself before it may queue for integration.
+      const worker = workerView(ticket)
+      if (worker?.state === 'running') {
+        tone = 'work'
+        stage = worker.text
+      } else if (worker) stage = stage ? stage + ' · ' + worker.text : worker.text
+      return { label, tone, stage, missing, worker }
     }
 
     function runMode(run) {
@@ -1008,6 +1146,7 @@ window.__ModuleLoader__.load({
     }
 
     function Ticket({ ticket, view, open, captain, member, timing }) {
+      const worker = view.worker
       const { id, title, status, dependsOn, attempt, retryAt, message } = ticket
       const info = [
         ['子会话', ticket.childId],
@@ -1036,6 +1175,12 @@ window.__ModuleLoader__.load({
         status === 'PENDING' &&
           retryAt > Date.now() &&
           h('p', { className: 'dtd-phase' }, '下次可重试：' + new Date(retryAt).toLocaleTimeString('zh-CN')),
+        worker &&
+          h(
+            'p',
+            { className: worker.state === 'failed' ? 'dtd-alert' : 'dtd-phase', 'data-dag-worker-verify': worker.state },
+            worker.text,
+          ),
         message && status === 'NEEDS_ATTENTION' && h('p', { className: 'dtd-alert' }, message),
         (info.length > 0 || (message && status !== 'NEEDS_ATTENTION')) &&
           h(
@@ -1241,6 +1386,11 @@ window.__ModuleLoader__.load({
                 ),
               ),
           ),
+          h('p', { className: 'dtd-hint', 'data-dag-integration': '' }, integrationText(run.integration)),
+          run.finalPhase &&
+            h('p', { className: 'dtd-hint', 'data-dag-final': run.finalPhase.stage, role: 'status' }, finalText(run.finalPhase)),
+          run.trainPhase &&
+            h('p', { className: 'dtd-hint', 'data-dag-train': run.trainPhase.bisect ? 'bisect' : run.trainPhase.stage, role: 'status' }, trainText(run.trainPhase)),
           cleanupSummary(run.tickets) &&
             h('p', { className: 'dtd-hint', 'data-dag-cleanup': '' }, cleanupSummary(run.tickets)),
           run.attached === false &&
@@ -1562,7 +1712,9 @@ window.__ModuleLoader__.load({
     function stepStates(ticket) {
       const order = Object.keys(stages)
       const live = ['RUNNING', 'SUBMITTED', 'PUBLISHING'].includes(ticket.status)
-      const current = live ? order.indexOf(ticket.livePhase?.stage) : -1
+      // A merge-train car is at the verify step while its train checks.
+      const at = ticket.livePhase?.stage === 'train' ? 'verify' : ticket.livePhase?.stage
+      const current = live ? order.indexOf(at) : -1
       return order.map((stage, i) => [
         stage,
         stage === 'cleanup'
@@ -2071,6 +2223,7 @@ window.__ModuleLoader__.load({
             { className: 'dtd-hint' },
             memberIds.length + ' 名成员 · ' + run.tickets.length + ' 项任务 · ' + edges + ' 条依赖 · 最多同时 ' + currentWorkers + ' 个',
           ),
+          h('p', { className: 'dtd-hint', 'data-dag-integration': '' }, integrationText(run.integration)),
         ),
         planChanged &&
           h(
