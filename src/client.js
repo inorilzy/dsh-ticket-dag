@@ -1788,8 +1788,19 @@ window.__ModuleLoader__.load({
             (ticket.attempt > 1 ? ' · 第 ' + ticket.attempt + ' 次尝试' : ''),
         ),
         ticket.message && ticket.status === 'NEEDS_ATTENTION' && h('p', { className: 'dtd-alert' }, ticket.message),
+        ticket.undeclaredFiles?.files?.length > 0 &&
+          h(
+            'p',
+            { className: 'dtd-hint', 'data-dag-undeclared': ticket.id },
+            '改动了声明以外的文件（仅提示，不影响集成）：' + ticket.undeclaredFiles.files.join('、'),
+          ),
         chat && h('div', { className: 'dtd-actions' }, chat),
       )
+    }
+
+    // Ticket pairs that may run together and declare overlapping files, as one line each.
+    function overlapLines(overlaps) {
+      return (overlaps ?? []).map((o) => o.tickets.join(' 与 ') + '：' + o.files.join('、'))
     }
 
     // Vendor of a model route, recognised from the provider and model names.
@@ -2341,6 +2352,24 @@ window.__ModuleLoader__.load({
               ),
             ),
         ),
+        (run.fileOverlaps ?? []).length > 0 &&
+          h(
+            'section',
+            { className: 'dtd-block', 'aria-label': '文件重叠提醒', 'data-dag-overlaps': '' },
+            h('h4', null, '文件重叠提醒'),
+            h(
+              'p',
+              { className: 'dtd-hint' },
+              '下面这些工单之间没有依赖关系，可能同时运行，声明的文件却有重叠，集成时容易试合并冲突。这只是提醒，不会阻止启动；可以回到对话让队长把共用的文件拆成单独工单，或者给它们加上依赖。',
+            ),
+            h(
+              'ul',
+              { className: 'dtd-checks' },
+              ...overlapLines(run.fileOverlaps).map((line, i) =>
+                h('li', { key: i, className: 'dtd-check', 'data-dag-overlap': '' }, h('span', null, line)),
+              ),
+            ),
+          ),
         h(
           'section',
           { className: 'dtd-block', 'aria-label': '任务与依赖' },
@@ -2390,6 +2419,8 @@ window.__ModuleLoader__.load({
                         h('option', { value: '' }, '默认成员（不使用预设）'),
                       ),
                     ),
+                    (t.files ?? []).length > 0 &&
+                      h('p', { className: 'dtd-hint', 'data-dag-files': t.id }, '预计修改：' + t.files.join('、')),
                   ),
               )
             }),

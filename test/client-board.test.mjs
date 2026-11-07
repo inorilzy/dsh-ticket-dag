@@ -418,6 +418,23 @@ test('ticket detail defaults to the most urgent ticket and names its neighbours'
   assert.match(text(blocked), /1 张工单需要处理/)
 })
 
+test('ticket detail notes files changed outside the declared ones, without treating it as a failure', () => {
+  const board = boardFor([
+    {
+      id: 'A',
+      title: 'Core',
+      status: 'NEEDS_ATTENTION',
+      dependsOn: [],
+      message: 'verify failed',
+      undeclaredFiles: { sourceSha: 'a'.repeat(40), files: ['src/main.js', 'README.md'] },
+    },
+  ])
+  const note = find(board, (n) => n.props['data-dag-undeclared'] !== undefined)
+  assert.equal(note.props['data-dag-undeclared'], 'A')
+  assert.match(text(note), /声明以外的文件（仅提示，不影响集成）：src\/main\.js、README\.md/)
+  assert.equal(find(boardFor(sample), (n) => n.props['data-dag-undeclared'] !== undefined), undefined)
+})
+
 test('focusing a ticket highlights its whole upstream and downstream chain and dims the rest', () => {
   const { root } = boardHost(
     [
@@ -881,6 +898,31 @@ test('plan review lists each check command, marks the ones the captain wrote and
   assert.match(text(rows[1]), /插件配置.*A.*ruff check \./)
   assert.match(text(find(block, (n) => n.props['data-dag-unchecked'] !== undefined)), /B、D 没有本票专属验收命令/)
   assert.match(text(find(block, (n) => n.props['data-dag-unchecked'] !== undefined)), /累计回归检查/)
+})
+
+test('plan review warns about tickets that may run together on overlapping files, and shows nothing without overlaps', () => {
+  const plain = reviewRun()
+  const quiet = loadHost([{ runs: [plain], selected: plain }, plain.key]).renderSlot('sidebar.right.pane.tab', {
+    sessionId: 'session-captain',
+  })
+  assert.equal(find(quiet, (n) => n.props['data-dag-overlaps'] !== undefined), undefined)
+
+  const selected = {
+    ...reviewRun(),
+    fileOverlaps: [
+      { tickets: ['B', 'C'], files: ['src/main.js', 'src/** ↔ src/events.js'] },
+      { tickets: ['B', 'D'], files: ['src/main.js'] },
+    ],
+  }
+  const pane = loadHost([{ runs: [selected], selected }, selected.key]).renderSlot('sidebar.right.pane.tab', {
+    sessionId: 'session-captain',
+  })
+  const block = find(pane, (n) => n.props['data-dag-overlaps'] !== undefined)
+  assert.ok(block, 'the review has an overlap block')
+  assert.match(text(block), /文件重叠提醒/)
+  assert.match(text(block), /不会阻止启动/)
+  const rows = findAll(block, (n) => n.props['data-dag-overlap'] !== undefined).map(text)
+  assert.deepEqual(rows, ['B 与 C：src/main.js、src/** ↔ src/events.js', 'B 与 D：src/main.js'])
 })
 
 test('plan review names a check no task uses yet and keeps every argument boundary and control character visible', () => {

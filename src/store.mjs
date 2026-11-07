@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { globToRegExp } from './selection.mjs'
 
 /**
  * The raw ledger arrays that decide what a plan approves: the run row, every
@@ -163,6 +164,16 @@ function strings(value, field, validator = text) {
   return list
 }
 
+// A ticket's declared files: repository-relative globs in selection.mjs syntax.
+function fileGlob(value, field) {
+  text(value, field)
+  const parts = value.split('/')
+  if (value.startsWith('/') || value.includes('\\') || parts.some((p) => p === '' || p === '.' || p === '..'))
+    throw new TypeError(field + ' must hold repository-relative paths or globs: ' + value)
+  globToRegExp(value)
+  return value
+}
+
 function commandExists(registry, name) {
   if (!Object.hasOwn(registry, name)) throw new TypeError('unknown verification check: ' + name)
   argvList(registry[name], name)
@@ -243,6 +254,9 @@ function normalizeTickets(list, checkRegistry, agentRegistry) {
     const acceptance = strings(raw.acceptance, id + '.acceptance')
     const ticket = { id, title, prompt, dependsOn, verify, acceptance }
     if (raw.kind !== undefined) ticket.kind = raw.kind
+    // Kept only when non-empty, so a manifest without files keeps its exact JSON and run identity.
+    const files = strings(raw.files, id + '.files', fileGlob)
+    if (files.length) ticket.files = files
     if (raw.produces !== undefined) ticket.produces = strings(raw.produces, id + '.produces')
     if (raw.consumes !== undefined) ticket.consumes = strings(raw.consumes, id + '.consumes')
     if (raw.agent !== undefined) {
@@ -301,6 +315,21 @@ export function latestWorkerResults(db) {
     .all()) {
     const { sourceSha, coveredTip, ok, failed } = JSON.parse(row.details)
     out.set(row.ticketId, { sourceSha, coveredTip: coveredTip ?? null, ok: ok === true, failed: failed ?? [] })
+  }
+  return out
+}
+
+/**
+ * Latest files_undeclared per ticket: { sourceSha, files }. Shared by RunStore
+ * and the read-only dashboard so both show the same result.
+ */
+export function latestUndeclared(db) {
+  const out = new Map()
+  for (const row of db
+    .prepare("SELECT ticketId,details FROM events WHERE type='files_undeclared' AND ticketId IS NOT NULL ORDER BY rowid")
+    .all()) {
+    const { sourceSha, files } = JSON.parse(row.details)
+    out.set(row.ticketId, { sourceSha, files: Array.isArray(files) ? files : [] })
   }
   return out
 }
@@ -1363,6 +1392,23 @@ export class RunStore {
       (details.run?.length ?? 0) + ' checks selected, ' + (details.skipped?.length ?? 0) + ' skipped' +
       (details.fallback ? ' (' + details.fallback + ')' : '')
     this.#transaction(() => this.#event('checks_selected', id ? this.get(id) : null, note, details))
+  }
+
+  /**
+   * A submitted commit changed files its ticket did not declare. A diagnostic
+   * for the captain's next plan, never a gate; the captain is not notified.
+   * @param details - { sourceSha, files }.
+   */
+  recordUndeclared(id, details) {
+    record(details, 'undeclared files')
+    text(details.sourceSha, 'sourceSha')
+    const note = id + ' changed ' + details.files.length + ' undeclared file(s): ' + details.files.slice(0, 5).join(', ')
+    this.#transaction(() => this.#event('files_undeclared', this.get(id), note, details))
+  }
+
+  /** The latest undeclared-files diagnostic of every ticket that has one, by ticket ID. */
+  undeclaredResults() {
+    return latestUndeclared(this.#db)
   }
 
   events() {

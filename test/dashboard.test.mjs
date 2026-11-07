@@ -542,6 +542,61 @@ test('cold history exposes each ticket agent preset and model route', (t) => {
   }
 })
 
+test('cold history carries declared files, their overlaps and the undeclared-files note', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'dag-files-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const repo = join(root, 'repo')
+  mkdirSync(repo)
+  const file = join(repo, 'state.sqlite')
+  const db = new RunStore(file)
+  const manifest = normalizeManifest(
+    {
+      spec_id: 'demo',
+      tickets: [
+        { id: 'A', title: 'A', verify: ['test'], files: ['src/a.js', 'src/main.js'] },
+        { id: 'B', title: 'B', verify: ['test'], files: ['src/b.js', 'src/main.js'] },
+        { id: 'C', title: 'C', verify: ['test'], depends_on: ['A'], files: ['src/main.js'] },
+        { id: 'D', title: 'D', verify: ['test'] },
+      ],
+    },
+    { test: [['node', '--version']] },
+  )
+  const meta = {
+    runId: 'files',
+    parentId: 'captain',
+    repo: { root: repo, commonDir: join(repo, '.git') },
+    ref: 'refs/heads/integration/files',
+    baseSha: 'start',
+    manifest,
+    policyHash: 'test',
+  }
+  db.init(meta)
+  db.recordUndeclared('A', { sourceSha: 'a'.repeat(40), files: ['README.md'] })
+  // B's note is about an earlier commit than the one it carries now, so it no longer applies.
+  db.recordUndeclared('B', { sourceSha: 'c'.repeat(40), files: ['old.js'] })
+  const raw = new DatabaseSync(file)
+  raw.prepare('UPDATE tickets SET sourceSha=? WHERE id=?').run('a'.repeat(40), 'A')
+  raw.prepare('UPDATE tickets SET sourceSha=? WHERE id=?').run('b'.repeat(40), 'B')
+  raw.close()
+  const catalog = new RunCatalog(join(root, 'profile'))
+  catalog.remember(file, meta, 1)
+  try {
+    const selected = catalog.read({ maxWorkers: 16, runs: new Map() }, null).selected
+    // C depends on A, so only A–B and B–C may run together on src/main.js.
+    assert.deepEqual(selected.fileOverlaps, [
+      { tickets: ['A', 'B'], files: ['src/main.js'] },
+      { tickets: ['B', 'C'], files: ['src/main.js'] },
+    ])
+    const byId = Object.fromEntries(selected.tickets.map((r) => [r.id, r]))
+    assert.deepEqual(byId.A.files, ['src/a.js', 'src/main.js'])
+    assert.deepEqual(byId.D.files, [])
+    assert.deepEqual(byId.A.undeclaredFiles, { sourceSha: 'a'.repeat(40), files: ['README.md'] })
+    assert.equal(byId.B.undeclaredFiles, null)
+  } finally {
+    db.close()
+  }
+})
+
 test('cold history reads cleanup results, and a ledger from before cleanup as not cleaned', (t) => {
   const root = mkdtempSync(join(tmpdir(), 'dag-cleanup-'))
   t.after(() => rmSync(root, { recursive: true, force: true }))

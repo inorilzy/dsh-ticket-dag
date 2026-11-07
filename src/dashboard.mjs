@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, statSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { END_MODES, integrationOf, latestWorkerResults, planRevision, readIntegrity } from './store.mjs'
+import { fileOverlaps } from './selection.mjs'
+import { END_MODES, integrationOf, latestUndeclared, latestWorkerResults, planRevision, readIntegrity } from './store.mjs'
 import { runTiming } from './timing.mjs'
 
 const route = '/api/ticket-dag.dashboard'
@@ -321,6 +322,8 @@ export class RunCatalog {
           // Every approved or reviewable command; the plan review shows them for approval.
           checks: data.checks ?? {},
           planChecks: data.planChecks ?? [],
+          // Ticket pairs that may run together and declare overlapping files.
+          fileOverlaps: data.fileOverlaps ?? [],
           // The integration mode frozen into the run manifest.
           integration: data.integration ?? { mode: 'each', selectChecksByFiles: false },
           // The final full check or its bisection while the live coordinator runs it.
@@ -341,6 +344,8 @@ export class RunCatalog {
             route: t.route ?? null,
             dependsOn: t.dependsOn,
             verify: t.verify ?? [],
+            files: t.files ?? [],
+            undeclaredFiles: t.undeclaredFiles ?? null,
             attempt: t.attempt,
             path: t.path,
             branch: t.branch,
@@ -417,26 +422,33 @@ export function readLedger(file, entry, detail, globalLimit, agents = {}, now = 
       result.integration = integrationOf(JSON.parse(integrity.run.manifest))
       const appended = new Map(integrity.appended.map((r) => [r.ticketId, r.createdAt]))
       const workerResults = latestWorkerResults(db)
+      const undeclared = latestUndeclared(db)
       result.tickets = db
         .prepare(
           `SELECT id,json_extract(definition,'$.title') AS title,
         json_extract(definition,'$.dependsOn') AS deps,json_extract(definition,'$.verify') AS checkIds,
+        json_extract(definition,'$.files') AS declared,
         status,attempt,baseSha,sourceSha,landedSha,
         path,branch,childId,message,autoRetries,retryAt,${cleanup},json_extract(definition,'$.agent') AS agent,
         json_extract(definition,'$.agentSpec.provider') AS provider,
         json_extract(definition,'$.agentSpec.model') AS modelId FROM tickets ORDER BY position`,
         )
         .all()
-        .map(({ deps, checkIds, provider, modelId, ...row }) => ({
+        .map(({ deps, checkIds, declared, provider, modelId, ...row }) => ({
           ...row,
           dependsOn: JSON.parse(deps),
           verify: checkIds ? JSON.parse(checkIds) : [],
+          files: declared ? JSON.parse(declared) : [],
+          // As in Coordinator#_snapshot: only a note about the current submitted commit applies.
+          undeclaredFiles: undeclared.get(row.id)?.sourceSha === row.sourceSha ? undeclared.get(row.id) : null,
           model: modelId ? [provider, modelId].filter(Boolean).join('/') : null,
           livePhase: null,
           workerVerify: workerResults.get(row.id) ?? null,
           appended: appended.has(row.id),
           appendedAt: appended.get(row.id) ?? null,
         }))
+      // The same rule as Coordinator#_snapshot, from the same ticket fields.
+      result.fileOverlaps = fileOverlaps(result.tickets)
       // A plan waiting for approval shows the captain's commands even before its captain reopens.
       if (run.mode === 'staged') {
         const checks = JSON.parse(integrity.run.manifest).checks ?? {}

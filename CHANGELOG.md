@@ -2,6 +2,10 @@
 
 版本号以 `package.json` 为准。条目整理自 Git 提交记录。
 
+## 0.17.0
+
+- 工单新增可选字段 `files`（预计修改的文件，仓库相对路径或 glob）。没有依赖关系、可能同时运行的工单声明了重叠的文件时，`dag_run`、`dag_add`、`dag_status` 结果的 `fileOverlaps` 列出它们，计划审查显示 **文件重叠提醒**；只提醒，不拒绝。工单提交时用 Git 比对实际改动，声明以外的文件记为 `files_undeclared`，在工单的 `undeclaredFiles` 和看板详情里显示，不影响集成。队长提示词要求填写 `files`，并把多张工单都要改的共享注册文件拆成单独工单。依据 plane-bench：P02–P06 都改同一组注册文件，plane-b 试合并冲突返工 5 次。
+
 ## 0.16.0
 
 - 新增集成模式 `integrationMode`：`each`（每张完整验收）、`end`（A 先合并、最后测：集成通道只跑快验收，全部集成后跑一次全量，失败按合并点二分定位并自动追加修复工单 `fix-<工单>-<n>`，上限 `maxFinalRepairs`）、`worker`（E 提交后立即在该提交上验收）、`worker-end`（A+E）、`train`（B 合并列车，`trainSize`）。新增 `selectChecksByFiles`（F 按改动文件选验收命令）和每个验收 ID 的 `checkMeta`（`files`、`fast`）。清单可用 `integration`、`check_meta` 覆盖，`dag_run` 时冻结。

@@ -1,5 +1,6 @@
-// Which verification checks a candidate needs, from the files it changes. Pure:
-// no I/O, so the coordinator, the simulation and the tests share one rule set.
+// Which verification checks a candidate needs, from the files it changes, and
+// which tickets declare overlapping files. Pure: no I/O, so the coordinator, the
+// dashboard, the simulation and the tests share one rule set.
 
 /**
  * A path glob as an anchored RegExp over '/'-separated repository paths.
@@ -65,6 +66,114 @@ function alternatives(body) {
   }
   parts.push(body.slice(start))
   return parts
+}
+
+// Braces are expanded before segments are compared, so only * and ? are wildcards here.
+const wild = /[*?]/
+// Brace expansion past this many alternatives is treated as matching anything,
+// so a pathological glob widens a warning instead of stalling dag_run.
+const expandLimit = 64
+
+function expand(glob) {
+  const open = glob.indexOf('{')
+  if (open < 0) return [glob]
+  const end = closing(glob, open)
+  if (end < 0) return [glob]
+  const out = []
+  for (const part of alternatives(glob.slice(open + 1, end))) {
+    for (const rest of expand(glob.slice(0, open) + part + glob.slice(end + 1))) {
+      out.push(rest)
+      if (out.length > expandLimit) return null
+    }
+  }
+  return out
+}
+
+// Whether two single path segments can name the same segment. Exact for
+// literals and for a literal against a pattern; for two patterns it compares
+// the literal text before the first and after the last wildcard, which can
+// report an overlap that does not exist but never misses one.
+function segmentsMeet(a, b) {
+  const aw = wild.test(a),
+    bw = wild.test(b)
+  if (!aw && !bw) return a === b
+  if (!aw) return globToRegExp(b).test(a)
+  if (!bw) return globToRegExp(a).test(b)
+  const head = (s) => s.slice(0, s.search(/[*?]/))
+  const tail = (s) => s.slice(Math.max(s.lastIndexOf('*'), s.lastIndexOf('?')) + 1)
+  const [ha, hb, ta, tb] = [head(a), head(b), tail(a), tail(b)]
+  return (ha.startsWith(hb) || hb.startsWith(ha)) && (ta.endsWith(tb) || tb.endsWith(ta))
+}
+
+function pathsMeet(a, i, b, j) {
+  if (i === a.length && j === b.length) return true
+  if (a[i] === '**') return pathsMeet(a, i + 1, b, j) || (j < b.length && pathsMeet(a, i, b, j + 1))
+  if (b[j] === '**') return pathsMeet(a, i, b, j + 1) || (i < a.length && pathsMeet(a, i + 1, b, j))
+  if (i === a.length || j === b.length) return false
+  // ** inside a segment (a**b) crosses separators; assume it can match.
+  if (a[i].includes('**') || b[j].includes('**')) return true
+  return segmentsMeet(a[i], b[j]) && pathsMeet(a, i + 1, b, j + 1)
+}
+
+/** Whether two file globs (globToRegExp syntax) can name a common path. */
+export function globsOverlap(a, b) {
+  if (a === b) return true
+  const left = expand(a),
+    right = expand(b)
+  if (!left || !right) return true
+  return left.some((x) => right.some((y) => pathsMeet(x.split('/'), 0, y.split('/'), 0)))
+}
+
+/**
+ * Ticket pairs that declare overlapping files and may run at the same time.
+ * A warning for the captain and the plan review, never a refusal: two tickets
+ * that edit different parts of one file often merge cleanly.
+ * @param tickets - [{ id, dependsOn, files?, status? }] in plan order.
+ * @returns [{ tickets: [a, b], files: [glob or 'globA ↔ globB'] }]; a pair
+ *   ordered by a transitive dependency, a ticket without files, and a ticket
+ *   already integrated or cancelled are left out.
+ */
+export function fileOverlaps(tickets) {
+  const byId = new Map(tickets.map((t) => [t.id, t]))
+  const ancestors = new Map()
+  const above = (id, trail = new Set()) => {
+    if (ancestors.has(id)) return ancestors.get(id)
+    const set = new Set()
+    if (trail.has(id)) return set
+    trail.add(id)
+    for (const dep of byId.get(id)?.dependsOn ?? []) {
+      set.add(dep)
+      for (const up of above(dep, trail)) set.add(up)
+    }
+    ancestors.set(id, set)
+    return set
+  }
+  const open = tickets.filter(
+    (t) => Array.isArray(t.files) && t.files.length && t.status !== 'INTEGRATED' && t.status !== 'CANCELLED',
+  )
+  const out = []
+  for (let i = 0; i < open.length; i++) {
+    for (let j = i + 1; j < open.length; j++) {
+      const a = open[i],
+        b = open[j]
+      if (above(a.id).has(b.id) || above(b.id).has(a.id)) continue
+      const files = []
+      for (const x of a.files)
+        for (const y of b.files) {
+          if (!globsOverlap(x, y)) continue
+          const label = x === y ? x : x + ' ↔ ' + y
+          if (!files.includes(label)) files.push(label)
+        }
+      if (files.length) out.push({ tickets: [a.id, b.id], files })
+    }
+  }
+  return out
+}
+
+/** Changed paths no glob in files covers, in changed order. */
+export function undeclaredFiles(files, changed) {
+  const patterns = files.map(globToRegExp)
+  return changed.filter((f) => !patterns.some((p) => p.test(f)))
 }
 
 /**

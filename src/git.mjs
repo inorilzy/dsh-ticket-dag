@@ -316,6 +316,16 @@ export async function changedFiles(repo, fromSha, toSha) {
   return out.split('\0').filter(Boolean)
 }
 
+/**
+ * Paths a ticket commit changes itself, measured from its merge base with the
+ * integration tip: a worker that merged the tip to resolve a conflict does not
+ * count the other tickets' files it brought in.
+ */
+export async function ownChangedFiles(repo, tipSha, sourceSha) {
+  const base = (await git(repo, 'merge-base', oid(tipSha), oid(sourceSha))).trim()
+  return changedFiles(repo, base, sourceSha)
+}
+
 function candidatePin(candidate) {
   return 'refs/dsh-ticket-dag/candidates/' + oid(candidate)
 }

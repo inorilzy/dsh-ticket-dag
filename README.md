@@ -90,7 +90,9 @@ DeepSeek Harness 的本地 Git 工单调度插件。队长交给它一个已确�
 
 ## 工单与控制工具
 
-清单字段为 `spec_id`、`base_ref`、`max_workers`、`tickets[]`，可选清单级 `checks`。工单至少需要 `id` 和 `title`。建议显式填写 `prompt`、`acceptance`、`depends_on`，可选 `verify`、`produces`、`consumes`、`agent`、`source`（由 `dag_import` 填写的工单来源）和清单级 `external_inputs`。导入时校验重复、未知依赖、环、验收项、预设 Agent 及已声明产物关系。
+清单字段为 `spec_id`、`base_ref`、`max_workers`、`tickets[]`，可选清单级 `checks`。工单至少需要 `id` 和 `title`。建议显式填写 `prompt`、`acceptance`、`depends_on`，可选 `verify`、`files`、`produces`、`consumes`、`agent`、`source`（由 `dag_import` 填写的工单来源）和清单级 `external_inputs`。导入时校验重复、未知依赖、环、验收项、预设 Agent 及已声明产物关系。
+
+**预计修改的文件（可选）。** 工单的 `files` 写这张工单预计会改的文件，用仓库相对路径或 glob（语法同 `check_meta.files`），例如 `["src/systems/player.js", "tests/player.test.mjs"]`。不能以 `/` 开头，不能含 `..`、`.` 或空的路径段。两张工单之间没有直接或间接依赖、可能同时运行，而 `files` 又有重叠时，`dag_run`、`dag_add`、`dag_status` 的结果会在 `fileOverlaps` 里列出这一对工单和重叠的文件，计划审查也会多一块 **文件重叠提醒**。这只是提醒，不会拒绝计划或阻止启动：同一文件的不同位置往往能自动合并，是否改拆法、加依赖由队长和你决定。常见的解法是把多张工单都要追加条目的共享文件（注册表、入口、路由表、配置列表）交给一张单独的工单，让它依赖那几张工单。已集成或已取消的工单不再参与比较。两个 glob 之间按字面前缀、后缀判断能否命中同一文件，可能多报，不会漏报。工单提交时，插件用 Git 计算这张提交自己改了哪些文件（从它和集成分支的合并基点算起，解决冲突时合入的其他工单的文件不算），不在 `files` 里的记为 `files_undeclared` 事件，在 `dag_status` 的工单 `undeclaredFiles` 和看板工单详情里显示，同样不影响集成，也不通知队长。没写 `files` 的工单不参与这两项检查，清单 JSON 与之前完全一致。
 
 **验收（可选）。** 每张工单的 `verify` 可以留空或不写，表示这张工单没有本票专属的验收命令：它的候选仍会执行本轮已集成工单的累计回归检查（按 ID 去重），通过后试合并干净、复核候选即集成，适合文档这类没有本票命令能检查的工作。写了 `verify` 时，ID 可以来自两处：
 

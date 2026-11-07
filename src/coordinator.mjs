@@ -3,7 +3,7 @@ import { access, lstat, mkdir, readFile, readdir, writeFile } from 'node:fs/prom
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import * as git from './git.mjs'
-import { selectChecks } from './selection.mjs'
+import { fileOverlaps, selectChecks, undeclaredFiles } from './selection.mjs'
 import {
   agentSpec,
   END_MODES,
@@ -704,6 +704,7 @@ export class Coordinator {
     const counts = Object.create(null)
     for (const t of tickets) counts[t.status] = (counts[t.status] ?? 0) + 1
     const workerResults = run.db.workerResults()
+    const undeclared = run.db.undeclaredResults()
     return {
       runId: m.runId,
       specId: m.manifest.specId,
@@ -734,6 +735,9 @@ export class Coordinator {
       checks: { ...Object.fromEntries(planCommands), ...run.checks },
       planChecks: Object.keys(m.manifest.checks ?? {}),
       unapprovedChecks: unapproved,
+      // Unfinished ticket pairs that may run together and declare overlapping
+      // files: a warning to split or order them, never a refusal.
+      fileOverlaps: fileOverlaps(tickets),
       tickets: tickets.map(
         ({
           id,
@@ -756,11 +760,16 @@ export class Coordinator {
           cleanup,
           cleanupReason,
           source,
+          files,
         }) => ({
           id,
           title,
           status,
           source: source ?? null,
+          files: files ?? [],
+          // Files the current submitted commit changed outside files: { sourceSha, files }.
+          // A note about an earlier attempt's commit no longer applies.
+          undeclaredFiles: undeclared.get(id)?.sourceSha === sourceSha ? undeclared.get(id) : null,
           agent: agent ?? null,
           model: modelRoute({ agentSpec }),
           route: {
@@ -1497,6 +1506,7 @@ export class Coordinator {
         }),
         'Stale worker receipt',
       )
+      await this._recordUndeclared(run, row, sourceSha)
     } catch (err) {
       job.atCapacity = launching && !job.handle && err.code === capacityCode
       if (!launching || job.atCapacity) job.quiet = true
@@ -1504,6 +1514,17 @@ export class Coordinator {
     } finally {
       if (job.quiet) run.safeChildren.add(row.childId)
     }
+  }
+
+  // Compare a submitted commit's own changes with the files its ticket declared.
+  // Diagnostic only: an unknown diff or a ledger write failure never blocks integration.
+  async _recordUndeclared(run, row, sourceSha) {
+    if (!row.files?.length) return
+    try {
+      const changed = await git.ownChangedFiles(run.db.meta().repo, run.db.meta().tipSha, sourceSha)
+      const files = undeclaredFiles(row.files, changed)
+      if (files.length) run.db.recordUndeclared(row.id, { sourceSha, files })
+    } catch {}
   }
 
   async _failed(run, row, job, err) {
