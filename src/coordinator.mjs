@@ -17,6 +17,7 @@ import {
   WORKER_MODES,
 } from './store.mjs'
 import { runTiming } from './timing.mjs'
+import { repairAgent } from './agents.mjs'
 
 const hash = (text) => createHash('sha256').update(text).digest('hex')
 const message = (err) => String(err?.message ?? err).slice(-3500)
@@ -122,6 +123,22 @@ function reviewText(meta, first) {
         'If nothing needs fixing, report to the user now.'
     : 'Review fixes are integrated. This run had its review round; report to the user without reviewing again.'
 }
+// Rules every worker follows whatever its preset, so a preset only adds its role.
+function workerRules(row) {
+  return [
+    'Working rules:',
+    '- Do only what this ticket asks, with the smallest change that does it. Follow the naming, error handling, imports and test style already in the repository. Do not add an abstraction for logic used once, and do not refactor neighbouring code.',
+    row.files?.length
+      ? '- This ticket declares the files it changes: ' + JSON.stringify(row.files) +
+        '. Stay inside them; if the work truly needs another file, change it and name it with the reason in your report.'
+      : '',
+    '- A behavior change comes with a test that proves it. Put new tests in a new test file named for this ticket rather than appending to a large shared test file, so parallel tickets do not conflict.',
+    '- When a test fails, fix the cause in the code under test. Do not weaken assertions, skip tests or special-case the test. Remove temporary debug output before committing.',
+    '- Report only results you ran and saw, with the command; never "should pass". After three failed attempts at the same problem, stop and report what you tried and where it is stuck.',
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
 function specPrompt(meta, row, upstream) {
   const stamp = [
     'DAG-Run: ' + meta.runId,
@@ -149,6 +166,7 @@ function specPrompt(meta, row, upstream) {
     'Ticket: ' + row.id + ' — ' + row.title,
     row.agentSpec?.instructions ? 'Role (' + row.agent + '): ' + row.agentSpec.instructions : '',
     row.prompt,
+    workerRules(row),
     'Acceptance: ' + JSON.stringify(row.acceptance) + '. ' +
       (row.verify.length
         ? 'Required check IDs: ' + JSON.stringify(row.verify) +
@@ -1516,6 +1534,26 @@ export class Coordinator {
     }
   }
 
+  /**
+   * Who works an automatic fix ticket: the repair preset when the profile has
+   * it, keeping the route the user chose for that preset in this run if any
+   * ticket already used it; otherwise the culprit's own preset, as before.
+   * @returns { agent, spec } or null for the default worker.
+   */
+  _repairOwner(run, culprit) {
+    if (this.agents && Object.hasOwn(this.agents, repairAgent)) {
+      const used = run.db.tickets().find((t) => t.agent === repairAgent && t.agentSpec)
+      const spec = agentSpec(this.agents, repairAgent)
+      if (used)
+        for (const field of ['provider', 'model', 'reasoningEffort']) {
+          if (used.agentSpec[field]) spec[field] = used.agentSpec[field]
+          else delete spec[field]
+        }
+      return { agent: repairAgent, spec }
+    }
+    return culprit.agent ? { agent: culprit.agent, spec: culprit.agentSpec ?? {} } : null
+  }
+
   // Compare a submitted commit's own changes with the files its ticket declared.
   // Diagnostic only: an unknown diff or a ledger write failure never blocks integration.
   async _recordUndeclared(run, row, sourceSha) {
@@ -2031,6 +2069,7 @@ export class Coordinator {
         )
         return
       }
+      const owner = this._repairOwner(run, culprit)
       const fix = normalizeAppend(
         [
           {
@@ -2045,11 +2084,11 @@ export class Coordinator {
               'Output tail:\n' + tails,
             verify: [...new Set([...culprit.verify, ...failed])],
             acceptance: ['Checks ' + failed.join(', ') + ' pass on the integrated tip'],
-            ...(culprit.agent && { agent: culprit.agent }),
+            ...(owner && { agent: owner.agent }),
           },
         ],
         run.checks,
-        culprit.agent ? { [culprit.agent]: culprit.agentSpec ?? {} } : {},
+        owner ? { [owner.agent]: owner.spec } : {},
       )
       run.db.appendRepair(fix[0], { policyHash: policyHash({ tickets: fix }, run.checks), details })
       // The ledger now holds this append; it is the new trusted state, as in add().

@@ -8,7 +8,7 @@ PRD 把“运行前在看板上审批清单”和“按工单切换模型”列�
 
 ## 配置
 
-`agents`：`{ [id]: { name, description, instructions, provider, model, reasoningEffort, maxConcurrent } }`，`maxConcurrent` 为 0–32 的整数（0 表示不单独限制），其余字段为字符串。`name` 是显示名（0.7.0 起），内置值为 实现者 / 测试员 / 文档员；只用于界面，不进入清单或 `agentSpec`。默认值为 `src/agents.mjs` 的 `implementer`、`test-writer`、`docs`。profile 保存后以保存值为准，不与内置值合并。空的 `provider`、`model`、`reasoningEffort` 表示使用宿主默认。
+`agents`：`{ [id]: { name, description, instructions, provider, model, reasoningEffort, maxConcurrent } }`，`maxConcurrent` 为 0–32 的整数（0 表示不单独限制），其余字段为字符串。`name` 是显示名（0.7.0 起），内置值为 架构 / 修复 / 实现者 / 前端 / 文书 / 验收员；只用于界面，不进入清单或 `agentSpec`。默认值为 `src/agents.mjs` 的 `architect`、`debugger`、`implementer`、`frontend`、`scribe`、`verifier`（0.18.0 起；之前为 `implementer`、`test-writer`、`docs`、`frontend`、`verifier`、`merger`）。profile 保存后以保存值为准，不与内置值合并。空的 `provider`、`model`、`reasoningEffort` 表示使用宿主默认。
 
 ## 清单
 

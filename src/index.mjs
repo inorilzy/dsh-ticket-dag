@@ -133,6 +133,16 @@ function integrationNote(integrationMode, selectChecksByFiles) {
   )
 }
 
+// When the captain should pick each built-in preset; only presets the profile has are named.
+const presetUse = {
+  architect: 'for the root ticket that fixes the interfaces, skeletons and shared registries other tickets build on',
+  implementer: 'for ordinary code and its tests, including tests for existing code',
+  frontend: 'for user interface work',
+  scribe: 'for docs, comments, config and the mechanical ticket that registers upstream modules in a shared file',
+  debugger: 'for bug fixes and failing checks, which automatic fix tickets also use',
+  verifier: 'for acceptance on real hosts, browsers or SDKs',
+}
+
 export function captainSection({
   checks,
   agents,
@@ -144,8 +154,11 @@ export function captainSection({
   selectChecksByFiles,
 }) {
   const presets = Object.keys(agents ?? {})
+  const uses = presets.filter((id) => Object.hasOwn(presetUse, id)).map((id) => id + ' ' + presetUse[id])
   const limits =
-    'Give each ticket the preset that matches its kind of work (for example UI tickets to a frontend preset, real-host acceptance to a verifier preset) instead of one preset for every ticket. Set max_workers explicitly' +
+    'Give each ticket the preset that matches how much judgement it needs, not one preset for every ticket' +
+    (uses.length ? ': ' + uses.join('; ') : '') +
+    '. Set max_workers explicitly' +
     (maxWorkers ? ' (this profile allows at most ' + maxWorkers + ')' : '') +
     ' and tell the user the value; tickets that edit the same files conflict more when many run at once.' +
     ' Give each ticket "files": the repository-relative paths or globs it is expected to change, from the code you read. When several tickets would each add an entry to the same shared file (a registry, an index, a route table, a config list), move those edits into one ticket of their own that depends on them, so the parallel tickets touch only their own files. The dag_run, dag_add and dag_status results carry fileOverlaps: ticket pairs that may run at the same time and declare overlapping files. It is a warning, not a refusal; split or order those tickets, or tell the user why the overlap is acceptable. A ticket whose commit changes files outside its files gets an undeclaredFiles note; it does not block integration.' +
@@ -501,7 +514,7 @@ export function apply(ctx, config = {}, { importer = importTickets, reporter = w
 
   register(
     'run',
-    'Start the approved spec manifest and return its runId. Reusing a runId with the same manifest is idempotent. Each ticket verify list is optional and names check IDs: a profile check, or one defined in the manifest checks object ({"<id>": [["program", "arg"]]}), which the user approves with the plan. An empty or omitted verify list means the ticket has no check of its own: its candidate still runs the accumulated regression checks of the tickets already integrated in this run, then integrates once those pass and its trial merge is clean. A ticket may set agent to a configured agent preset ID (for example implementer, frontend, verifier, test-writer, docs or merger) to give its worker that role and model; omit it for the default worker. A ticket may set files to the repository-relative paths or globs it expects to change; the result fileOverlaps lists ticket pairs that may run at the same time and declare overlapping files, as a warning. When the result mode is staged, nothing has started: the user reviews each ticket preset and model in the 「工单 · <runId>」 tab of the conversation right sidebar and approves or discards the plan there. Tell the user that and end the turn; you are notified once it is approved. dag_resume cannot start a staged run. To add work to this run later, use dag_add instead of a new dag_run.',
+    'Start the approved spec manifest and return its runId. Reusing a runId with the same manifest is idempotent. Each ticket verify list is optional and names check IDs: a profile check, or one defined in the manifest checks object ({"<id>": [["program", "arg"]]}), which the user approves with the plan. An empty or omitted verify list means the ticket has no check of its own: its candidate still runs the accumulated regression checks of the tickets already integrated in this run, then integrates once those pass and its trial merge is clean. A ticket may set agent to a configured agent preset ID (for example architect, implementer, frontend, scribe, debugger or verifier) to give its worker that role and model; omit it for the default worker. A ticket may set files to the repository-relative paths or globs it expects to change; the result fileOverlaps lists ticket pairs that may run at the same time and declare overlapping files, as a warning. When the result mode is staged, nothing has started: the user reviews each ticket preset and model in the 「工单 · <runId>」 tab of the conversation right sidebar and approves or discards the plan there. Tell the user that and end the turn; you are notified once it is approved. dag_resume cannot start a staged run. To add work to this run later, use dag_add instead of a new dag_run.',
     {
       manifest: { type: 'json', required: true, description: 'Ticket DAG manifest object or JSON string.' },
       runId: {

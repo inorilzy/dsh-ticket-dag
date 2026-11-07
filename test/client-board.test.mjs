@@ -603,13 +603,13 @@ test('the stepper ends with a cleanup step and the run overview counts cleaned a
 
 test('nodes and the detail card name the ticket member and its model', () => {
   const root = boardFor([
-    { id: 'A', title: 'Docs', status: 'RUNNING', agent: 'docs', model: 'acme/fast-1', livePhase: { stage: 'agent' } },
+    { id: 'A', title: 'Docs', status: 'RUNNING', agent: 'scribe', model: 'acme/fast-1', livePhase: { stage: 'agent' } },
     { id: 'B', status: 'PENDING', dependsOn: ['A'] },
   ])
   const node = find(root, (n) => n.props['data-dag-node'] === 'A')
-  assert.match(text(node), /文档员/)
-  assert.match(node.props.title, /文档员 \/ acme\/fast-1/)
-  assert.match(text(find(root, (n) => n.props['data-dag-detail'] === 'A')), /文档员 · acme\/fast-1/)
+  assert.match(text(node), /文书/)
+  assert.match(node.props.title, /文书 \/ acme\/fast-1/)
+  assert.match(text(find(root, (n) => n.props['data-dag-detail'] === 'A')), /文书 · acme\/fast-1/)
   assert.doesNotMatch(text(find(root, (n) => n.props['data-dag-node'] === 'B')), /默认/)
 })
 
@@ -709,7 +709,7 @@ test('without saved presets the config page starts from the built-in presets', a
   const values = (label) =>
     findAll(section, (n) => n.props['aria-label'] === label).map((n) => n.props.value)
   assert.deepEqual(values('Agent ID'), Object.keys(builtinAgents))
-  assert.deepEqual(values('显示名'), ['实现者', '测试员', '文档员', '前端', '验收员', '合并员'])
+  assert.deepEqual(values('显示名'), ['架构', '修复', '实现者', '前端', '文书', '验收员'])
   assert.deepEqual(
     values('角色说明'),
     Object.values(builtinAgents).map((a) => a.instructions),
@@ -1289,8 +1289,9 @@ test('built-in presets saved without a display name still show their Chinese nam
   })
   const names = findAll(pane, (n) => n.props['data-dag-member'] !== undefined).map((m) => text(m))
   assert.match(names[0], /实现者/)
-  assert.match(names[1], /测试员/)
-  assert.match(names[2], /文档员/)
+  // test-writer and docs are no longer built in, so with no saved name they show their ID.
+  assert.match(names[1], /^test-writer/)
+  assert.match(names[2], /^docs/)
 })
 
 test('the captain avatar follows its vendor; each member has its own colour, also on its map nodes', () => {
@@ -1638,8 +1639,8 @@ const dagRunResult = {
   runId: 'demo-01',
   mode: 'staged',
   tickets: [
-    { id: 'T1', agent: 'docs' },
-    { id: 'T2', agent: 'docs' },
+    { id: 'T1', agent: 'scribe' },
+    { id: 'T2', agent: 'scribe' },
     { id: 'T3', agent: 'implementer' },
     { id: 'T4', agent: null },
   ],
@@ -1665,7 +1666,7 @@ test('each dag_run tool call folds into a conversation card that keeps the run I
   assert.equal(node.data.runId, 'demo-01')
   assert.deepEqual(
     [...node.data.tickets].map((t) => [t.id, t.agent]),
-    [['T1', 'docs'], ['T2', 'docs'], ['T3', 'implementer'], ['T4', null]],
+    [['T1', 'scribe'], ['T2', 'scribe'], ['T3', 'implementer'], ['T4', null]],
   )
   // A failed or unreadable result shows no card; the call alone shows none either.
   assert.equal(foldCard(definition, dagCall), null)
@@ -1690,7 +1691,7 @@ function cardSnapshot(extra = {}) {
     available: true,
     complete: false,
     counts: { PENDING: 4 },
-    presets: [{ id: 'docs', name: '写文档的' }],
+    presets: [{ id: 'scribe', name: '写文档的' }],
     tickets: dagRunResult.tickets.map((t) => ({ ...t })),
     ...extra,
   }
@@ -1821,7 +1822,7 @@ test('a failed read marks the folded plan as an old snapshot and does not invent
   assert.equal(cardState(card), '旧快照')
   assert.match(text(card), /旧快照 · 4 张工单/)
   assert.match(text(card), /读取失败，以下是旧快照，不是当前状态。/)
-  assert.deepEqual(cardMembers(card), ['文档员 · 2 张', '实现者 · 1 张', '默认成员 · 1 张'])
+  assert.deepEqual(cardMembers(card), ['文书 · 2 张', '实现者 · 1 张', '默认成员 · 1 张'])
   assert.doesNotMatch(text(card), /待确认|运行中|已暂停|已取消|已完成|进行中|记录不可读取/)
   openRunCard(host, card)
   assert.deepEqual(host.opened, [])
@@ -1857,7 +1858,7 @@ test('a run missing from the board list is marked an old snapshot, not a live ti
   assert.equal(cardState(card), '旧快照')
   assert.match(text(card), /旧快照 · 4 张工单/)
   assert.match(text(card), /读取失败，以下是旧快照，不是当前状态。/)
-  assert.deepEqual(cardMembers(card), ['文档员 · 2 张', '实现者 · 1 张', '默认成员 · 1 张'])
+  assert.deepEqual(cardMembers(card), ['文书 · 2 张', '实现者 · 1 张', '默认成员 · 1 张'])
   assert.doesNotMatch(text(card), /待确认|运行中|已暂停|已取消|已完成|记录不可读取/)
   openRunCard(host, card)
   assert.deepEqual(host.opened, [])
