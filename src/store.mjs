@@ -328,7 +328,14 @@ export function latestUndeclared(db) {
   for (const row of db
     .prepare("SELECT ticketId,details FROM events WHERE type='files_undeclared' AND ticketId IS NOT NULL ORDER BY rowid")
     .all()) {
-    const { sourceSha, files } = JSON.parse(row.details)
+    // A diagnostic row that does not parse is skipped, never fatal to the snapshot.
+    let details
+    try {
+      details = JSON.parse(row.details)
+    } catch {
+      continue
+    }
+    const { sourceSha, files } = details ?? {}
     out.set(row.ticketId, { sourceSha, files: Array.isArray(files) ? files : [] })
   }
   return out

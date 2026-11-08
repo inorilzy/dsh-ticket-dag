@@ -123,6 +123,28 @@ function reviewText(meta, first) {
         'If nothing needs fixing, report to the user now.'
     : 'Review fixes are integrated. This run had its review round; report to the user without reviewing again.'
 }
+// Tickets whose route the user chose: every ticket except those dag_add
+// appended after the approval (all appended ones when the run needed none).
+function approvedTickets(db) {
+  const approval = db.events().find((e) => e.type === 'run_approved')
+  const late = new Set(
+    db
+      .appended()
+      .filter((b) => !approval || b.createdAt > approval.createdAt)
+      .flatMap((b) => b.tickets.map((t) => t.id)),
+  )
+  return db.tickets().filter((t) => !late.has(t.id))
+}
+
+// A diagnostic that fails to compute shows as none instead of failing the snapshot.
+function quietly(fn, fallback) {
+  try {
+    return fn()
+  } catch {
+    return fallback
+  }
+}
+
 // Rules every worker follows whatever its preset, so a preset only adds its role.
 function workerRules(row) {
   return [
@@ -722,7 +744,7 @@ export class Coordinator {
     const counts = Object.create(null)
     for (const t of tickets) counts[t.status] = (counts[t.status] ?? 0) + 1
     const workerResults = run.db.workerResults()
-    const undeclared = run.db.undeclaredResults()
+    const undeclared = quietly(() => run.db.undeclaredResults(), new Map())
     return {
       runId: m.runId,
       specId: m.manifest.specId,
@@ -755,7 +777,7 @@ export class Coordinator {
       unapprovedChecks: unapproved,
       // Unfinished ticket pairs that may run together and declare overlapping
       // files: a warning to split or order them, never a refusal.
-      fileOverlaps: fileOverlaps(tickets),
+      fileOverlaps: quietly(() => fileOverlaps(tickets), []),
       tickets: tickets.map(
         ({
           id,
@@ -904,7 +926,7 @@ export class Coordinator {
           /* Unstamped work is a resume candidate, never a success receipt. */
         }
       }
-      if (adopt)
+      if (adopt) {
         requireValue(
           run.db.move(t.id, t.lease, 'NEEDS_ATTENTION', 'SUBMITTED', {
             sourceSha: adopt,
@@ -912,7 +934,8 @@ export class Coordinator {
           }),
           'Stale ticket',
         )
-      else requireValue(run.db.retry(t.id), 'Ticket could not be retried')
+        await this._recordUndeclared(run, t, adopt)
+      } else requireValue(run.db.retry(t.id), 'Ticket could not be retried')
     })
     this._wake(run)
     return this._snapshot(run)
@@ -983,15 +1006,8 @@ export class Coordinator {
           t.id + ': check ' + id + ' was not shown when this run was approved, so dag_add cannot use it; start a new run',
         )
       }
-      const approval = run.db.events().find((e) => e.type === 'run_approved')
-      if (approval) {
-        const late = new Set(
-          run.db
-            .appended()
-            .filter((b) => b.createdAt > approval.createdAt)
-            .flatMap((b) => b.tickets.map((t) => t.id)),
-        )
-        const approved = run.db.tickets().filter((t) => !late.has(t.id))
+      if (run.db.events().some((e) => e.type === 'run_approved')) {
+        const approved = approvedTickets(run.db)
         for (const t of tickets) {
           const chosen = t.agent && approved.find((a) => a.agent === t.agent)
           if (!chosen) continue
@@ -1541,17 +1557,25 @@ export class Coordinator {
    * @returns { agent, spec } or null for the default worker.
    */
   _repairOwner(run, culprit) {
-    if (this.agents && Object.hasOwn(this.agents, repairAgent)) {
-      const used = run.db.tickets().find((t) => t.agent === repairAgent && t.agentSpec)
-      const spec = agentSpec(this.agents, repairAgent)
-      if (used)
-        for (const field of ['provider', 'model', 'reasoningEffort']) {
-          if (used.agentSpec[field]) spec[field] = used.agentSpec[field]
-          else delete spec[field]
-        }
-      return { agent: repairAgent, spec }
+    const fallback = culprit.agent ? { agent: culprit.agent, spec: culprit.agentSpec ?? {} } : null
+    if (!this.agents || !Object.hasOwn(this.agents, repairAgent)) return fallback
+    let spec
+    try {
+      spec = agentSpec(this.agents, repairAgent)
+    } catch {
+      // A malformed repair preset must not stop the repair; keep the old owner.
+      return fallback
     }
-    return culprit.agent ? { agent: culprit.agent, spec: culprit.agentSpec ?? {} } : null
+    // The first debugger ticket in plan order the user chose a route for. A
+    // ticket approved on the host default froze no route fields (or no
+    // agentSpec at all), and the repair then uses the host default too.
+    const chosen = approvedTickets(run.db).find((t) => t.agent === repairAgent)
+    if (chosen)
+      for (const field of ['provider', 'model', 'reasoningEffort']) {
+        if (chosen.agentSpec?.[field]) spec[field] = chosen.agentSpec[field]
+        else delete spec[field]
+      }
+    return { agent: repairAgent, spec }
   }
 
   // Compare a submitted commit's own changes with the files its ticket declared.
@@ -1591,8 +1615,10 @@ export class Coordinator {
           sourceSha,
           message: 'Adopted completion after interrupted delivery',
         })
-      )
+      ) {
+        await this._recordUndeclared(run, row, sourceSha)
         return
+      }
       const at =
         Date.now() +
         this.retryDelayMs * 2 ** (row.autoRetries ?? 0) +

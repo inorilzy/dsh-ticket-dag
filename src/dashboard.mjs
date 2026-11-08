@@ -448,7 +448,12 @@ export function readLedger(file, entry, detail, globalLimit, agents = {}, now = 
           appendedAt: appended.get(row.id) ?? null,
         }))
       // The same rule as Coordinator#_snapshot, from the same ticket fields.
-      result.fileOverlaps = fileOverlaps(result.tickets)
+      // A warning that fails to compute shows as none instead of hiding the run.
+      try {
+        result.fileOverlaps = fileOverlaps(result.tickets)
+      } catch {
+        result.fileOverlaps = []
+      }
       // A plan waiting for approval shows the captain's commands even before its captain reopens.
       if (run.mode === 'staged') {
         const checks = JSON.parse(integrity.run.manifest).checks ?? {}

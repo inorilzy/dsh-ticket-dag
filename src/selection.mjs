@@ -74,15 +74,20 @@ const wild = /[*?]/
 // so a pathological glob widens a warning instead of stalling dag_run.
 const expandLimit = 64
 
-function expand(glob) {
-  const open = glob.indexOf('{')
+// The alternatives a glob stands for, or null past expandLimit. An unmatched
+// brace is literal and the braces after it still expand, as in translate().
+function expand(glob, from = 0) {
+  let open = glob.indexOf('{', from)
+  while (open >= 0 && closing(glob, open) < 0) open = glob.indexOf('{', open + 1)
   if (open < 0) return [glob]
   const end = closing(glob, open)
-  if (end < 0) return [glob]
   const out = []
   for (const part of alternatives(glob.slice(open + 1, end))) {
-    for (const rest of expand(glob.slice(0, open) + part + glob.slice(end + 1))) {
-      out.push(rest)
+    // Rescanned from open: the expanded part may hold nested braces.
+    const rest = expand(glob.slice(0, open) + part + glob.slice(end + 1), open)
+    if (rest === null) return null
+    for (const item of rest) {
+      out.push(item)
       if (out.length > expandLimit) return null
     }
   }
@@ -105,14 +110,24 @@ function segmentsMeet(a, b) {
   return (ha.startsWith(hb) || hb.startsWith(ha)) && (ta.endsWith(tb) || tb.endsWith(ta))
 }
 
-function pathsMeet(a, i, b, j) {
-  if (i === a.length && j === b.length) return true
-  if (a[i] === '**') return pathsMeet(a, i + 1, b, j) || (j < b.length && pathsMeet(a, i, b, j + 1))
-  if (b[j] === '**') return pathsMeet(a, i, b, j + 1) || (i < a.length && pathsMeet(a, i + 1, b, j))
-  if (i === a.length || j === b.length) return false
-  // ** inside a segment (a**b) crosses separators; assume it can match.
-  if (a[i].includes('**') || b[j].includes('**')) return true
-  return segmentsMeet(a[i], b[j]) && pathsMeet(a, i + 1, b, j + 1)
+// Memoized on (i, j): without it several ** segments backtrack exponentially.
+function pathsMeet(a, b) {
+  const seen = new Map()
+  const meet = (i, j) => {
+    const key = i * (b.length + 1) + j
+    if (seen.has(key)) return seen.get(key)
+    let result
+    if (i === a.length && j === b.length) result = true
+    else if (a[i] === '**') result = meet(i + 1, j) || (j < b.length && meet(i, j + 1))
+    else if (b[j] === '**') result = meet(i, j + 1) || (i < a.length && meet(i + 1, j))
+    else if (i === a.length || j === b.length) result = false
+    // ** inside a segment (a**b) crosses separators; assume it can match.
+    else if (a[i].includes('**') || b[j].includes('**')) result = true
+    else result = segmentsMeet(a[i], b[j]) && meet(i + 1, j + 1)
+    seen.set(key, result)
+    return result
+  }
+  return meet(0, 0)
 }
 
 /** Whether two file globs (globToRegExp syntax) can name a common path. */
@@ -121,7 +136,7 @@ export function globsOverlap(a, b) {
   const left = expand(a),
     right = expand(b)
   if (!left || !right) return true
-  return left.some((x) => right.some((y) => pathsMeet(x.split('/'), 0, y.split('/'), 0)))
+  return left.some((x) => right.some((y) => pathsMeet(x.split('/'), y.split('/'))))
 }
 
 /**

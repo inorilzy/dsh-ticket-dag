@@ -129,7 +129,8 @@ test('a repair keeps the route the user approved for debugger in this run; witho
     agents: { debugger: { instructions: 'Find the cause.', provider: 'acme', model: 'deep-2', reasoningEffort: 'high' } },
     launch: async () => {},
   })
-  const run = (tickets) => ({ db: { tickets: () => tickets } })
+  // The repair route reads the approval and appended batches too; this ledger has neither.
+  const run = (tickets) => ({ db: { tickets: () => tickets, events: () => [], appended: () => [] } })
   const culprit = { id: 'L', agent: 'implementer', agentSpec: { instructions: 'Build it.', model: 'mid-1' } }
   assert.deepEqual(co._repairOwner(run([culprit]), culprit), {
     agent: 'debugger',
